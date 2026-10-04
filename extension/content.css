@@ -19,9 +19,9 @@ html.ytam-hide-native .ytp-caption-window-container { display: none !important; 
   color: var(--ytam-fg);
   font: 14px/1.4 Roboto, Arial, sans-serif;
 }
-.ytam-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--ytam-line); }
+.ytam-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--ytam-line); }
 .ytam-logo { margin-right: auto; font-weight: 700; }
-.ytam-track { max-width: 150px; padding: 2px 4px; border: 1px solid var(--ytam-line); border-radius: 6px; background: transparent; color: inherit; font-size: 12px; }
+.ytam-track { max-width: 110px; padding: 2px 4px; border: 1px solid var(--ytam-line); border-radius: 6px; background: transparent; color: inherit; font-size: 12px; }
 .ytam-track option { color: #0f0f0f; }
 .ytam-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; user-select: none; }
 .ytam-icon { width: 24px; height: 24px; border: 0; border-radius: 50%; background: none; color: inherit; font-size: 18px; line-height: 1; cursor: pointer; }
@@ -113,3 +113,38 @@ html.ytam-hide-native .ytp-caption-window-container { display: none !important; 
 .ytam-toast.ok { background: #1e7e34; }
 .ytam-toast.warn { background: #8a5a00; }
 .ytam-toast.err { background: #b3261e; }
+
+/* ---------- word levels (colors come from settings) ---------- */
+:root { --ytam-c-learning: #ffc400; --ytam-c-next: #66c2ff; --ytam-c-rare: #c792ea; }
+#ytam-panel .ytam-w.ytam-learning { background: color-mix(in srgb, var(--ytam-c-learning) 45%, transparent); }
+#ytam-panel .ytam-w.ytam-next { background: color-mix(in srgb, var(--ytam-c-next) 30%, transparent); }
+#ytam-panel .ytam-w.ytam-rare { background: color-mix(in srgb, var(--ytam-c-rare) 28%, transparent); }
+#ytam-overlay .ytam-w.ytam-learning { color: var(--ytam-c-learning); }
+#ytam-overlay .ytam-w.ytam-next { color: var(--ytam-c-next); }
+#ytam-overlay .ytam-w.ytam-rare { color: var(--ytam-c-rare); }
+#ytam-overlay .ytam-w:hover { background: rgba(255, 255, 255, .18); }
+
+.ytam-row.ytam-pending .ytam-save { border-color: #f9a825; background: #f9a825; color: #fff; opacity: 1; }
+
+/* ---------- hover tooltip ---------- */
+.ytam-tip {
+  position: fixed;
+  z-index: 2147483646;
+  max-width: 280px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: #212121;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .4);
+  font: 14px/1.35 Roboto, Arial, sans-serif;
+  pointer-events: none;
+}
+.ytam-tip b { color: #ffd36a; font-weight: 500; }
+.ytam-tip-st { display: block; color: #9e9e9e; font-size: 11px; }
+
+.ytam-pop-status { display: flex; gap: 4px; margin-top: 8px; }
+.ytam-st { flex: 1; padding: 4px 0; border: 1px solid #555; border-radius: 6px; background: none; color: #ddd; font: 12px Roboto, Arial, sans-serif; cursor: pointer; }
+.ytam-st:hover { border-color: #999; }
+.ytam-st.on[data-st="0"] { border-color: #9e9e9e; background: #424242; color: #fff; }
+.ytam-st.on[data-st="1"] { border-color: var(--ytam-c-learning); background: var(--ytam-c-learning); color: #111; }
+.ytam-st.on[data-st="2"] { border-color: #43a047; background: #43a047; color: #fff; }
