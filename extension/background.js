@@ -47,52 +47,51 @@ async function translateLines(lines, tl) {
   return out;
 }
 
-// Single-word translations, cached on disk so hovering is instant.
-const wordCache = {};
+// Persistent caches so hover translations are instant on every video.
+const caches = {};
 const dirtyCaches = new Set();
 let saveTimer = 0;
 
-async function getWordCache(tl) {
-  if (!wordCache[tl]) {
-    const key = 'trc:' + tl;
-    wordCache[tl] = (await chrome.storage.local.get(key))[key] || {};
-  }
-  return wordCache[tl];
+async function getCache(name) {
+  if (!caches[name]) caches[name] = (await chrome.storage.local.get(name))[name] || {};
+  return caches[name];
 }
 
-function persistWordCache(tl) {
-  dirtyCaches.add(tl);
+function persistCache(name) {
+  dirtyCaches.add(name);
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    for (const lang of dirtyCaches) chrome.storage.local.set({ ['trc:' + lang]: wordCache[lang] });
+    for (const n of dirtyCaches) chrome.storage.local.set({ [n]: caches[n] });
     dirtyCaches.clear();
   }, 1500);
 }
 
 async function translateWords(words, tl) {
-  const cache = await getWordCache(tl);
+  const cache = await getCache('trc:' + tl);
   const missing = words.filter((w) => !(w in cache));
   for (let i = 0; i < missing.length; i += 100) {
     const chunk = missing.slice(i, i + 100);
     const out = await translateLines(chunk, tl);
     chunk.forEach((w, k) => { if (out[k]) cache[w] = out[k]; });
-    persistWordCache(tl);
+    persistCache('trc:' + tl);
   }
   const res = {};
   for (const w of words) if (cache[w]) res[w] = cache[w];
   return res;
 }
 
-const lookupCache = new Map();
 async function lookup(word, tl) {
-  const key = tl + ':' + word.toLowerCase();
-  if (lookupCache.has(key)) return lookupCache.get(key);
+  const name = 'lkc:' + tl;
+  const cache = await getCache(name);
+  const key = word.toLowerCase();
+  if (cache[key]) return cache[key];
   const j = await gtx(word, tl, true);
   const res = {
     translation: joinTrans(j).trim(),
     dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })),
   };
-  lookupCache.set(key, res);
+  cache[key] = res;
+  persistCache(name);
   return res;
 }
 
@@ -100,45 +99,159 @@ async function lookup(word, tl) {
 
 const LANGS = { ru: 'Russian', uk: 'Ukrainian', be: 'Belarusian', kk: 'Kazakh', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pl: 'Polish', tr: 'Turkish', 'zh-CN': 'Chinese (Simplified)', ja: 'Japanese' };
 
-async function aiSegment({ text, tl, maxWords, model }) {
+async function geminiKey() {
   const { geminiKey } = await chrome.storage.local.get(YTAM_LOCAL_DEFAULTS);
-  if (!geminiKey) throw new Error('Не задан ключ Gemini API (Настройки → ИИ)');
+  if (!geminiKey) throw new Error('Не задан ключ Gemini API (⚙ → ИИ)');
+  return geminiKey;
+}
+
+async function gemini(model, body) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': await geminiKey() },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || 'HTTP ' + r.status));
+  const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+  return parts.map((p) => p.text || '').join('');
+}
+
+const EXPR_SCHEMA = {
+  type: 'ARRAY',
+  items: { type: 'OBJECT', properties: { p: { type: 'STRING' }, t: { type: 'STRING' } }, required: ['p', 't'] },
+};
+
+const EXPR_RULE = (lang) => `- "x": idioms, phrasal verbs, fixed expressions and collocations in the line whose meaning is not obvious from the single words (e.g. "get along", "needs to be", "for the sake of", "doesn't cut it"). "p" must be copied exactly as it appears in the line, "t" is its meaning in ${lang}. Empty array if none.`;
+
+async function aiSegment({ text, tl, maxWords, model }) {
+  const lang = LANGS[tl] || tl;
   const prompt = `You are given a fragment of a YouTube transcript. It may lack punctuation and capitalization (auto-generated captions) or be split mid-sentence.
 
 Task:
 1. Restore correct punctuation and capitalization.
 2. Split the text into subtitle lines. Each line is one complete sentence. If a sentence is longer than ${maxWords} words, split it at natural clause boundaries so every line has at most ${maxWords} words.
-3. Translate each line into ${LANGS[tl] || tl} naturally, using the surrounding context.
+3. Translate each line into ${lang} naturally, using the surrounding context.
 
 Strict rules:
 - Keep EVERY word of the original in the original order. Do not add, remove, reorder, or paraphrase words. Only change punctuation and letter case.
 - The fragment may start or end mid-sentence; keep those parts as their own lines.
-- Return JSON: an array of objects {"s": original-language line, "t": translation}.
+- Return JSON array of {"s": original-language line, "t": translation, "x": expressions}.
+${EXPR_RULE(lang)}
 
 Transcript:
 ${text}`;
+  const out = await gemini(model, {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'ARRAY',
+        items: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['s', 't'] },
+      },
+    },
+  });
+  return { lines: JSON.parse(out) };
+}
 
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'ARRAY',
-          items: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' } }, required: ['s', 't'] },
+// Gemini watches/listens to the YouTube video itself (public videos only).
+async function aiVideo({ videoId, from, to, tl, maxWords, model }) {
+  const lang = LANGS[tl] || tl;
+  const mmss = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+  const prompt = `Listen to the speech in this video from ${mmss(from)} to ${mmss(to)} and produce accurate subtitles.
+
+Rules:
+- Transcribe verbatim in the spoken language, with correct punctuation and capitalization. Do not summarize or skip anything said in that range. Ignore music and sound effects.
+- One subtitle line = one complete sentence. If a sentence is longer than ${maxWords} words, split it at natural clause boundaries.
+- "b" and "e": start and end of the line in seconds from the BEGINNING OF THE WHOLE VIDEO (not of the range), precise to 0.1 s. "e" must be when the last word of the line actually ends.
+- "t": natural translation of the line into ${lang} using context.
+${EXPR_RULE(lang)}
+Return JSON array of {"b","e","s","t","x"} ordered by time.`;
+  const out = await gemini(model, {
+    contents: [{
+      role: 'user',
+      parts: [
+        { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps: 0.2 } },
+        { text: prompt },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0.1,
+      mediaResolution: 'MEDIA_RESOLUTION_LOW',
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: { b: { type: 'NUMBER' }, e: { type: 'NUMBER' }, s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA },
+          required: ['b', 'e', 's', 't'],
         },
       },
-    }),
+    },
   });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || 'HTTP ' + r.status));
-  const out = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-  const lines = JSON.parse(out.map((p) => p.text || '').join(''));
-  return { lines, usage: j.usageMetadata || null };
+  let lines = JSON.parse(out).filter((l) => l && l.s);
+  // Some answers count from the start of the range instead of the video.
+  if (from > 30 && lines.length && lines[0].b < from - 20) lines = lines.map((l) => ({ ...l, b: l.b + from, e: l.e + from }));
+  return { lines };
 }
+
+// Streaming explanations for the word popup (Объяснить / Примеры / Грамматика / вопрос).
+function explainPrompt({ kind, word, sentence, question, tl }) {
+  const lang = LANGS[tl] || tl;
+  const base = `Phrase from a video: "${sentence}"\nFocus word or expression: "${word}"\nAnswer in ${lang}. Be brief (max 90 words), plain text, you may use **bold** and "- " bullets.`;
+  switch (kind) {
+    case 'explain': return `${base}\nExplain what "${word}" means exactly in this phrase and what the whole phrase means. Mention nuance, register or connotation if relevant.`;
+    case 'examples': return `${base}\nGive 4 short natural English example sentences using "${word}" in the same meaning, each followed by its translation in parentheses.`;
+    case 'grammar': return `${base}\nExplain the grammar of this phrase that a learner should notice (tense, construction, word order, why this form of "${word}" is used).`;
+    default: return `${base}\nThe learner asks: ${question}`;
+  }
+}
+
+async function streamGemini(model, prompt, onDelta) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': await geminiKey() },
+    body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 600 } }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error('Gemini: ' + ((j.error && j.error.message) || 'HTTP ' + r.status));
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      try {
+        const j = JSON.parse(line.slice(5));
+        const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+        const text = parts.map((p) => p.text || '').join('');
+        if (text) onDelta(text);
+      } catch (_) {}
+    }
+  }
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'ytam-ai') return;
+  port.onMessage.addListener(async (msg) => {
+    try {
+      const { aiFastModel } = await chrome.storage.sync.get({ aiFastModel: YTAM_DEFAULTS.aiFastModel });
+      await streamGemini(aiFastModel, explainPrompt(msg), (delta) => port.postMessage({ delta }));
+      port.postMessage({ done: true });
+    } catch (e) {
+      try { port.postMessage({ error: e.message || String(e) }); } catch (_) {}
+    }
+  });
+});
 
 // ---------- AnkiConnect ----------
 
@@ -241,6 +354,7 @@ async function handle(msg) {
     case 'translateWords': return translateWords(msg.words, msg.tl);
     case 'lookup': return lookup(msg.word, msg.tl);
     case 'aiSegment': return aiSegment(msg);
+    case 'aiVideo': return aiVideo(msg);
     case 'addCard': return addCard(msg.card);
     case 'ankiStatus': {
       const version = await anki('version');

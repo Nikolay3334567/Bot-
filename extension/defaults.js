@@ -21,15 +21,19 @@ self.YTAM_DEFAULTS = {
   // Highlighting
   vocabSize: 3000,
   nextSize: 3000,
+  hlKnown: true,
   hlLearning: true,
   hlNext: true,
   hlRare: true,
-  colorLearning: '#ffc400',
-  colorNext: '#66c2ff',
-  colorRare: '#c792ea',
-  // AI (Gemini)
-  aiEnabled: false,
+  colorKnown: '#a0f8d0',
+  colorLearning: '#c98a4b',
+  colorNext: '#f8bc82',
+  colorRare: '#b490c0',
+  builtinExpr: true,
+  // AI (Gemini): 'off' | 'text' (fix existing subtitles) | 'audio' (Gemini listens to the video)
+  aiMode: 'off',
   aiModel: 'gemini-2.5-flash-lite',
+  aiFastModel: 'gemini-2.5-flash-lite',
 };
 
 // Stored only on this computer (not synced).

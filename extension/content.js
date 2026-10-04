@@ -104,35 +104,35 @@
     return best;
   }
 
-  // '' = known / not highlighted, otherwise a CSS class.
+  // LR scheme: known = green, recommended = orange, rare = purple,
+  // learning (saved to Anki) = outlined box.
   function wordLevel(w) {
     const st = S.vocab[w];
     if (st === 1) return settings.hlLearning ? 'ytam-learning' : '';
-    if (st === 2) return '';
-    if (/^\d/.test(w) || w.length < 2) return '';
+    if (st === 2) return settings.hlKnown ? 'ytam-known' : '';
+    if (/^\d/.test(w)) return '';
     const r = rankOf(w);
-    if (r <= settings.vocabSize) return '';
+    if (r <= settings.vocabSize) return settings.hlKnown ? 'ytam-known' : '';
     if (r <= settings.vocabSize + settings.nextSize) return settings.hlNext ? 'ytam-next' : '';
     return settings.hlRare ? 'ytam-rare' : '';
   }
 
-  function statusName(w) {
-    const st = S.vocab[w];
-    if (st === 1) return 'Изучаю';
-    if (st === 2) return 'Знаю';
-    return rankOf(w) <= settings.vocabSize ? 'Знаю (по частоте)' : 'Новое';
+  const isKnown = (w) => S.vocab[w] === 2 || (S.vocab[w] !== 1 && rankOf(w) <= settings.vocabSize);
+
+  function spanClass(el) {
+    let c = 'ytam-w ' + wordLevel(el.dataset.w);
+    if (el.dataset.xl === '1' && settings.hlLearning) c = c.replace(/ytam-(known|next|rare)/, '') + ' ytam-learning';
+    return c.replace(/\s+/g, ' ').trim();
   }
 
   function recolor(word) {
     const sel = word ? `.ytam-w[data-w="${CSS.escape(word)}"]` : '.ytam-w';
-    document.querySelectorAll(sel).forEach((el) => {
-      el.className = ('ytam-w ' + wordLevel(el.dataset.w)).trim();
-    });
+    document.querySelectorAll(sel).forEach((el) => { el.className = spanClass(el); });
   }
 
   async function setWordStatus(w, st) {
     if (st) S.vocab[w] = st; else delete S.vocab[w];
-    recolor(w);
+    if (w.includes(' ')) { renderList(); renderOverlay(); } else recolor(w);
     try {
       const { vocab = {} } = await chrome.storage.local.get('vocab');
       if (st) vocab[w] = st; else delete vocab[w];
@@ -140,13 +140,97 @@
     } catch (_) {}
   }
 
-  // Middle click: new → learning → known → new.
-  function cycleStatus(w, i) {
-    const st = S.vocab[w];
-    const next = st === 1 ? 2 : st === 2 ? 0 : 1;
+  // Right / middle click (LR): learning ↔ known; anything else → learning.
+  function toggleStatus(w, i, meaning) {
+    const next = S.vocab[w] === 1 ? 2 : 1;
     setWordStatus(w, next);
-    toast(`${w}: ${['новое', 'изучаю', 'знаю'][next]}`);
-    if (next === 1 && settings.ankiOnLearning && i != null) queueCard(i, { word: w }, true);
+    toast(`${w}: ${next === 1 ? 'изучаю' : 'знаю'}`);
+    if (next === 1 && settings.ankiOnLearning && i != null) queueCard(i, { word: w, meaning }, true);
+  }
+
+  // ---------- expressions (idioms, phrasal verbs) ----------
+
+  const TOKEN_RE = /[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu;
+  const tokensOf = (text) => [...text.matchAll(TOKEN_RE)].map((m) => norm(m[0]));
+  const POSSESSIVE = new Set(['my', 'your', 'his', 'her', 'our', 'their', 'its', 'one\'s']);
+
+  const EXPR_BY_FORM = new Map();
+  (() => {
+    const irr = self.YTAM_IRREGULAR || {};
+    const formsOf = (b) => {
+      const f = new Set([b, b + 's', b + 'es', b + 'ed', b + 'd', b + 'ing']);
+      if (b.endsWith('e')) f.add(b.slice(0, -1) + 'ing');
+      if (b.endsWith('y')) { f.add(b.slice(0, -1) + 'ies'); f.add(b.slice(0, -1) + 'ied'); }
+      for (const x of (irr[b] || '').split(' ')) if (x) f.add(x);
+      return f;
+    };
+    for (const p of (self.YTAM_EXPR || '').split('|')) {
+      const toks = tokensOf(p);
+      if (toks.length < 2) continue;
+      for (const f of formsOf(toks[0])) {
+        if (!EXPR_BY_FORM.has(f)) EXPR_BY_FORM.set(f, []);
+        EXPR_BY_FORM.get(f).push({ p, toks });
+      }
+    }
+  })();
+
+  const tokEq = (pattern, tok) => pattern === tok || (pattern === 'your' && POSSESSIVE.has(tok));
+
+  // Finds pattern tokens in order; small gaps allowed ("pick it up").
+  function findSeq(toks, pat, from = 0) {
+    for (let i = from; i < toks.length; i++) {
+      const idx = [];
+      let j = i;
+      for (let k = 0; k < pat.length; k++) {
+        let found = -1;
+        for (let g = 0; g <= (k === 0 ? 0 : 2) && j + g < toks.length; g++) {
+          if (tokEq(pat[k], toks[j + g])) { found = j + g; break; }
+        }
+        if (found < 0) break;
+        idx.push(found);
+        j = found + 1;
+      }
+      if (idx.length === pat.length) return idx;
+    }
+    return null;
+  }
+
+  function cueExpr(c) {
+    if (c._expr) return c._expr;
+    const toks = tokensOf(c.text);
+    const spans = [...c.text.matchAll(new RegExp(TOKEN_RE.source, 'gu'))];
+    const out = [];
+    const seen = new Set();
+    const add = (p, t, idx) => {
+      const key = idx.join(',');
+      if (seen.has(key)) return;
+      seen.add(key);
+      const a = spans[idx[0]], b = spans[idx[idx.length - 1]];
+      const surf = c.text.slice(a.index, b.index + b[0].length); // as written in the phrase
+      out.push({ p, t, idx, key: norm(p), surf });
+    };
+    for (const x of c.x || []) {
+      const pat = tokensOf(String(x.p || ''));
+      if (pat.length < 2) continue;
+      const idx = findSeq(toks, pat);
+      if (idx) add(x.p, x.t || '', idx);
+    }
+    if (settings.builtinExpr) {
+      toks.forEach((tok, i) => {
+        for (const e of EXPR_BY_FORM.get(tok) || []) {
+          const idx = findSeq(toks, [tok, ...e.toks.slice(1)], i);
+          if (idx && idx[0] === i) add(e.p, '', idx);
+        }
+      });
+    }
+    // Longest expressions first.
+    out.sort((a, b) => b.idx.length - a.idx.length);
+    c._expr = out;
+    return out;
+  }
+
+  function exprTr(e) {
+    return e.t || S.wordTr.get(e.key) || '';
   }
 
   // ---------- subtitles ----------
@@ -239,7 +323,7 @@
       }
       const start = first >= 0 ? words[first].start : prevEnd;
       const end = last >= 0 ? words[last].end : start + 0.5;
-      cues.push({ start, end: Math.max(end, start + 0.3), text: s, tr: String(line.t || '') });
+      cues.push({ start, end: Math.max(end, start + 0.3), text: s, tr: String(line.t || ''), x: line.x || [] });
       prevEnd = end;
     }
     return { cues, ratio: total ? matched / total : 0 };
@@ -289,13 +373,82 @@
     if (ratio < 0.7) throw new Error('ИИ слишком сильно изменил текст');
     const cues = results.flatMap((r) => r.cues);
     for (let i = 1; i < cues.length; i++) if (cues[i].start < cues[i - 1].start) cues[i].start = cues[i - 1].start;
+    await saveAiCache(key, cues);
+    return cues;
+  }
+
+  async function saveAiCache(key, cues) {
     try {
       const { aiKeys = [] } = await chrome.storage.local.get('aiKeys');
       aiKeys.push(key);
       const drop = aiKeys.splice(0, Math.max(0, aiKeys.length - 150));
       if (drop.length) await chrome.storage.local.remove(drop);
-      await chrome.storage.local.set({ [key]: cues, aiKeys });
+      await chrome.storage.local.set({ [key]: cues.map(({ _expr, ...c }) => c), aiKeys });
     } catch (_) {}
+  }
+
+  // Gemini listens to the video itself; YouTube word timings (if any) refine the times.
+  async function aiVideoProcess(words, token) {
+    const key = `aiv:${S.videoId}:${settings.targetLang}:${settings.maxWords}:${settings.aiModel}`;
+    const cached = (await chrome.storage.local.get(key))[key];
+    if (cached) return cached;
+    let dur = 0;
+    for (let i = 0; i < 40 && !(dur > 0 && isFinite(dur)); i++) {
+      const v = getVideo();
+      dur = v ? v.duration : 0;
+      if (!(dur > 0 && isFinite(dur))) await sleep(250);
+      if (token !== S.token) return null;
+    }
+    if (!(dur > 0 && isFinite(dur))) throw new Error('неизвестна длительность видео');
+
+    const CHUNK = 600;
+    const ranges = [];
+    if (dur <= 12 * 60) ranges.push([0, dur]);
+    else for (let t = 0; t < dur; t += CHUNK) ranges.push([t, Math.min(dur, t + CHUNK)]);
+
+    const results = new Array(ranges.length);
+    let next = 0, done = 0;
+    await Promise.all(Array.from({ length: 3 }, async () => {
+      while (next < ranges.length) {
+        const i = next++;
+        if (token !== S.token) return;
+        const [from, to] = ranges[i];
+        const res = await bg({ type: 'aiVideo', videoId: S.videoId, from, to, tl: settings.targetLang, maxWords: settings.maxWords, model: settings.aiModel });
+        results[i] = res.lines.filter((l) => l.b >= from - 5 && l.b < to + 5);
+        setStatus(`🎧 ИИ слушает видео… ${++done}/${ranges.length}`);
+      }
+    }));
+    if (token !== S.token) return null;
+
+    let cues = results.flat().map((l) => ({ start: +l.b || 0, end: +l.e || (+l.b + 2), text: cleanText(String(l.s)), tr: String(l.t || ''), x: l.x || [] }))
+      .filter((c) => c.text);
+    cues.sort((a, b) => a.start - b.start);
+    if (!cues.length) throw new Error('ИИ не вернул субтитры');
+
+    // Snap to YouTube's word timings where the text matches.
+    if (words.length) {
+      const W = words.map((w) => normTok(w.text));
+      let p = 0;
+      for (const c of cues) {
+        while (p < words.length && words[p].start < c.start - 2.5) p++;
+        while (p > 0 && words[p - 1].start >= c.start - 2.5) p--;
+        let q = p, first = -1, last = -1, hits = 0;
+        const toks = c.text.split(' ').map(normTok).filter(Boolean);
+        for (const tok of toks) {
+          for (let k = q; k < Math.min(W.length, q + 8); k++) {
+            if (W[k] === tok) { if (first < 0) first = k; last = k; q = k + 1; hits++; break; }
+          }
+        }
+        if (toks.length && hits / toks.length >= 0.5) {
+          c.start = words[first].start;
+          c.end = Math.max(words[last].end, c.start + 0.3);
+          p = last + 1;
+        }
+      }
+      cues.sort((a, b) => a.start - b.start);
+    }
+    for (let i = 1; i < cues.length; i++) if (cues[i].start < cues[i - 1].start) cues[i].start = cues[i - 1].start;
+    await saveAiCache(key, cues);
     return cues;
   }
 
@@ -409,10 +562,10 @@
     setStatus('');
     prefetchWords(token);
 
-    if (settings.aiEnabled) {
-      setStatus('✨ ИИ обрабатывает субтитры…');
+    if (settings.aiMode === 'text' || settings.aiMode === 'audio') {
+      setStatus(settings.aiMode === 'audio' ? '🎧 ИИ слушает видео…' : '✨ ИИ обрабатывает субтитры…');
       try {
-        const cues = await aiProcess(words, token);
+        const cues = settings.aiMode === 'audio' ? await aiVideoProcess(words, token) : await aiProcess(words, token);
         if (token !== S.token || !cues) return;
         setCues(cues);
         setStatus('');
@@ -473,6 +626,7 @@
     const re = /[\p{L}]+(?:['’-][\p{L}]+)*/gu;
     const set = new Set();
     for (const w of S.words) for (const m of w.text.matchAll(re)) set.add(norm(m[0]));
+    for (const c of S.cues) for (const e of cueExpr(c)) if (!e.t) set.add(e.key);
     const list = [...set].filter((w) => !S.wordTr.has(w));
     for (let i = 0; i < list.length; i += 300) {
       if (token !== S.token || tl !== settings.targetLang) return;
@@ -487,14 +641,20 @@
 
   // ---------- UI ----------
 
-  function wordsNode(text, cls) {
+  function wordsNode(text, cls, cueIdx) {
     const el = h('div', { class: cls });
-    const re = /[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu;
-    let last = 0, m;
+    const c = S.cues[cueIdx];
+    const learnedTok = new Set();
+    if (c) for (const e of cueExpr(c)) if (S.vocab[e.key] === 1) e.idx.forEach((k) => learnedTok.add(k));
+    const re = new RegExp(TOKEN_RE.source, 'gu');
+    let last = 0, m, ti = 0;
     while ((m = re.exec(text))) {
       if (m.index > last) el.append(text.slice(last, m.index));
-      const w = norm(m[0]);
-      el.append(h('span', { class: ('ytam-w ' + wordLevel(w)).trim(), 'data-w': w, text: m[0] }));
+      const span = h('span', { 'data-w': norm(m[0]), 'data-ti': String(ti), text: m[0] });
+      if (learnedTok.has(ti)) span.dataset.xl = '1';
+      span.className = spanClass(span);
+      el.append(span);
+      ti++;
       last = m.index + m[0].length;
     }
     if (last < text.length) el.append(text.slice(last));
@@ -512,31 +672,37 @@
       const w = e.target.closest('.ytam-w');
       if (!w || !root.contains(w)) return;
       S.hoverWord = { el: w, i: cueOf(w) };
-      if (settings.hoverTranslate && !pop) showTip(w);
+      if (settings.hoverTranslate && !pop) showTip(w, cueOf(w));
     });
     root.addEventListener('mouseout', (e) => {
       const w = e.target.closest('.ytam-w');
       if (!w || (e.relatedTarget && w.contains(e.relatedTarget))) return;
       S.hoverWord = null;
-      hideTip();
+      scheduleHideTip();
     });
     root.addEventListener('mousedown', (e) => {
       if (e.button === 1 && e.target.closest('.ytam-w')) e.preventDefault(); // no autoscroll
     });
-    root.addEventListener('auxclick', (e) => {
+    const statusClick = (e) => {
       const w = e.target.closest('.ytam-w');
-      if (!w || e.button !== 1) return;
+      if (!w) return;
       e.preventDefault();
       e.stopPropagation();
-      cycleStatus(w.dataset.w, cueOf(w));
-    });
+      toggleStatus(w.dataset.w, cueOf(w));
+      if (tipFor === w) showTip(w, cueOf(w));
+    };
+    root.addEventListener('contextmenu', statusClick);
+    root.addEventListener('auxclick', (e) => { if (e.button === 1) statusClick(e); });
   }
+
+  const STAR = '☆', STAR_ON = '★';
 
   function createUI() {
     const select = h('select', { class: 'ytam-track', title: 'Дорожка субтитров' });
     select.addEventListener('change', () => {
       S.cues = [];
       renderList();
+      S.token++;
       loadTrack(S.tracks[+select.value], S.token);
     });
     const status = h('div', { class: 'ytam-status' });
@@ -554,11 +720,11 @@
       status,
       list,
       h('div', { class: 'ytam-foot' },
-        'Наведение — перевод · клик — словарь · ', h('b', { text: 'колесо' }), ' — статус слова · ',
+        'Наведение — перевод · клик — словарь · ', h('b', { text: 'правая кнопка' }), ' — знаю/изучаю · ',
         h('kbd', { text: 'A' }), '/', h('kbd', { text: 'D' }), ' фразы · ',
         h('kbd', { text: 'S' }), ' повтор · ',
         h('kbd', { text: 'Q' }), ' автопауза · ',
-        h('kbd', { text: 'E' }), ' фраза в Anki'));
+        h('kbd', { text: 'E' }), ' ☆ фраза'));
 
     collapse.addEventListener('click', () => {
       panel.classList.toggle('ytam-collapsed');
@@ -569,7 +735,8 @@
       const row = e.target.closest('.ytam-row');
       if (!row) return;
       const i = +row.dataset.i;
-      if (e.target.closest('.ytam-save')) return queueCard(i, null);
+      if (e.target.closest('.ytam-star')) return queueCard(i, null);
+      if (e.target.closest('.ytam-play')) return seekCue(i, true);
       const w = e.target.closest('.ytam-w');
       if (w) return openWord(w, i);
       seekCue(i, true);
@@ -578,10 +745,13 @@
 
     const ovText = h('div', { class: 'ytam-ov-text' });
     const ovTr = h('div', { class: 'ytam-ov-tr' });
-    const ovBox = h('div', { class: 'ytam-ov-box' }, ovText, ovTr);
-    const overlay = h('div', { id: 'ytam-overlay', class: 'ytam-hidden' }, ovBox);
-    for (const type of ['mousedown', 'mouseup', 'dblclick', 'click', 'auxclick']) {
-      ovBox.addEventListener(type, (e) => {
+    const ovPlay = h('button', { class: 'ytam-play', title: 'Повторить фразу (S)', onclick: () => seekCue(S.shown, true) });
+    const ovStar = h('button', { class: 'ytam-star', title: 'Фраза в Anki (E)', text: STAR, onclick: () => queueCard(S.shown, null) });
+    const ovBox = h('div', { class: 'ytam-ov-box' }, ovText);
+    const ovLine = h('div', { class: 'ytam-ov-line' }, ovPlay, ovBox, ovStar);
+    const overlay = h('div', { id: 'ytam-overlay', class: 'ytam-hidden' }, ovLine, ovTr);
+    for (const type of ['mousedown', 'mouseup', 'dblclick', 'click', 'auxclick', 'contextmenu']) {
+      ovLine.addEventListener(type, (e) => {
         e.stopPropagation();
         if (type !== 'click') return;
         const w = e.target.closest('.ytam-w');
@@ -589,19 +759,19 @@
       });
     }
     bindWords(ovBox, () => S.shown);
-    ovBox.addEventListener('mouseenter', () => {
+    ovLine.addEventListener('mouseenter', () => {
       const v = getVideo();
       if (settings.pauseOnHover && v && !v.paused) { v.pause(); S.hoverPaused = true; }
     });
-    ovBox.addEventListener('mouseleave', () => { if (!pop) resumeAfterHover(); });
+    ovLine.addEventListener('mouseleave', () => { if (!pop) resumeAfterHover(); });
 
-    return { panel, list, status, select, overlay, ovBox, ovText, ovTr, rows: [] };
+    return { panel, list, status, select, overlay, ovLine, ovBox, ovText, ovTr, ovStar, rows: [] };
   }
 
   function resumeAfterHover() {
     if (!S.hoverPaused) return;
     S.hoverPaused = false;
-    if (ui && ui.ovBox.matches(':hover')) return;
+    if (ui && ui.ovLine.matches(':hover')) return;
     const v = getVideo();
     if (v) v.play();
   }
@@ -624,16 +794,20 @@
     if (!ui) return;
     const frag = document.createDocumentFragment();
     ui.rows = S.cues.map((c, i) => {
-      const row = h('div', { class: 'ytam-row' + (S.saved.has(savedKey(c)) ? ' ytam-saved' : ''), 'data-i': String(i) },
-        h('button', { class: 'ytam-time', text: fmtTime(c.start), title: 'Перейти' }),
+      const saved = S.saved.has(savedKey(c));
+      const row = h('div', { class: 'ytam-row' + (saved ? ' ytam-saved' : ''), 'data-i': String(i) },
+        h('button', { class: 'ytam-play', title: `Воспроизвести · ${fmtTime(c.start)}` }),
         h('div', { class: 'ytam-body' },
-          wordsNode(c.text, 'ytam-text'),
+          wordsNode(c.text, 'ytam-text', i),
           h('div', { class: 'ytam-tr', text: S.trans[i] || '' })),
-        h('button', { class: 'ytam-save', title: 'Фраза в Anki (E)', text: '+' }));
+        h('button', { class: 'ytam-star', title: 'Фраза в Anki (E)', text: saved ? STAR_ON : STAR }));
       frag.append(row);
       return row;
     });
+    const top = ui.list.scrollTop;
     ui.list.replaceChildren(frag);
+    ui.list.scrollTop = top;
+    if (ui.rows[S.active]) ui.rows[S.active].classList.add('ytam-active');
   }
 
   function updateRowTr(i) {
@@ -644,7 +818,19 @@
   function markRow(cue, cls, on) {
     if (!ui) return;
     const i = S.cues.findIndex((c) => savedKey(c) === savedKey(cue));
-    if (ui.rows[i]) ui.rows[i].classList.toggle(cls, on);
+    const row = ui.rows[i];
+    if (row) {
+      row.classList.toggle(cls, on);
+      row.querySelector('.ytam-star').textContent = row.matches('.ytam-saved, .ytam-pending') ? STAR_ON : STAR;
+    }
+    if (i === S.shown) renderOverlayStar();
+  }
+
+  function renderOverlayStar() {
+    const row = ui && ui.rows[S.shown];
+    const on = !!row && row.matches('.ytam-saved, .ytam-pending');
+    ui.ovStar.textContent = on ? STAR_ON : STAR;
+    ui.ovStar.classList.toggle('on', on);
   }
 
   function setActiveRow(a) {
@@ -664,12 +850,14 @@
     const c = S.cues[S.shown];
     ui.overlay.classList.toggle('ytam-hidden', !c);
     if (!c) return;
-    ui.ovText.replaceChildren(...wordsNode(c.text, 'x').childNodes);
+    ui.ovText.replaceChildren(...wordsNode(c.text, 'x', S.shown).childNodes);
     ui.ovTr.textContent = S.trans[S.shown] || '';
+    renderOverlayStar();
   }
 
   function applySettings() {
     const root = document.documentElement.style;
+    root.setProperty('--ytam-c-known', settings.colorKnown);
     root.setProperty('--ytam-c-learning', settings.colorLearning);
     root.setProperty('--ytam-c-next', settings.colorNext);
     root.setProperty('--ytam-c-rare', settings.colorRare);
@@ -697,33 +885,71 @@
     if (ui && player && ui.overlay.parentNode !== player) player.append(ui.overlay);
   }
 
-  // ---------- hover tooltip ----------
+  // ---------- dictionary prefetch ("buffering") ----------
+  // Dictionary entries for words of the current and next phrases are fetched
+  // ahead of time so the hover tooltip shows variants instantly.
 
-  let tipEl = null, tipFor = null;
-  function placeAbove(el, anchor) {
-    const r = anchor.getBoundingClientRect();
-    el.style.left = Math.max(8, Math.min(r.left + r.width / 2 - el.offsetWidth / 2, innerWidth - el.offsetWidth - 8)) + 'px';
-    const top = r.top - el.offsetHeight - 6;
-    el.style.top = (top > 8 ? top : r.bottom + 6) + 'px';
+  const dict = new Map();   // word -> { translation, dict } | Promise
+  const dictQueue = [];
+  let dictBusy = 0;
+
+  function getDict(w) {
+    if (dict.has(w)) return dict.get(w);
+    const p = bg({ type: 'lookup', word: w, tl: settings.targetLang })
+      .then((r) => { dict.set(w, r); return r; })
+      .catch(() => { dict.delete(w); return null; });
+    dict.set(w, p);
+    return p;
   }
 
-  async function showTip(span) {
-    if (!tipEl) tipEl = h('div', { class: 'ytam-tip' });
-    const w = span.dataset.w;
-    tipFor = span;
-    const fill = (t) => {
-      tipEl.replaceChildren(h('b', { text: t || '…' }), h('span', { class: 'ytam-tip-st', text: statusName(w) }));
-      placeAbove(tipEl, span);
-    };
-    layer().append(tipEl);
-    fill(S.wordTr.get(w));
-    if (!S.wordTr.has(w)) {
-      try {
-        const res = await bg({ type: 'translateWords', words: [w], tl: settings.targetLang });
-        if (res[w]) S.wordTr.set(w, res[w]);
-        if (tipFor === span) fill(res[w] || '—');
-      } catch (_) {}
+  function prefetchAround(a) {
+    const words = [];
+    for (let i = Math.max(0, a); i < Math.min(S.cues.length, a + 4); i++) {
+      for (const w of tokensOf(S.cues[i].text)) if (!dict.has(w) && w.length > 1 && !/^\d/.test(w)) words.push(w);
     }
+    words.sort((x, y) => isKnown(x) - isKnown(y)); // unknown words first
+    for (const w of words) if (!dictQueue.includes(w)) dictQueue.push(w);
+    pumpDict();
+  }
+
+  function pumpDict() {
+    while (dictBusy < 2 && dictQueue.length) {
+      const w = dictQueue.shift();
+      if (dict.has(w)) continue;
+      dictBusy++;
+      Promise.resolve(getDict(w)).finally(() => { dictBusy--; setTimeout(pumpDict, 120); });
+    }
+  }
+
+  function variants(w) {
+    const d = dict.get(w);
+    const out = [];
+    const add = (t) => { if (t && !out.some((o) => o.toLowerCase() === t.toLowerCase())) out.push(t); };
+    if (d && !(d instanceof Promise)) {
+      add(d.translation);
+      for (const e of d.dict) for (const t of e.terms) add(t);
+    } else add(S.wordTr.get(w));
+    return out;
+  }
+
+  // ---------- hover tooltip (LR style) ----------
+
+  let tipEl = null, tipFor = null, tipHideTimer = 0;
+
+  function placeAbove(el, anchor, gap = 10) {
+    const r = anchor.getBoundingClientRect();
+    const left = Math.max(8, Math.min(r.left + r.width / 2 - el.offsetWidth / 2, innerWidth - el.offsetWidth - 8));
+    el.style.left = left + 'px';
+    const top = r.top - el.offsetHeight - gap;
+    const below = top < 8;
+    el.style.top = (below ? r.bottom + gap : top) + 'px';
+    el.classList.toggle('below', below);
+    el.style.setProperty('--arrow-x', Math.max(14, Math.min(el.offsetWidth - 14, r.left + r.width / 2 - left)) + 'px');
+  }
+
+  function scheduleHideTip() {
+    clearTimeout(tipHideTimer);
+    tipHideTimer = setTimeout(() => { if (!tipEl || !tipEl.matches(':hover')) hideTip(); }, 220);
   }
 
   function hideTip() {
@@ -731,7 +957,103 @@
     if (tipEl) tipEl.remove();
   }
 
-  // ---------- word popup ----------
+  function exprsAt(i, ti) {
+    const c = S.cues[i];
+    return c ? cueExpr(c).filter((e) => e.idx.includes(ti)) : [];
+  }
+
+  function showTip(span, i) {
+    clearTimeout(tipHideTimer);
+    if (!tipEl) {
+      tipEl = h('div', { class: 'ytam-tip' });
+      tipEl.addEventListener('mouseleave', scheduleHideTip);
+      tipEl.addEventListener('mousedown', (e) => e.stopPropagation());
+      tipEl.addEventListener('click', (e) => e.stopPropagation());
+    }
+    const w = span.dataset.w;
+    tipFor = span;
+    const exprs = exprsAt(i, +span.dataset.ti).slice(0, 2);
+
+    const fill = () => {
+      if (tipFor !== span) return;
+      const vars = variants(w).slice(0, 4);
+      const st = S.vocab[w];
+      tipEl.replaceChildren(
+        ...exprs.map((e) => h('div', { class: 'ytam-tip-expr' },
+          h('span', { class: 'ytam-tip-phrase', text: e.p }),
+          h('span', { text: ' : ' + (exprTr(e) || '…') }),
+          h('button', {
+            class: 'ytam-tip-save' + (S.vocab[e.key] === 1 ? ' on' : ''),
+            title: 'Сохранить выражение в Anki',
+            text: '📖',
+            onclick: () => {
+              setWordStatus(e.key, 1);
+              queueCard(i, { word: e.p, meaning: exprTr(e), expr: true, hl: e.surf });
+              fill();
+            },
+          }))),
+        h('div', { class: 'ytam-tip-vars' }, vars.length ? vars.map((t) => h('div', { text: t })) : h('div', { text: '…' })),
+        h('div', { class: 'ytam-tip-btns' },
+          h('button', { class: 'ytam-tb-known' + (isKnown(w) ? ' on' : ''), title: 'Знаю', text: '✓', onclick: () => { setWordStatus(w, 2); fill(); } }),
+          h('button', {
+            class: 'ytam-tb-learn' + (st === 1 ? ' on' : ''),
+            title: 'Изучаю — в Anki',
+            text: '📖',
+            onclick: () => {
+              if (S.vocab[w] === 1) return;
+              setWordStatus(w, 1);
+              if (settings.ankiOnLearning) queueCard(i, { word: w, meaning: variants(w).slice(0, 3).join(', ') }, true);
+              toast(`${w}: изучаю`);
+              fill();
+            },
+          })));
+      placeAbove(tipEl, span);
+    };
+
+    layer().append(tipEl);
+    fill();
+    const d = getDict(w);
+    if (d instanceof Promise) d.then(fill);
+    for (const e of exprs) {
+      if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
+    }
+  }
+
+  // ---------- word popup (left click) ----------
+
+  const DICT_LINKS = [
+    ['Re', 'Reverso Context', (w, tl) => `https://context.reverso.net/translation/english-${({ ru: 'russian', uk: 'ukrainian', de: 'german', fr: 'french', es: 'spanish', it: 'italian', pl: 'polish', tr: 'turkish', ja: 'japanese', 'zh-CN': 'chinese' })[tl] || 'russian'}/${encodeURIComponent(w)}`],
+    ['Ca', 'Cambridge', (w, tl) => `https://dictionary.cambridge.org/dictionary/${tl === 'ru' ? 'english-russian' : 'english'}/${encodeURIComponent(w)}`],
+    ['Gl', 'Glosbe', (w, tl) => `https://glosbe.com/en/${tl.split('-')[0]}/${encodeURIComponent(w)}`],
+    ['Wi', 'Wiktionary', (w) => `https://en.wiktionary.org/wiki/${encodeURIComponent(w)}`],
+    ['Wr', 'WordReference', (w, tl) => `https://www.wordreference.com/en${tl.split('-')[0]}/${encodeURIComponent(w)}`],
+    ['Yg', 'YouGlish — произношение', (w) => `https://youglish.com/pronounce/${encodeURIComponent(w)}/english`],
+    ['Ur', 'Urban Dictionary', (w) => `https://www.urbandictionary.com/define.php?term=${encodeURIComponent(w)}`],
+  ];
+
+  const aiCache = new Map();
+
+  function mdLite(text) {
+    return esc(text)
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+      .replace(/^\s*[-*]\s+/gm, '• ')
+      .replace(/\n/g, '<br>');
+  }
+
+  function streamAI(params, out) {
+    const key = JSON.stringify(params);
+    if (aiCache.has(key)) { out.innerHTML = mdLite(aiCache.get(key)); return; }
+    out.innerHTML = '<span class="ytam-dim">Думаю…</span>';
+    let text = '';
+    let port;
+    try { port = chrome.runtime.connect({ name: 'ytam-ai' }); } catch (_) { out.textContent = 'Перезагрузите страницу'; return; }
+    port.onMessage.addListener((m) => {
+      if (m.delta) { text += m.delta; out.innerHTML = mdLite(text); }
+      if (m.done) { aiCache.set(key, text); port.disconnect(); }
+      if (m.error) { out.textContent = m.error; port.disconnect(); }
+    });
+    port.postMessage(params);
+  }
 
   function closePop() {
     if (!pop) return;
@@ -741,56 +1063,115 @@
     resumeAfterHover();
   }
 
-  async function openWord(span, i) {
+  function openWord(span, i) {
+    // Second click on the same word closes the popup (LR behaviour).
+    if (pop && pop.span === span) { closePop(); return; }
     closePop();
     hideTip();
     const word = span.textContent;
     const w = span.dataset.w;
+    const cue = S.cues[i];
+    if (!cue) return;
     const v = getVideo();
     if (v && !v.paused) { v.pause(); S.hoverPaused = true; }
+    const exprs = exprsAt(i, +span.dataset.ti);
 
-    const body = h('div', { class: 'ytam-pop-body', text: S.wordTr.get(w) || 'Перевожу…' });
-    const info = { word, meaning: S.wordTr.get(w) || '' };
-    const stBtn = (st, label) => h('button', {
-      class: 'ytam-st' + ((S.vocab[w] || 0) === st ? ' on' : ''),
-      'data-st': String(st),
-      text: label,
-      onclick: (e) => {
+    const trLine = h('div', { class: 'ytam-pop-tr', text: variants(w).slice(0, 3).join(', ') || '…' });
+    const pill = h('span', { class: 'ytam-pill' });
+    const setPill = () => { pill.className = 'ytam-pill ' + (S.vocab[w] === 1 ? 'learning' : isKnown(w) ? 'known' : 'new'); };
+    setPill();
+
+    const aiOut = h('div', { class: 'ytam-ai-out' });
+    const tabs = [['explain', 'Объяснить'], ['examples', 'Примеры'], ['grammar', 'Грамматика']];
+    const tabBtns = tabs.map(([kind, label]) => h('button', {
+      class: 'ytam-tab', text: label,
+      onclick: () => {
+        tabBtns.forEach((b) => b.classList.toggle('on', b.textContent === label));
+        streamAI({ kind, word, sentence: cue.text, tl: settings.targetLang }, aiOut);
+      },
+    }));
+    const ask = h('input', { class: 'ytam-ask', type: 'text', placeholder: 'Спросить о фразе…' });
+    ask.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter' && ask.value.trim()) {
+        tabBtns.forEach((b) => b.classList.remove('on'));
+        streamAI({ kind: 'ask', word, sentence: cue.text, question: ask.value.trim(), tl: settings.targetLang }, aiOut);
+        ask.value = '';
+      }
+    });
+
+    const dictBox = h('div', { class: 'ytam-pop-dict' });
+    const fillDict = () => {
+      const d = dict.get(w);
+      if (!d || d instanceof Promise) return;
+      trLine.textContent = variants(w).slice(0, 3).join(', ');
+      dictBox.replaceChildren(h('div', { class: 'ytam-dict-word', text: word }),
+        ...(d.dict.length ? d.dict.map((e) => h('div', {}, h('i', { text: `(${e.pos}) ` }), e.terms.join(', '))) : [h('div', { text: d.translation })]));
+    };
+
+    const examples = S.cues.map((c, k) => k).filter((k) => k !== i && tokensOf(S.cues[k].text).includes(w)).slice(0, 4);
+    const statusBtn = (st, text, title) => h('button', {
+      class: 'ytam-sb', 'data-st': String(st), text, title,
+      onclick: () => {
+        if (st === 1 && S.vocab[w] !== 1 && settings.ankiOnLearning) queueCard(i, { word, meaning: variants(w).slice(0, 3).join(', ') }, true);
         setWordStatus(w, st);
-        e.target.parentNode.querySelectorAll('.ytam-st').forEach((b) => b.classList.toggle('on', +b.dataset.st === st));
+        setPill();
+        el.querySelectorAll('.ytam-sb').forEach((b) => b.classList.toggle('on', +b.dataset.st === (S.vocab[w] || 0)));
       },
     });
+
     const el = h('div', { class: 'ytam-pop' },
-      h('div', { class: 'ytam-pop-word', text: word }),
-      body,
-      h('div', { class: 'ytam-pop-status' }, stBtn(0, 'Новое'), stBtn(1, 'Изучаю'), stBtn(2, 'Знаю')),
+      h('div', { class: 'ytam-pop-head' },
+        pill,
+        h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }), trLine),
+        h('button', { class: 'ytam-x', title: 'Произнести', text: '🔊', onclick: () => speak(word) }),
+        h('button', { class: 'ytam-x', title: 'Закрыть', text: '✕', onclick: closePop })),
+      exprs.length ? h('div', { class: 'ytam-pop-exprs' }, exprs.map((e) => h('div', {},
+        h('span', { class: 'ytam-tip-phrase', text: e.p }), ' — ' + (exprTr(e) || '…'),
+        h('button', { class: 'ytam-tip-save' + (S.vocab[e.key] === 1 ? ' on' : ''), text: '📖', title: 'Выражение в Anki',
+          onclick: (ev) => { setWordStatus(e.key, 1); queueCard(i, { word: e.p, meaning: exprTr(e), expr: true, hl: e.surf }); ev.target.classList.add('on'); } })))) : null,
+      h('div', { class: 'ytam-tabs' }, tabBtns),
+      aiOut,
+      ask,
+      dictBox,
+      examples.length ? h('div', { class: 'ytam-pop-ex' },
+        h('div', { class: 'ytam-ex-head', text: 'Примеры из этого видео' }),
+        examples.map((k) => h('div', { class: 'ytam-ex', onclick: () => { closePop(); seekCue(k, true); } }, wordsNode(S.cues[k].text, 'x', k)))) : null,
+      h('div', { class: 'ytam-pop-links' }, DICT_LINKS.map(([abbr, title, url]) =>
+        h('a', { href: url(word, settings.targetLang), target: '_blank', rel: 'noopener', title, text: abbr }))),
       h('div', { class: 'ytam-pop-actions' },
-        h('button', { class: 'ytam-btn', text: '+ Слово в Anki', onclick: () => { setWordStatus(w, 1); queueCard(i, info); closePop(); } }),
-        h('button', { class: 'ytam-btn sec', text: '+ Фраза', onclick: () => { queueCard(i, null); closePop(); } })));
+        statusBtn(2, '✓', 'Знаю'),
+        statusBtn(1, '📖', 'Изучаю — карточка в Anki'),
+        statusBtn(0, '⊘', 'Сбросить статус'),
+        h('button', { class: 'ytam-sb', text: STAR, title: 'Только фраза в Anki', onclick: () => { queueCard(i, null); closePop(); } })));
+    el.querySelectorAll('.ytam-sb[data-st]').forEach((b) => b.classList.toggle('on', +b.dataset.st === (S.vocab[w] || 0)));
     el.addEventListener('mousedown', (e) => e.stopPropagation());
     el.addEventListener('click', (e) => e.stopPropagation());
+    el.addEventListener('contextmenu', (e) => e.stopPropagation());
     layer().append(el);
     span.classList.add('ytam-w-sel');
     pop = { el, span };
-    placeAbove(el, span);
+    placeAbove(el, span, 14);
 
+    fillDict();
+    const d = getDict(w);
+    if (d instanceof Promise) d.then(() => { if (pop && pop.el === el) { fillDict(); placeAbove(el, span, 14); } });
+    tabBtns[0].click();
+  }
+
+  function speak(text) {
     try {
-      const res = await bg({ type: 'lookup', word, tl: settings.targetLang });
-      if (!pop || pop.el !== el) return;
-      const terms = res.dict.flatMap((d) => d.terms).filter((t) => t.toLowerCase() !== res.translation.toLowerCase());
-      info.meaning = [res.translation, ...terms.slice(0, 4)].filter(Boolean).join(', ');
-      body.replaceChildren(
-        h('div', { class: 'ytam-pop-main', text: res.translation }),
-        h('div', { class: 'ytam-pop-dict' }, res.dict.map((d) =>
-          h('div', {}, h('i', { text: d.pos + ': ' }), d.terms.join(', ')))));
-      placeAbove(el, span);
-    } catch (e) {
-      if (pop && pop.el === el && !S.wordTr.has(w)) body.textContent = 'Ошибка: ' + e.message;
-    }
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      speechSynthesis.speak(u);
+    } catch (_) {}
   }
 
   document.addEventListener('mousedown', (e) => {
-    if (pop && !pop.el.contains(e.target)) closePop();
+    if (!pop || pop.el.contains(e.target)) return;
+    if (e.target.closest && e.target.closest('.ytam-w') === pop.span) return; // handled by the click toggle
+    closePop();
   }, true);
 
   // ---------- background audio capture ----------
@@ -837,7 +1218,8 @@
 
   function onAudio(e) {
     const v = Tap.v;
-    if (!v || v.paused || v.seeking || !Tap.src || !S.videoId) { Tap.lastEnd = null; return; }
+    // Pauses keep the pass going; only a jump in video time (seek) starts a new one.
+    if (!v || v.paused || v.seeking || !Tap.src || !S.videoId) return;
     const inp = e.inputBuffer;
     const n = inp.length, sr = inp.sampleRate;
     const t1 = v.currentTime;
@@ -965,8 +1347,13 @@
   function highlight(text, word) {
     const html = esc(text);
     if (!word) return html;
-    const w = esc(word).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return html.replace(new RegExp(`(^|[^\\p{L}\\p{N}])(${w})(?=$|[^\\p{L}\\p{N}])`, 'iu'), '$1<b>$2</b>');
+    const reEsc = (x) => esc(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const parts = word.split(/\s+/).filter(Boolean);
+    const B = '(^|[^\\p{L}\\p{N}])', E = '(?=$|[^\\p{L}\\p{N}])';
+    const whole = html.replace(new RegExp(`${B}(${parts.map(reEsc).join('[^\\p{L}\\p{N}]+')})${E}`, 'iu'), '$1<b>$2</b>');
+    if (whole !== html || parts.length === 1) return whole;
+    // Separated phrase ("pick it up"): bold each part.
+    return parts.reduce((acc, p) => acc.replace(new RegExp(`${B}(${reEsc(p)})${E}`, 'iu'), '$1<b>$2</b>'), html);
   }
 
   // Saving is instant for the user; the card goes to Anki once the
@@ -982,12 +1369,14 @@
       cue: { start: cue.start, end: cue.end, text: cue.text },
       translation: S.trans[i],
       word: wordInfo ? wordInfo.word : '',
+      expr: !!(wordInfo && wordInfo.expr),
+      hl: wordInfo ? (wordInfo.hl || wordInfo.word) : '',
       meaning: wordInfo ? (wordInfo.meaning || S.wordTr.get(norm(wordInfo.word)) || '') : '',
       image: settings.includeImage && near ? snapshot(v) : null,
       queuedAt: Date.now(),
     });
     markRow(cue, 'ytam-pending', true);
-    if (!quiet) toast(wordInfo ? `✓ Сохранено: ${wordInfo.word}` : '✓ Фраза сохранена', 'ok');
+    if (!quiet) toast(wordInfo ? `✓ Сохранено: ${wordInfo.word}` : '★ Фраза сохранена', 'ok');
     processPending(false);
   }
 
@@ -997,7 +1386,7 @@
     for (const item of [...S.pending]) {
       let ready = force || !settings.includeAudio || Date.now() - item.queuedAt > 10 * 60 * 1000;
       if (!ready) {
-        const ext = tapExtract(item.cue.start - 0.7, item.cue.end + 0.9);
+        const ext = tapExtract(Math.max(0, item.cue.start - 0.7), item.cue.end + 0.9);
         ready = !!ext && ext.cov > 0.97;
         // Seeked away / phrase passed without being fully heard: don't wait forever.
         if (!ready && v && !v.paused && item.videoId === S.videoId &&
@@ -1014,7 +1403,7 @@
     try {
       let audio = null;
       if (settings.includeAudio) {
-        const ext = tapExtract(cue.start - 0.7, cue.end + 0.9);
+        const ext = tapExtract(Math.max(0, cue.start - 0.7), cue.end + 0.9);
         if (ext && ext.cov > 0.5) audio = encodeMp3(trimClip(ext, cue.start, cue.end), ext.rate);
       }
       let translation = item.translation;
@@ -1022,7 +1411,10 @@
         try { translation = (await bg({ type: 'translateLines', lines: [cue.text], tl: settings.targetLang }))[0]; } catch (_) { translation = ''; }
       }
       let meaning = item.meaning;
-      if (item.word) {
+      if (item.word && item.expr && !meaning) {
+        try { meaning = (await bg({ type: 'translateWords', words: [item.word.toLowerCase()], tl: settings.targetLang }))[item.word.toLowerCase()] || ''; } catch (_) {}
+      }
+      if (item.word && !item.expr) {
         try {
           const res = await bg({ type: 'lookup', word: item.word, tl: settings.targetLang });
           const terms = res.dict.flatMap((d) => d.terms).filter((t) => t.toLowerCase() !== res.translation.toLowerCase());
@@ -1036,7 +1428,7 @@
           videoId: item.videoId,
           title: item.title,
           start: cue.start,
-          sentenceHtml: highlight(cue.text, item.word),
+          sentenceHtml: highlight(cue.text, item.hl || item.word),
           translation,
           word: item.word,
           wordMeaning: meaning,
@@ -1078,7 +1470,7 @@
     mountOverlay();
     const t = v.currentTime;
     const a = cueIndexAt(t);
-    if (a !== S.active) { setActiveRow(a); S.active = a; }
+    if (a !== S.active) { setActiveRow(a); S.active = a; prefetchAround(a); }
     const c = S.cues[a];
     const shown = c && t <= c.end + 0.25 ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
@@ -1112,7 +1504,8 @@
       const w = S.hoverWord.el.dataset.w;
       setWordStatus(w, st);
       toast(`${w}: ${['новое', 'изучаю', 'знаю'][st]}`);
-      if (st === 1 && settings.ankiOnLearning) queueCard(S.hoverWord.i, { word: w }, true);
+      if (st === 1 && settings.ankiOnLearning) queueCard(S.hoverWord.i, { word: w, meaning: variants(w).slice(0, 3).join(', ') }, true);
+      if (tipFor) showTip(tipFor, S.hoverWord.i);
       return;
     }
 
@@ -1145,6 +1538,7 @@
     S.track = null;
     S.saved = new Set();
     S.waitingCapture = false;
+    dictQueue.length = 0;
     closePop();
     hideTip();
     document.documentElement.classList.remove('ytam-hide-native');
@@ -1170,7 +1564,22 @@
     if (!data) return setStatus('Не удалось получить данные плеера. Обновите страницу.');
     S.title = data.title || document.title;
     S.tracks = data.tracks;
-    if (!S.tracks.length) return setStatus('У этого видео нет субтитров.');
+    if (!S.tracks.length) {
+      if (settings.aiMode !== 'audio') return setStatus('У этого видео нет субтитров. Включите режим «ИИ слушает видео» — он создаст их сам.');
+      S.track = { languageCode: 'ai', kind: 'ai', name: 'ИИ', baseUrl: '' };
+      setStatus('🎧 ИИ слушает видео…');
+      try {
+        const cues = await aiVideoProcess([], token);
+        if (token !== S.token || !cues) return;
+        document.documentElement.classList.add('ytam-hide-native');
+        setCues(cues);
+        setStatus('');
+        prefetchWords(token);
+      } catch (e) {
+        if (token === S.token) setStatus('ИИ не смог создать субтитры: ' + e.message);
+      }
+      return;
+    }
 
     const en = (t) => /^en/i.test(t.languageCode);
     S.track = S.tracks.find((t) => en(t) && t.kind !== 'asr') || S.tracks.find(en) || S.tracks[0];
@@ -1198,19 +1607,30 @@
     onNavigate();
   });
 
-  const RELOAD_KEYS = ['aiEnabled', 'aiModel', 'maxWords', 'targetLang'];
-  const RECOLOR_KEYS = ['vocabSize', 'nextSize', 'hlLearning', 'hlNext', 'hlRare'];
+  const RELOAD_KEYS = ['aiMode', 'aiModel', 'maxWords', 'targetLang'];
+  const RERENDER_KEYS = ['vocabSize', 'nextSize', 'hlKnown', 'hlLearning', 'hlNext', 'hlRare', 'builtinExpr'];
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {
-      if (changes.vocab) { S.vocab = changes.vocab.newValue || {}; recolor(); }
+      if (changes.vocab) {
+        const nv = changes.vocab.newValue || {};
+        const keys = new Set([...Object.keys(nv), ...Object.keys(S.vocab)]);
+        const diff = [...keys].filter((k) => nv[k] !== S.vocab[k]);
+        S.vocab = nv;
+        if (!diff.length) return; // our own change, already applied
+        if (diff.length > 20 || diff.some((k) => k.includes(' '))) { renderList(); renderOverlay(); } else diff.forEach(recolor);
+      }
       return;
     }
     if (area !== 'sync') return;
     const reload = RELOAD_KEYS.some((k) => changes[k] && changes[k].newValue !== settings[k]);
     for (const k in changes) settings[k] = changes[k].newValue;
     applySettings();
-    if (RECOLOR_KEYS.some((k) => changes[k])) recolor();
-    if (changes.targetLang) S.wordTr = new Map();
+    if (RERENDER_KEYS.some((k) => changes[k])) {
+      S.cues.forEach((c) => { delete c._expr; });
+      renderList();
+      renderOverlay();
+    }
+    if (changes.targetLang) { S.wordTr = new Map(); dict.clear(); aiCache.clear(); }
     if (changes.enabled) { if (!settings.enabled) teardown(); onNavigate(); }
     if (reload && S.track && S.words.length) { S.token++; loadTrack(S.track, S.token); }
   });

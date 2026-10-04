@@ -43,30 +43,41 @@
 
   <section>
     <h2>Подсветка слов</h2>
-    <p class="hint">Слова, которые вы пометили, подсвечиваются по статусу. Остальные — по частотному словарю
-      (50 000 самых частых английских слов): первые <b>N</b> считаются известными, следующие — «к изучению».
+    <p class="hint">Как в Language Reactor. Статус слова — либо ваша отметка, либо частотный словарь
+      (50 000 самых частых английских слов): первые <b>N</b> считаются известными, следующие — рекомендованными.
       Ориентиры: A2 ≈ 1500, B1 ≈ 3000, B2 ≈ 5000, C1 ≈ 8000.</p>
     <label class="row"><span>Мой словарный запас (N)</span><input type="number" min="0" max="50000" step="500" data-k="vocabSize"></label>
-    <label class="row"><span>Сколько следующих слов — «к изучению»</span><input type="number" min="0" max="50000" step="500" data-k="nextSize"></label>
-    <div class="row"><label class="chk"><input type="checkbox" data-k="hlLearning"> Изучаю (сохранённые)</label><input type="color" data-k="colorLearning"></div>
-    <div class="row"><label class="chk"><input type="checkbox" data-k="hlNext"> К изучению (следующие по частоте)</label><input type="color" data-k="colorNext"></div>
-    <div class="row"><label class="chk"><input type="checkbox" data-k="hlRare"> Редкие слова</label><input type="color" data-k="colorRare"></div>
-    <p class="hint">Управление на YouTube: <b>наведение</b> — перевод; <b>клик</b> — словарь и кнопки;
-      <b>колесо (средняя кнопка)</b> — Новое → Изучаю → Знаю → Новое;
-      при наведении на слово клавиши <b>1</b> — изучаю, <b>2</b> — знаю, <b>0</b> — новое.</p>
+    <label class="row"><span>Сколько следующих слов — «рекомендованные»</span><input type="number" min="0" max="50000" step="500" data-k="nextSize"></label>
+    <div class="row"><label class="chk"><input type="checkbox" data-k="hlKnown"> Известные (зелёные)</label><input type="color" data-k="colorKnown"></div>
+    <div class="row"><label class="chk"><input type="checkbox" data-k="hlNext"> Рекомендованные (оранжевые)</label><input type="color" data-k="colorNext"></div>
+    <div class="row"><label class="chk"><input type="checkbox" data-k="hlRare"> Редкие (фиолетовые)</label><input type="color" data-k="colorRare"></div>
+    <div class="row"><label class="chk"><input type="checkbox" data-k="hlLearning"> Изучаю — в Anki (рамка)</label><input type="color" data-k="colorLearning"></div>
+    <label class="row"><span>Встроенный словарь выражений<small>~350 фразовых глаголов и идиом в подсказке; ИИ-режим находит выражения по контексту</small></span><input type="checkbox" data-k="builtinExpr"></label>
+    <p class="hint">Управление на YouTube: <b>наведение</b> — перевод с вариантами и выражениями;
+      <b>клик</b> — подробное окно (повторный клик закрывает); <b>правая кнопка</b> — Знаю ⇄ Изучаю (Изучаю = карточка в Anki);
+      при наведении клавиши <b>1</b> — изучаю, <b>2</b> — знаю, <b>0</b> — сброс; ☆ — фраза в Anki.</p>
   </section>
 
   <section>
-    <h2>✨ ИИ-обработка субтитров (Gemini)</h2>
-    <p class="hint">ИИ расставляет знаки препинания, собирает полные предложения и переводит их с учётом контекста.
-      Результат кэшируется: повторное открытие видео бесплатно.</p>
-    <label class="row"><span>Включить</span><input type="checkbox" data-k="aiEnabled"></label>
-    <label class="row"><span>Ключ Gemini API<small>Хранится только на этом компьютере</small></span><input type="password" data-k="geminiKey" data-local placeholder="AIza…"></label>
-    <label class="row"><span>Модель</span><input type="text" data-k="aiModel" list="models"></label>
+    <h2>✨ ИИ (Gemini)</h2>
+    <label class="row"><span>Обработка субтитров</span>
+      <select data-k="aiMode">
+        <option value="off">Выключена</option>
+        <option value="text">Текст: пунктуация, предложения, перевод</option>
+        <option value="audio">🎧 ИИ слушает видео: точный текст и тайминги</option>
+      </select>
+    </label>
+    <label class="row"><span>Ключ Gemini API<small>Хранится только на этом компьютере. <a href="https://aistudio.google.com/apikey" target="_blank">Получить ключ</a></small></span><input type="password" data-k="geminiKey" data-local placeholder="AIza…"></label>
+    <label class="row"><span>Модель для субтитров</span><input type="text" data-k="aiModel" list="models"></label>
+    <label class="row"><span>Модель для «Объяснить / Примеры / Грамматика»<small>Нужна самая быстрая</small></span><input type="text" data-k="aiFastModel" list="models"></label>
     <datalist id="models"><option value="gemini-2.5-flash-lite"><option value="gemini-3.1-flash-lite"><option value="gemini-2.5-flash"></datalist>
-    <p class="hint">Примерная стоимость: ~1 600 слов на 10 минут видео ≈ 2,5 тыс. токенов на вход и ~5 тыс. на выход.
-      <br>gemini-2.5-flash-lite: ≈ $0.002 за 10 мин → час видео в день ≈ $0.4 в месяц.
-      <br>gemini-3.1-flash-lite: ≈ $0.008 за 10 мин → ≈ $1.5 в месяц.</p>
+    <p class="hint"><b>Примерная стоимость</b> (gemini-2.5-flash-lite / 3.1-flash-lite):
+      <br>• Текст: ≈ $0.002 / $0.008 за 10 мин видео.
+      <br>• 🎧 Слушает видео: ≈ $0.01 / $0.02 за 10 мин; видео 30 мин ≈ $0.03 / $0.07
+      (видео длиннее 12 мин режется на куски по 10 мин — дороже, т.к. Google тарифицирует аудио куска целиком).
+      <br>• Разбор слова (клик): ≈ $0.0002 за раз.
+      <br>Час видео в день ≈ $2–4 в месяц в режиме «слушает». Результат кэшируется — повторный просмотр бесплатен.
+      Режим «слушает» работает только для публичных видео.</p>
   </section>
 
   <section>
