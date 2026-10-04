@@ -1,0 +1,64 @@
+// Runs in the page (MAIN world). YouTube now signs subtitle requests with a
+// one-time token, so we watch the player's own /api/timedtext requests and
+// hand their URLs to the content script. Also exposes the player response.
+(() => {
+  if (window.__ytamHooked) return;
+  window.__ytamHooked = true;
+
+  const isTimedText = (u) => typeof u === 'string' && u.includes('/api/timedtext');
+  const post = (url, body) => {
+    try {
+      window.postMessage({ __ytam: true, type: 'timedtext', url: new URL(url, location.href).href, body }, '*');
+    } catch (_) {}
+  };
+
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__ytamUrl = String(url);
+    return origOpen.apply(this, arguments);
+  };
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function () {
+    if (isTimedText(this.__ytamUrl)) {
+      this.addEventListener('load', () => {
+        const textual = this.responseType === '' || this.responseType === 'text';
+        post(this.__ytamUrl, textual ? this.responseText : null);
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input && input.url;
+    const p = origFetch.apply(this, arguments);
+    if (isTimedText(url)) {
+      p.then((r) => r.clone().text()).then((t) => post(url, t)).catch(() => {});
+    }
+    return p;
+  };
+
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || !e.data || e.data.__ytamReq !== 'playerResponse') return;
+    let pr = null;
+    try {
+      const player = document.getElementById('movie_player');
+      pr = (player && player.getPlayerResponse && player.getPlayerResponse()) || window.ytInitialPlayerResponse || null;
+    } catch (_) {}
+    const tracks = (pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer &&
+      pr.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+    window.postMessage({
+      __ytam: true,
+      type: 'playerResponse',
+      id: e.data.id,
+      videoId: pr && pr.videoDetails && pr.videoDetails.videoId,
+      title: (pr && pr.videoDetails && pr.videoDetails.title) || document.title,
+      tracks: tracks.map((t) => ({
+        baseUrl: t.baseUrl,
+        languageCode: t.languageCode,
+        kind: t.kind || '',
+        name: (t.name && (t.name.simpleText || (t.name.runs || []).map((r) => r.text).join(''))) || t.languageCode,
+      })),
+    }, '*');
+  });
+})();
