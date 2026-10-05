@@ -1,5 +1,6 @@
+document.getElementById('settings').append(YTAM_buildSettings());
 const $ = (id) => document.getElementById(id);
-const STATUS = { 1: 'Изучаю', 2: 'Знаю' };
+const STATUS = { 1: 'Изучаю', 2: 'Знаю', 3: 'Не учить' };
 let vocab = {};
 
 $('test').onclick = () => ytamCheckAnki($('status'), $('decks'));
@@ -22,7 +23,7 @@ function render() {
     .slice(0, 500);
   $('list').replaceChildren(...rows.map(([w, s]) => {
     const sel = document.createElement('select');
-    for (const [v, label] of [['1', 'Изучаю'], ['2', 'Знаю'], ['0', 'Удалить']]) sel.append(new Option(label, v, false, String(s) === v));
+    for (const [v, label] of [['1', 'Изучаю'], ['2', 'Знаю'], ['3', 'Не учить'], ['0', 'Удалить']]) sel.append(new Option(label, v, false, String(s) === v));
     sel.onchange = () => setStatus(w, +sel.value);
     const row = document.createElement('div');
     row.className = 'w';

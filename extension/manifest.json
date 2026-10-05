@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -37,9 +37,11 @@
         "data/freq_en.js",
         "data/expressions.js",
         "defaults.js",
+        "settings-form.js",
         "content.js"
       ],
       "css": [
+        "settings-form.css",
         "content.css"
       ],
       "run_at": "document_idle"

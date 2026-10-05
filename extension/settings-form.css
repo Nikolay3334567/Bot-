@@ -1,0 +1,35 @@
+/* Settings form (in-player dialog and options page), dark Language Reactor look. */
+.ytam-set { display: flex; flex-direction: column; min-height: 0; color: #e8e8e8; font: 14px/1.4 Roboto, "Segoe UI", Arial, sans-serif; }
+.ytam-set-nav { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 12px; border-bottom: 1px solid #3a3a3a; }
+.ytam-set-tab { padding: 10px 14px; border: 0; border-bottom: 2px solid transparent; background: none; color: #aaa; font: 500 14px Roboto, Arial, sans-serif; cursor: pointer; }
+.ytam-set-tab:hover { color: #fff; }
+.ytam-set-tab.on { border-bottom-color: #c060d0; color: #fff; }
+.ytam-set-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 20px 20px; scrollbar-color: #666 #2a2a2a; }
+.ytam-set-pane { display: none; }
+.ytam-set-pane.on { display: block; }
+.ytam-set-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; align-items: center; padding: 9px 0; border-bottom: 1px solid #333; }
+.ytam-set-row.wide { grid-template-columns: 1fr; gap: 6px; }
+.ytam-set-label { display: flex; flex-direction: column; text-align: right; }
+.ytam-set-row.wide .ytam-set-label { text-align: left; }
+.ytam-set-label small { color: #8a8a8a; font-size: 12px; }
+.ytam-set-label span[data-color-key] { font-weight: 500; }
+.ytam-set-ctl { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ytam-set-ctl select, .ytam-set-ctl input[type=text], .ytam-set-ctl input[type=password], .ytam-set-ctl input[type=number], .ytam-set-ctl textarea {
+  box-sizing: border-box; width: 100%; max-width: 360px; padding: 6px 8px; border: 1px solid #555; border-radius: 4px;
+  background: #1f1f1f; color: #eee; font: 14px Roboto, Arial, sans-serif;
+}
+.ytam-set-ctl textarea { max-width: none; min-height: 52px; resize: vertical; font: 12px/1.4 monospace; }
+.ytam-set-ctl input[type=range] { flex: 1; max-width: 240px; accent-color: #6cb8ff; }
+.ytam-set-ctl input[type=color] { width: 34px; height: 24px; padding: 0; border: 1px solid #555; border-radius: 4px; background: none; cursor: pointer; }
+.ytam-set-val { min-width: 64px; color: #bbb; font-size: 13px; }
+.ytam-switch { position: relative; display: inline-block; flex: none; width: 46px; height: 24px; cursor: pointer; }
+.ytam-switch input { position: absolute; opacity: 0; }
+.ytam-switch span { position: absolute; inset: 4px 0; border-radius: 8px; background: #5a5a5a; transition: background .15s; }
+.ytam-switch span::after { content: ''; position: absolute; left: -2px; top: -5px; width: 26px; height: 26px; border-radius: 50%; background: #ddd; box-shadow: 0 1px 3px rgba(0, 0, 0, .5); transition: transform .15s, background .15s; }
+.ytam-switch input:checked + span { background: #4d6b84; }
+.ytam-switch input:checked + span::after { transform: translateX(22px); background: #7cc4ff; }
+.ytam-set-reset { margin-top: 14px; padding: 6px 12px; border: 1px solid #555; border-radius: 4px; background: none; color: #6cb8ff; font: 13px Roboto, Arial, sans-serif; cursor: pointer; }
+@media (max-width: 600px) {
+  .ytam-set-row { grid-template-columns: 1fr; gap: 6px; }
+  .ytam-set-label { text-align: left; }
+}

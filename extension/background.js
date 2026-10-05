@@ -197,14 +197,15 @@ Return JSON array of {"b","e","s","t","x"} ordered by time.`;
 }
 
 // Streaming explanations for the word popup (Объяснить / Примеры / Грамматика / вопрос).
-function explainPrompt({ kind, word, sentence, question, tl }) {
+function explainPrompt({ kind, word, sentence, question, tl }, cfg) {
   const lang = LANGS[tl] || tl;
-  const base = `Phrase from a video: "${sentence}"\nFocus word or expression: "${word}"\nAnswer in ${lang}. Be brief (max 90 words), plain text, you may use **bold** and "- " bullets.`;
+  const base = `Фраза из видео: "${sentence}"\nСлово или выражение: "${word}"\nОтвечай на языке: ${lang}. Кратко (до 90 слов), простым текстом; можно **жирный** и списки через "- ".`;
+  const fill = (t) => String(t || '').replace(/\{word\}/g, word).replace(/\{sentence\}/g, sentence);
   switch (kind) {
-    case 'explain': return `${base}\nExplain what "${word}" means exactly in this phrase and what the whole phrase means. Mention nuance, register or connotation if relevant.`;
-    case 'examples': return `${base}\nGive 4 short natural English example sentences using "${word}" in the same meaning, each followed by its translation in parentheses.`;
-    case 'grammar': return `${base}\nExplain the grammar of this phrase that a learner should notice (tense, construction, word order, why this form of "${word}" is used).`;
-    default: return `${base}\nThe learner asks: ${question}`;
+    case 'explain': return `${base}\n${fill(cfg.aiPromptExplain)}`;
+    case 'examples': return `${base}\n${fill(cfg.aiPromptExamples)}`;
+    case 'grammar': return `${base}\n${fill(cfg.aiPromptGrammar)}`;
+    default: return `${base}\nВопрос ученика: ${question}`;
   }
 }
 
@@ -244,8 +245,8 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ytam-ai') return;
   port.onMessage.addListener(async (msg) => {
     try {
-      const { aiFastModel } = await chrome.storage.sync.get({ aiFastModel: YTAM_DEFAULTS.aiFastModel });
-      await streamGemini(aiFastModel, explainPrompt(msg), (delta) => port.postMessage({ delta }));
+      const cfg = await chrome.storage.sync.get(YTAM_DEFAULTS);
+      await streamGemini(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => port.postMessage({ delta }));
       port.postMessage({ done: true });
     } catch (e) {
       try { port.postMessage({ error: e.message || String(e) }); } catch (_) {}
@@ -356,6 +357,7 @@ async function handle(msg) {
     case 'aiSegment': return aiSegment(msg);
     case 'aiVideo': return aiVideo(msg);
     case 'addCard': return addCard(msg.card);
+    case 'deleteNotes': return anki('deleteNotes', { notes: msg.ids });
     case 'ankiStatus': {
       const version = await anki('version');
       const decks = await anki('deckNames');
