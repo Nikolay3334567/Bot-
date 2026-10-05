@@ -10,6 +10,8 @@ self.YTAM_DEFAULTS = {
   padEnd: 0.3,
   ankiOnLearning: true,
   ankiDelete: 'drop',
+  audioSource: 'auto',
+  helperUrl: 'http://127.0.0.1:8766',
   // Translation & subtitles
   targetLang: 'ru',
   showTranslation: true,
@@ -132,6 +134,8 @@ self.YTAM_SCHEMA = [
       { k: 'ankiOnLearning', label: '«Изучаю» сразу создаёт карточку', type: 'toggle' },
       { k: 'ankiDelete', label: 'Удалять карточку из Anki (через 30 с)', type: 'select', options: [['drop', 'Когда слово убрано / «не учить»'], ['all', 'Также когда отмечено «знаю»'], ['never', 'Никогда']] },
       { k: 'includeAudio', label: 'Аудио фразы (MP3)', type: 'toggle' },
+      { k: 'audioSource', label: 'Откуда брать звук', type: 'select', options: [['auto', 'Помощник yt-dlp, если запущен, иначе запись (рекомендуется)'], ['helper', 'Только помощник yt-dlp'], ['capture', 'Только запись с видео']] },
+      { k: 'helperUrl', label: 'Адрес помощника', type: 'text', hint: 'Запустите helper/start-helper.bat (см. README)' },
       { k: 'includeImage', label: 'Кадр из видео', type: 'toggle' },
       { k: 'smartTrim', label: 'Подгонять края аудио по паузам', type: 'toggle' },
       { k: 'padStart', label: 'Запас до фразы', type: 'range', min: 0, max: 1.5, step: 0.05, unit: 'с' },
@@ -151,3 +155,86 @@ self.YTAM_SCHEMA = [
     ],
   },
 ];
+
+// Developer menu (🛠 in the side panel): every internal number, tunable live.
+// Stored in chrome.storage.local.dev
+self.YTAM_DEV_SCHEMA = [
+  {
+    title: 'Аудио: окно и обрезка', fields: [
+      { k: 'clipLead', label: 'Окно до фразы (поиск начала)', def: 0.7, min: 0, max: 3, step: 0.05, unit: 'с' },
+      { k: 'clipTail', label: 'Окно после фразы (поиск конца)', def: 0.9, min: 0, max: 4, step: 0.05, unit: 'с' },
+      { k: 'trimBack', label: 'Искать тишину назад от начала', def: 0.6, min: 0, max: 3, step: 0.05, unit: 'с' },
+      { k: 'trimFwd', label: 'Искать тишину вперёд от конца', def: 0.8, min: 0, max: 4, step: 0.05, unit: 'с' },
+      { k: 'trimEndFrom', label: 'Начинать поиск конца раньше на', def: 0.15, min: 0, max: 1.5, step: 0.05, unit: 'с' },
+      { k: 'trimThrFactor', label: 'Порог тишины (доля громкости)', def: 0.12, min: 0.01, max: 0.6, step: 0.01 },
+      { k: 'trimThrMin', label: 'Минимальный порог тишины', def: 250, min: 0, max: 4000, step: 50 },
+      { k: 'trimFrameMs', label: 'Окно анализа громкости', def: 20, min: 5, max: 60, step: 1, unit: 'мс' },
+      { k: 'silenceMs', label: 'Пауза = тишина не короче', def: 160, min: 20, max: 800, step: 10, unit: 'мс' },
+      { k: 'startKeepMs', label: 'Оставить перед началом речи', def: 40, min: 0, max: 400, step: 10, unit: 'мс' },
+      { k: 'endKeepMs', label: 'Оставить после конца речи', def: 80, min: 0, max: 600, step: 10, unit: 'мс' },
+      { k: 'fadeMs', label: 'Плавное нарастание/затухание', def: 12, min: 0, max: 200, step: 2, unit: 'мс' },
+      { k: 'mp3Kbps', label: 'Битрейт MP3', def: 96, min: 32, max: 192, step: 16, unit: 'кбит/с' },
+      { k: 'helperRate', label: 'Частота звука от помощника', def: 24000, min: 16000, max: 48000, step: 8000, unit: 'Гц' },
+    ],
+  },
+  {
+    title: 'Аудио: запись с видео (запасной путь)', fields: [
+      { k: 'tapMinutes', label: 'Держать в памяти', def: 4, min: 1, max: 15, step: 1, unit: 'мин' },
+      { k: 'pendingCov', label: 'Ждать, пока прозвучит фраза (доля)', def: 0.97, min: 0.5, max: 1, step: 0.01 },
+      { k: 'minCov', label: 'Мин. доля звука для карточки', def: 0.5, min: 0.1, max: 1, step: 0.05 },
+    ],
+  },
+  {
+    title: 'Тайминги субтитров', fields: [
+      { k: 'showTail', label: 'Держать фразу на экране после конца', def: 0.25, min: 0, max: 3, step: 0.05, unit: 'с' },
+      { k: 'subShift', label: 'Сдвиг всех субтитров', def: 0, min: -2, max: 2, step: 0.05, unit: 'с', hint: '+ = позже' },
+      { k: 'autoPauseEarly', label: 'Автопауза раньше конца на', def: 0.06, min: -0.5, max: 0.8, step: 0.02, unit: 'с' },
+      { k: 'segGap', label: 'Делить фразу при паузе больше', def: 0.6, min: 0.1, max: 3, step: 0.05, unit: 'с' },
+      { k: 'asrWordMax', label: 'Макс. длина слова автосубтитров', def: 0.8, min: 0.2, max: 2, step: 0.05, unit: 'с' },
+      { k: 'clauseRatio', label: 'Делить по запятой после доли длины', def: 0.6, min: 0.2, max: 1, step: 0.05 },
+      { k: 'tickMs', label: 'Частота обновления', def: 50, min: 15, max: 250, step: 5, unit: 'мс' },
+    ],
+  },
+  {
+    title: 'Подсказка и окно слова', fields: [
+      { k: 'tipHideMs', label: 'Скрывать подсказку через', def: 200, min: 0, max: 1500, step: 10, unit: 'мс' },
+      { k: 'resumeMs', label: 'Продолжать видео после ухода мыши через', def: 250, min: 0, max: 2000, step: 10, unit: 'мс' },
+      { k: 'tipGap', label: 'Отступ подсказки от слова', def: 10, min: 0, max: 60, step: 1, unit: 'px' },
+      { k: 'popGap', label: 'Отступ окна от слова', def: 14, min: 0, max: 60, step: 1, unit: 'px' },
+      { k: 'popLoadMs', label: 'Макс. ожидание словаря перед показом окна', def: 1200, min: 0, max: 5000, step: 100, unit: 'мс' },
+      { k: 'popAboveMin', label: 'Показывать окно над словом, если места больше', def: 260, min: 0, max: 800, step: 10, unit: 'px' },
+    ],
+  },
+  {
+    title: 'Подгрузка переводов', fields: [
+      { k: 'dictAhead', label: 'Подгружать словарь на фраз вперёд', def: 4, min: 0, max: 30, step: 1 },
+      { k: 'dictConc', label: 'Параллельных запросов словаря', def: 2, min: 1, max: 8, step: 1 },
+      { k: 'dictDelayMs', label: 'Пауза между запросами словаря', def: 120, min: 0, max: 2000, step: 10, unit: 'мс' },
+    ],
+  },
+  {
+    title: 'ИИ', fields: [
+      { k: 'aiChunkWords', label: 'Текст: слов в одном запросе', def: 300, min: 80, max: 2000, step: 20 },
+      { k: 'aiVideoChunkSec', label: 'Видео: длина куска', def: 600, min: 60, max: 2400, step: 30, unit: 'с' },
+      { k: 'aiSingleMaxMin', label: 'Видео: одним запросом, если короче', def: 12, min: 1, max: 60, step: 1, unit: 'мин' },
+      { k: 'aiConc', label: 'Параллельных запросов', def: 3, min: 1, max: 8, step: 1 },
+      { k: 'aiVideoFps', label: 'Видео: кадров в секунду для ИИ', def: 0.2, min: 0.05, max: 2, step: 0.05 },
+      { k: 'aiTemp', label: 'Температура', def: 0.2, min: 0, max: 1, step: 0.05 },
+      { k: 'aiMinMatch', label: 'Мин. совпадение текста ИИ с оригиналом', def: 0.7, min: 0.3, max: 1, step: 0.05 },
+    ],
+  },
+  {
+    title: 'Карточки', fields: [
+      { k: 'imgWidth', label: 'Ширина кадра', def: 640, min: 240, max: 1920, step: 40, unit: 'px' },
+      { k: 'jpegQuality', label: 'Качество кадра', def: 0.82, min: 0.3, max: 1, step: 0.02 },
+      { k: 'ankiDeleteSec', label: 'Удалять из Anki через', def: 30, min: 0, max: 600, step: 5, unit: 'с' },
+    ],
+  },
+  {
+    title: 'Отладка', fields: [
+      { k: 'debugHud', label: 'Панель отладки на видео', def: 0, min: 0, max: 1, step: 1, hint: '1 = показать время, фразу, буфер звука, статус помощника' },
+    ],
+  },
+];
+self.YTAM_DEV_DEFAULTS = {};
+for (const g of self.YTAM_DEV_SCHEMA) for (const f of g.fields) self.YTAM_DEV_DEFAULTS[f.k] = f.def;

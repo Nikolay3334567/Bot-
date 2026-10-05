@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -12,7 +12,9 @@
     "https://translate.googleapis.com/*",
     "http://127.0.0.1:8765/*",
     "http://localhost:8765/*",
-    "https://generativelanguage.googleapis.com/*"
+    "https://generativelanguage.googleapis.com/*",
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -124,7 +124,7 @@ const EXPR_SCHEMA = {
 
 const EXPR_RULE = (lang) => `- "x": idioms, phrasal verbs, fixed expressions and collocations in the line whose meaning is not obvious from the single words (e.g. "get along", "needs to be", "for the sake of", "doesn't cut it"). "p" must be copied exactly as it appears in the line, "t" is its meaning in ${lang}. Empty array if none.`;
 
-async function aiSegment({ text, tl, maxWords, model }) {
+async function aiSegment({ text, tl, maxWords, model, temperature = 0.2 }) {
   const lang = LANGS[tl] || tl;
   const prompt = `You are given a fragment of a YouTube transcript. It may lack punctuation and capitalization (auto-generated captions) or be split mid-sentence.
 
@@ -144,7 +144,7 @@ ${text}`;
   const out = await gemini(model, {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0.2,
+      temperature,
       responseMimeType: 'application/json',
       responseSchema: {
         type: 'ARRAY',
@@ -156,7 +156,7 @@ ${text}`;
 }
 
 // Gemini watches/listens to the YouTube video itself (public videos only).
-async function aiVideo({ videoId, from, to, tl, maxWords, model }) {
+async function aiVideo({ videoId, from, to, tl, maxWords, model, fps = 0.2, temperature = 0.1 }) {
   const lang = LANGS[tl] || tl;
   const mmss = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
   const prompt = `Listen to the speech in this video from ${mmss(from)} to ${mmss(to)} and produce accurate subtitles.
@@ -172,12 +172,12 @@ Return JSON array of {"b","e","s","t","x"} ordered by time.`;
     contents: [{
       role: 'user',
       parts: [
-        { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps: 0.2 } },
+        { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps } },
         { text: prompt },
       ],
     }],
     generationConfig: {
-      temperature: 0.1,
+      temperature,
       mediaResolution: 'MEDIA_RESOLUTION_LOW',
       responseMimeType: 'application/json',
       responseSchema: {
@@ -347,6 +347,34 @@ async function addCard(c) {
   });
 }
 
+// ---------- Local yt-dlp helper (helper/ytam_helper.py) ----------
+
+async function helperFetch(base, path) {
+  let r;
+  try {
+    r = await fetch(String(base || YTAM_DEFAULTS.helperUrl).replace(/\/+$/, '') + path, { cache: 'no-store' });
+  } catch (_) {
+    throw new Error('помощник не запущен');
+  }
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || 'помощник: HTTP ' + r.status);
+  }
+  return r;
+}
+
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function helperPcm({ url, v, start, end, rate }) {
+  const q = `/pcm?v=${encodeURIComponent(v)}&start=${start.toFixed(3)}&end=${end.toFixed(3)}&rate=${rate}`;
+  const buf = new Uint8Array(await (await helperFetch(url, q)).arrayBuffer());
+  return { b64: bytesToB64(buf), rate };
+}
+
 // ---------- Messaging ----------
 
 async function handle(msg) {
@@ -357,6 +385,9 @@ async function handle(msg) {
     case 'aiSegment': return aiSegment(msg);
     case 'aiVideo': return aiVideo(msg);
     case 'addCard': return addCard(msg.card);
+    case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
+    case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
+    case 'helperPcm': return helperPcm(msg);
     case 'deleteNotes': return anki('deleteNotes', { notes: msg.ids });
     case 'ankiStatus': {
       const version = await anki('version');

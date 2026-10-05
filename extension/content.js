@@ -5,6 +5,8 @@
 
   const DEFAULTS = self.YTAM_DEFAULTS;
   let settings = { ...DEFAULTS };
+  // Developer parameters (🛠 tab), live-tunable.
+  const X = { ...self.YTAM_DEV_DEFAULTS };
 
   const S = {
     videoId: null,
@@ -27,6 +29,7 @@
     wordTr: new Map(),  // word -> short translation (prefetched)
     hoverWord: null,
     pending: [],        // cards waiting for their audio to be played
+    helper: { state: 'off', progress: 0, error: '' },
   };
   let ui = null;
   let pop = null;
@@ -200,7 +203,7 @@
   async function scheduleAnkiDelete(k) {
     const { saved = [], ankiDel = [] } = await chrome.storage.local.get(['saved', 'ankiDel']);
     const e = saved.find((x) => x.k === k);
-    ankiDel.push({ k, ids: e ? e.ids || [] : [], due: Date.now() + 30000 });
+    ankiDel.push({ k, ids: e ? e.ids || [] : [], due: Date.now() + X.ankiDeleteSec * 1000 });
     await chrome.storage.local.set({ ankiDel, saved: saved.filter((x) => x.k !== k) });
     S.savedList = saved.filter((x) => x.k !== k);
     refreshSideTabs();
@@ -347,7 +350,7 @@
       words.forEach((w, i) => {
         const next = words[i + 1];
         const evLen = w.evEnd > w.start ? w.evEnd - w.start : 1;
-        w.end = next && next.start - w.start <= 0.8 ? next.start : w.start + Math.max(0.3, Math.min(0.8, evLen));
+        w.end = next && next.start - w.start <= X.asrWordMax ? next.start : w.start + Math.max(0.3, Math.min(X.asrWordMax, evLen));
       });
     }
     return words;
@@ -368,7 +371,7 @@
       const sentenceEnd = /[.!?…]["')\]]?$/.test(w.text);
       const clauseEnd = /[,;:—]$/.test(w.text);
       const gap = next ? next.start - w.end : Infinity;
-      if (!next || sentenceEnd || gap > 0.6 || cur.length >= maxWords || (clauseEnd && cur.length >= maxWords * 0.6)) flush();
+      if (!next || sentenceEnd || gap > X.segGap || cur.length >= maxWords || (clauseEnd && cur.length >= maxWords * X.clauseRatio)) flush();
     });
     return cues;
   }
@@ -413,10 +416,11 @@
     const chunks = [];
     let from = 0;
     while (from < words.length) {
-      let to = Math.min(words.length, from + 300);
+      const N = X.aiChunkWords;
+      let to = Math.min(words.length, from + N);
       if (to < words.length) {
         let best = to, bestGap = -1;
-        for (let k = from + 220; k < Math.min(words.length, from + 360); k++) {
+        for (let k = from + Math.round(N * 0.75); k < Math.min(words.length, from + Math.round(N * 1.2)); k++) {
           const gap = words[k].start - words[k - 1].end + (/[.!?]$/.test(words[k - 1].text) ? 5 : 0);
           if (gap > bestGap) { bestGap = gap; best = k; }
         }
@@ -428,7 +432,7 @@
 
     const results = new Array(chunks.length);
     let next = 0, done = 0;
-    await Promise.all(Array.from({ length: 3 }, async () => {
+    await Promise.all(Array.from({ length: X.aiConc }, async () => {
       while (next < chunks.length) {
         const i = next++;
         if (token !== S.token) return;
@@ -438,6 +442,7 @@
           tl: settings.targetLang,
           maxWords: settings.maxWords,
           model: settings.aiModel,
+          temperature: X.aiTemp,
         });
         results[i] = alignLines(res.lines, chunks[i]);
         ++done;
@@ -446,7 +451,7 @@
     }));
     if (token !== S.token) return null;
     const ratio = results.reduce((a, r) => a + r.ratio, 0) / results.length;
-    if (ratio < 0.7) throw new Error('ИИ слишком сильно изменил текст');
+    if (ratio < X.aiMinMatch) throw new Error('ИИ слишком сильно изменил текст');
     const cues = results.flatMap((r) => r.cues);
     for (let i = 1; i < cues.length; i++) if (cues[i].start < cues[i - 1].start) cues[i].start = cues[i - 1].start;
     await saveAiCache(key, cues);
@@ -477,19 +482,19 @@
     }
     if (!(dur > 0 && isFinite(dur))) throw new Error('неизвестна длительность видео');
 
-    const CHUNK = 600;
+    const CHUNK = X.aiVideoChunkSec;
     const ranges = [];
-    if (dur <= 12 * 60) ranges.push([0, dur]);
+    if (dur <= X.aiSingleMaxMin * 60) ranges.push([0, dur]);
     else for (let t = 0; t < dur; t += CHUNK) ranges.push([t, Math.min(dur, t + CHUNK)]);
 
     const results = new Array(ranges.length);
     let next = 0, done = 0;
-    await Promise.all(Array.from({ length: 3 }, async () => {
+    await Promise.all(Array.from({ length: X.aiConc }, async () => {
       while (next < ranges.length) {
         const i = next++;
         if (token !== S.token) return;
         const [from, to] = ranges[i];
-        const res = await bg({ type: 'aiVideo', videoId: S.videoId, from, to, tl: settings.targetLang, maxWords: settings.maxWords, model: settings.aiModel });
+        const res = await bg({ type: 'aiVideo', videoId: S.videoId, from, to, tl: settings.targetLang, maxWords: settings.maxWords, model: settings.aiModel, fps: X.aiVideoFps, temperature: X.aiTemp });
         results[i] = res.lines.filter((l) => l.b >= from - 5 && l.b < to + 5);
         ++done;
         setProgress(ranges.length > 1 ? `🎧 ИИ слушает видео ${done}/${ranges.length}` : '🎧 ИИ слушает видео', ranges.length > 1 ? done / ranges.length : null);
@@ -812,14 +817,16 @@
     const list = h('div', { class: 'ytam-list' });
     const wordsPane = h('div', { class: 'ytam-pane ytam-words' });
     const savedPane = h('div', { class: 'ytam-pane ytam-savedp' });
+    const devPane = h('div', { class: 'ytam-pane ytam-devp' });
     const tabBtn = (id, label) => h('button', { class: 'ytam-ptab', 'data-tab': id, text: label, onclick: () => setTab(id) });
-    const tabs = [tabBtn('subs', 'Субтитры'), tabBtn('words', 'Слова'), tabBtn('saved', 'Сохранённые')];
+    const tabs = [tabBtn('subs', 'Субтитры'), tabBtn('words', 'Слова'), tabBtn('saved', 'Сохранённые'), tabBtn('dev', '🛠')];
+    tabs[3].title = 'Меню разработчика: все параметры вживую';
     const collapse = h('button', { class: 'ytam-icon', title: 'Свернуть', text: '–' });
     const panel = h('div', { id: 'ytam-panel' },
       h('div', { class: 'ytam-head' }, tabs, h('span', { class: 'ytam-sp' }),
         svgBtn('ytam-icon', 'gear', 'Настройки', () => openSettings()), collapse),
       h('div', { class: 'ytam-subbar' }, select, h('label', { class: 'ytam-toggle' }, trToggle, 'Перевод')),
-      status, prog, list, wordsPane, savedPane,
+      status, prog, list, wordsPane, savedPane, devPane,
       h('div', { class: 'ytam-foot' },
         h('kbd', { text: 'A' }), h('kbd', { text: 'S' }), h('kbd', { text: 'D' }), ' фразы · ',
         h('kbd', { text: 'Q' }), ' автопауза · ', h('kbd', { text: 'R' }), ' ☆ фраза · ПКМ — знаю/изучаю'));
@@ -884,7 +891,7 @@
       for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) el.addEventListener(type, (e) => e.stopPropagation());
     }
 
-    return { panel, list, status, select, prog, progLabel, progBar, progFill, wordsPane, savedPane, tabs, overlay, ovLine, ovBox, ovText, ovTr, ovStar, sideL, sideR, rows: [] };
+    return { panel, list, status, select, prog, progLabel, progBar, progFill, wordsPane, savedPane, devPane, tabs, overlay, ovLine, ovBox, ovText, ovTr, ovStar, sideL, sideR, rows: [] };
   }
 
   function scheduleResume() {
@@ -892,7 +899,7 @@
     S.resumeTimer = setTimeout(() => {
       if (pop || (ui && ui.ovLine.matches(':hover')) || (tipEl && tipEl.matches(':hover'))) return;
       resumeAfterHover();
-    }, 250);
+    }, X.resumeMs);
   }
 
   function resumeAfterHover() {
@@ -1114,6 +1121,7 @@
   function refreshSideTabs(now) {
     clearTimeout(sideTimer);
     if (!ui || S.tab === 'subs') return;
+    if (S.tab === 'dev') { renderDevTab(); return; }
     sideTimer = setTimeout(() => (S.tab === 'words' ? renderWordsTab() : renderSavedTab()), now ? 0 : 250);
   }
 
@@ -1181,6 +1189,110 @@
           h('span', { class: 'ytam-stext' + (e.t === 'p' ? '' : ' ytam-learning'), text: e.text }),
           del);
       }));
+  }
+
+  // ---------- developer menu (🛠 tab): every internal number, live ----------
+
+  let devSaveTimer = 0;
+  const devInputs = {};
+  function setDev(vals) {
+    Object.assign(X, vals);
+    syncDev();
+    clearTimeout(devSaveTimer);
+    devSaveTimer = setTimeout(() => chrome.storage.local.set({ dev: { ...X } }), 300);
+  }
+
+  function syncDev() {
+    for (const [k, set] of Object.entries(devInputs)) set(X[k]);
+  }
+
+  function renderDevTab() {
+    if (ui.devPane.dataset.built) { syncDev(); return; }
+    ui.devPane.dataset.built = '1';
+    const info = h('div', { class: 'ytam-dev-info', text: 'Меняйте значения — применяются сразу. «▶ Клип» — прослушать, как будет звучать карточка текущей фразы.' });
+    const btn = (text, onclick, title) => h('button', { class: 'ytam-dbtn', text, onclick, title });
+    const top = h('div', { class: 'ytam-dev-top' },
+      btn('▶ Клип текущей фразы', () => testClip(info)),
+      btn('Помощник yt-dlp', () => pingHelper(info)),
+      btn('Экспорт', () => { navigator.clipboard.writeText(JSON.stringify(X, null, 1)); info.textContent = 'Параметры скопированы в буфер обмена (JSON).'; }),
+      btn('Импорт', () => {
+        const t = prompt('Вставьте JSON с параметрами');
+        if (!t) return;
+        try { setDev(JSON.parse(t)); info.textContent = 'Импортировано.'; } catch (e) { info.textContent = 'Ошибка JSON: ' + e.message; }
+      }),
+      btn('Сбросить всё', () => { if (confirm('Вернуть все параметры по умолчанию?')) setDev({ ...self.YTAM_DEV_DEFAULTS }); }));
+    const groups = self.YTAM_DEV_SCHEMA.map((g) => {
+      const det = h('details', { class: 'ytam-dev-group', open: true }, h('summary', { text: g.title }));
+      for (const f of g.fields) {
+        const range = h('input', { type: 'range', min: f.min, max: f.max, step: f.step });
+        const num = h('input', { type: 'number', min: f.min, max: f.max, step: f.step });
+        const reset = h('button', { class: 'ytam-dev-reset', title: 'По умолчанию: ' + f.def, text: '↺' });
+        const set = (v) => { range.value = v; num.value = v; reset.style.visibility = +v === f.def ? 'hidden' : 'visible'; };
+        devInputs[f.k] = set;
+        range.addEventListener('input', () => setDev({ [f.k]: +range.value }));
+        num.addEventListener('change', () => { const v = Math.min(f.max, Math.max(f.min, +num.value)); if (!isNaN(v)) setDev({ [f.k]: v }); });
+        num.addEventListener('keydown', (e) => e.stopPropagation());
+        reset.addEventListener('click', () => setDev({ [f.k]: f.def }));
+        det.append(h('div', { class: 'ytam-dev-row' },
+          h('div', { class: 'ytam-dev-label' }, h('span', { text: f.label }), f.unit ? h('small', { text: f.unit }) : null, f.hint ? h('small', { text: ' · ' + f.hint }) : null),
+          h('div', { class: 'ytam-dev-ctl' }, range, num, reset)));
+      }
+      return det;
+    });
+    ui.devPane.replaceChildren(top, info, ...groups);
+    syncDev();
+  }
+
+  async function testClip(info) {
+    const i = S.shown >= 0 ? S.shown : S.active;
+    const cue = S.cues[i];
+    if (!cue) { info.textContent = 'Нет текущей фразы.'; return; }
+    info.textContent = 'Готовлю клип…';
+    try {
+      const item = { videoId: S.videoId, cue, shift: X.subShift };
+      const ext = await clipAudio(item);
+      if (!ext || ext.cov < 0.05) { info.textContent = 'Нет звука: фраза ещё не звучала, а помощник yt-dlp не запущен.'; return; }
+      const pcm = trimClip(ext, cue.start + item.shift, cue.end + item.shift);
+      const last = trimClip.last;
+      const b64 = encodeMp3(pcm, ext.rate);
+      new Audio('data:audio/mpeg;base64,' + b64).play();
+      const f = (t) => t.toFixed(2);
+      info.textContent = `Источник: ${ext.src} · фраза YouTube ${f(cue.start)}–${f(cue.end)} · клип ${f(last.start)}–${f(last.end)} ` +
+        `(${(last.end - last.start).toFixed(2)} с, ${last.how}) · MP3 ${Math.round((b64.length * 0.75) / 1024)} КБ` +
+        (ext.cov < 0.99 ? ` · звука записано ${Math.round(ext.cov * 100)}%` : '');
+    } catch (e) {
+      info.textContent = 'Ошибка: ' + e.message;
+    }
+  }
+
+  async function pingHelper(info) {
+    info.textContent = 'Проверяю помощник…';
+    try {
+      const r = await bg({ type: 'helperPing', url: settings.helperUrl });
+      info.textContent = `Помощник работает · yt-dlp ${r.ytdlp || 'НЕ УСТАНОВЛЕН'} · ffmpeg ${r.ffmpeg ? 'есть' : 'НЕТ'} · это видео: ${S.helper.state}` +
+        (S.helper.state === 'downloading' ? ` ${Math.round(S.helper.progress * 100)}%` : '') + (S.helper.error ? ' · ' + S.helper.error : '');
+    } catch (e) {
+      info.textContent = `Помощник не отвечает (${settings.helperUrl}): ${e.message}. Запустите helper/start-helper.bat.`;
+    }
+  }
+
+  // Debug HUD on the video.
+  let hud = null;
+  function updateHud(v, t, a) {
+    if (!X.debugHud) { if (hud) { hud.remove(); hud = null; } return; }
+    const player = document.getElementById('movie_player');
+    if (!player) return;
+    if (!hud) hud = h('div', { class: 'ytam-hud' });
+    if (hud.parentNode !== player) player.append(hud);
+    const c = S.cues[a];
+    const buf = Tap.blocks.reduce((sum, b) => sum + (b.t1 - b.t0), 0);
+    hud.textContent = [
+      `t ${v.currentTime.toFixed(2)} (субтитры ${t.toFixed(2)})`,
+      c ? `фраза #${a}: ${c.start.toFixed(2)}–${c.end.toFixed(2)}` : 'фраза —',
+      `запись в памяти ${Math.round(buf)} с · проходов ${Tap.pass}`,
+      `помощник: ${S.helper.state}${S.helper.state === 'downloading' ? ' ' + Math.round(S.helper.progress * 100) + '%' : ''}`,
+      `ждут аудио: ${S.pending.length} · словарь в очереди: ${dictQueue.length}`,
+    ].join('\n');
   }
 
   // ---------- settings dialog (opened from the player button) ----------
@@ -1268,7 +1380,7 @@
 
   function prefetchAround(a) {
     const words = [];
-    for (let i = Math.max(0, a); i < Math.min(S.cues.length, a + 4); i++) {
+    for (let i = Math.max(0, a); i < Math.min(S.cues.length, a + X.dictAhead); i++) {
       for (const w of tokensOf(S.cues[i].text)) if (!dict.has(w) && w.length > 1 && !/^\d/.test(w)) words.push(w);
     }
     words.sort((x, y) => isKnown(x) - isKnown(y)); // unknown words first
@@ -1277,11 +1389,11 @@
   }
 
   function pumpDict() {
-    while (dictBusy < 2 && dictQueue.length) {
+    while (dictBusy < X.dictConc && dictQueue.length) {
       const w = dictQueue.shift();
       if (dict.has(w)) continue;
       dictBusy++;
-      Promise.resolve(getDict(w)).finally(() => { dictBusy--; setTimeout(pumpDict, 120); });
+      Promise.resolve(getDict(w)).finally(() => { dictBusy--; setTimeout(pumpDict, X.dictDelayMs); });
     }
   }
 
@@ -1322,7 +1434,7 @@
       if (tipEl && tipEl.matches(':hover')) return;
       hideTip();
       scheduleResume();
-    }, 200);
+    }, X.tipHideMs);
   }
 
   function hideTip() {
@@ -1380,7 +1492,7 @@
           })));
       }
       tipEl.replaceChildren(...kids);
-      anchorTo(tipEl, span, 10, 160);
+      anchorTo(tipEl, span, X.tipGap, 160);
     };
 
     layer().append(tipEl);
@@ -1465,16 +1577,16 @@
     layer().append(el);
     span.classList.add('ytam-w-sel');
     pop = { el, span };
-    anchorTo(el, span, 14, 260);
+    anchorTo(el, span, X.popGap, X.popAboveMin);
 
     const build = () => {
       if (!pop || pop.el !== el) return;
       el.classList.remove('loading');
       el.replaceChildren(...popContent(span, i, word, w, cue, el));
-      anchorTo(el, span, 14, 260);
+      anchorTo(el, span, X.popGap, X.popAboveMin);
     };
     const d = getDict(w);
-    if (d instanceof Promise) Promise.race([d, sleep(1200)]).then(build); else build();
+    if (d instanceof Promise) Promise.race([d, sleep(X.popLoadMs)]).then(build); else build();
   }
 
   function popContent(span, i, word, w, cue, el) {
@@ -1571,7 +1683,6 @@
   // is never interrupted.
 
   const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null };
-  const TAP_MAX_BLOCKS = 2600; // ~4 min at 48 kHz / 4096
 
   function tapEnsure(v) {
     if (!settings.includeAudio || !v) return;
@@ -1627,7 +1738,8 @@
       out[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
     }
     Tap.blocks.push({ t0, t1, pass: Tap.pass, rate: sr / f, data: out });
-    if (Tap.blocks.length > TAP_MAX_BLOCKS) Tap.blocks.splice(0, Tap.blocks.length - TAP_MAX_BLOCKS);
+    const maxBlocks = Math.ceil((X.tapMinutes * 60 * sr) / n);
+    if (Tap.blocks.length > maxBlocks) Tap.blocks.splice(0, Tap.blocks.length - maxBlocks);
   }
 
   // Audio for [start, end) of video time from the most recent complete pass.
@@ -1663,38 +1775,44 @@
   }
 
   // Snap clip edges to nearby pauses (YouTube timings are often off).
+  // Returns PCM; trimClip.last holds the chosen edges (video time) for the dev menu.
   function trimClip(ext, cueStart, cueEnd) {
     const { data, rate } = ext;
-    const frame = Math.max(1, Math.round(rate * 0.02));
+    const frame = Math.max(1, Math.round((rate * X.trimFrameMs) / 1000));
     const nF = Math.floor(data.length / frame);
     const fAt = (t) => Math.max(0, Math.min(nF - 1, Math.round(((t - ext.t0) / (ext.t1 - ext.t0)) * data.length / frame)));
+    const tAt = (f) => ext.t0 + ((f * frame) / data.length) * (ext.t1 - ext.t0);
     let sF = fAt(cueStart - settings.padStart), eF = fAt(cueEnd + settings.padEnd);
+    let how = 'запас';
 
     if (settings.smartTrim && nF > 10) {
       const rms = new Float32Array(nF);
       for (let f = 0; f < nF; f++) {
-        let s = 0;
-        for (let i = f * frame; i < (f + 1) * frame; i++) s += data[i] * data[i];
-        rms[f] = Math.sqrt(s / frame);
+        let sum = 0;
+        for (let i = f * frame; i < (f + 1) * frame; i++) sum += data[i] * data[i];
+        rms[f] = Math.sqrt(sum / frame);
       }
       const sorted = Array.from(rms).sort((a, b) => a - b);
-      const thr = Math.max(250, sorted[Math.floor(nF * 0.9)] * 0.12);
+      const thr = Math.max(X.trimThrMin, sorted[Math.floor(nF * 0.9)] * X.trimThrFactor);
+      const keepS = Math.round(X.startKeepMs / X.trimFrameMs), keepE = Math.round(X.endKeepMs / X.trimFrameMs);
+      const need = Math.max(1, Math.round(X.silenceMs / X.trimFrameMs));
       // start: walk back from the cue start to the first quiet spot
-      for (let f = fAt(cueStart), lim = fAt(cueStart - 0.6); f > lim; f--) {
-        if (rms[f] < thr && rms[f - 1] < thr) { sF = Math.max(0, f - 2); break; }
+      for (let f = fAt(cueStart), lim = fAt(cueStart - X.trimBack); f > lim; f--) {
+        if (rms[f] < thr && rms[f - 1] < thr) { sF = Math.max(0, f - keepS); how = 'по паузам'; break; }
       }
-      // end: walk forward from the cue end to the first 160 ms of quiet
-      for (let f = fAt(cueEnd - 0.15), lim = fAt(cueEnd + 0.8), run = 0; f <= lim; f++) {
+      // end: walk forward from the cue end to the first long enough quiet run
+      for (let f = fAt(cueEnd - X.trimEndFrom), lim = fAt(cueEnd + X.trimFwd), run = 0; f <= lim; f++) {
         run = rms[f] < thr ? run + 1 : 0;
-        if (run >= 8) { eF = Math.min(nF, f - run + 4); break; }
+        if (run >= need) { eF = Math.min(nF, f - run + 1 + keepE); how = 'по паузам'; break; }
       }
     }
     const out = data.slice(sF * frame, Math.max(sF + 1, eF) * frame);
-    const fade = Math.min(out.length >> 1, Math.round(rate * 0.012));
+    const fade = Math.min(out.length >> 1, Math.round((rate * X.fadeMs) / 1000));
     for (let i = 0; i < fade; i++) {
       out[i] = (out[i] * i) / fade;
       out[out.length - 1 - i] = (out[out.length - 1 - i] * i) / fade;
     }
+    trimClip.last = { start: tAt(sF), end: tAt(Math.max(sF + 1, eF)), how };
     return out;
   }
 
@@ -1705,7 +1823,7 @@
   }
 
   function encodeMp3(pcm, rate) {
-    const enc = new lamejs.Mp3Encoder(1, rate, 96);
+    const enc = new lamejs.Mp3Encoder(1, rate, X.mp3Kbps);
     const parts = [];
     for (let i = 0; i < pcm.length; i += 1152) {
       const b = enc.encodeBuffer(pcm.subarray(i, i + 1152));
@@ -1722,14 +1840,67 @@
   function snapshot(v) {
     try {
       if (!v || !v.videoWidth) return null;
-      const scale = Math.min(1, 640 / v.videoWidth);
+      const scale = Math.min(1, X.imgWidth / v.videoWidth);
       const c = document.createElement('canvas');
       c.width = Math.round(v.videoWidth * scale);
       c.height = Math.round(v.videoHeight * scale);
       c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-      return c.toDataURL('image/jpeg', 0.82).split(',')[1];
+      return c.toDataURL('image/jpeg', X.jpegQuality).split(',')[1];
     } catch (_) {
       return null;
+    }
+  }
+
+  // ---------- audio source: yt-dlp helper (clean) or in-page capture (fallback) ----------
+
+  const helperUsable = (videoId) => settings.audioSource !== 'capture' && videoId === S.videoId &&
+    (S.helper.state === 'ready' || S.helper.state === 'downloading');
+
+  function audioSpan(item) {
+    const from = Math.max(0, item.cue.start + item.shift - X.clipLead);
+    return { from, to: item.cue.end + item.shift + X.clipTail };
+  }
+
+  // Window of audio around the phrase: { data: Int16Array, rate, t0, t1, cov, src }
+  async function clipAudio(item) {
+    const { from, to } = audioSpan(item);
+    if (settings.audioSource !== 'capture' && (helperUsable(item.videoId) || settings.audioSource === 'helper')) {
+      try {
+        const r = await bg({ type: 'helperPcm', url: settings.helperUrl, v: item.videoId, start: from, end: to, rate: X.helperRate });
+        const bytes = Uint8Array.from(atob(r.b64), (ch) => ch.charCodeAt(0));
+        const data = new Int16Array(bytes.buffer, 0, bytes.length >> 1);
+        if (data.length) return { data, rate: r.rate, t0: from, t1: from + data.length / r.rate, cov: 1, src: 'yt-dlp' };
+      } catch (e) {
+        S.helper.error = e.message;
+        if (settings.audioSource === 'helper') throw new Error('помощник yt-dlp: ' + e.message);
+      }
+    }
+    const ext = tapExtract(from, to);
+    if (ext) ext.src = 'запись с видео';
+    return ext;
+  }
+
+  // Ask the helper to download this video's audio as soon as the video opens.
+  async function helperPrepare(videoId, token) {
+    S.helper = { state: 'off', progress: 0, error: '' };
+    if (settings.audioSource === 'capture' || !settings.includeAudio) return;
+    for (let i = 0; i < 600; i++) {
+      let r;
+      try {
+        r = await bg({ type: 'helperPrepare', url: settings.helperUrl, v: videoId });
+      } catch (e) {
+        if (token !== S.token) return;
+        S.helper = { state: 'off', progress: 0, error: e.message };
+        if (settings.audioSource === 'helper') setStatus('🎵 Помощник yt-dlp не отвечает — запустите helper/start-helper.bat');
+        return;
+      }
+      if (token !== S.token) return;
+      S.helper = { state: r.state, progress: r.progress || 0, error: r.error || '' };
+      if (r.state !== 'downloading') {
+        if (r.state === 'error') setStatus('🎵 yt-dlp не смог скачать аудио: ' + r.error.slice(0, 160) + (settings.audioSource === 'helper' ? '' : ' Использую запись с видео.'));
+        return;
+      }
+      await sleep(1500);
     }
   }
 
@@ -1762,6 +1933,7 @@
       videoId: S.videoId,
       title: S.title,
       cue: { start: cue.start, end: cue.end, text: cue.text },
+      shift: X.subShift, // audio times = cue times + shift
       translation: S.trans[i],
       word: wordInfo ? wordInfo.word : '',
       expr: !!(wordInfo && wordInfo.expr),
@@ -1779,10 +1951,12 @@
     if (!S.pending.length) return;
     const v = getVideo();
     for (const item of [...S.pending]) {
-      let ready = force || !settings.includeAudio || Date.now() - item.queuedAt > 10 * 60 * 1000;
+      // With the yt-dlp helper the audio does not depend on playback: ready at once.
+      let ready = force || !settings.includeAudio || helperUsable(item.videoId) || Date.now() - item.queuedAt > 10 * 60 * 1000;
       if (!ready) {
-        const ext = tapExtract(Math.max(0, item.cue.start - 0.7), item.cue.end + 0.9);
-        ready = !!ext && ext.cov > 0.97;
+        const a = audioSpan(item);
+        const ext = tapExtract(a.from, a.to);
+        ready = !!ext && ext.cov > X.pendingCov;
         // Seeked away / phrase passed without being fully heard: don't wait forever.
         if (!ready && v && !v.paused && item.videoId === S.videoId &&
             (v.currentTime > item.cue.end + 5 || v.currentTime < item.cue.start - 30)) ready = Date.now() - item.queuedAt > 3000;
@@ -1798,8 +1972,8 @@
     try {
       let audio = null;
       if (settings.includeAudio) {
-        const ext = tapExtract(Math.max(0, cue.start - 0.7), cue.end + 0.9);
-        if (ext && ext.cov > 0.5) audio = encodeMp3(trimClip(ext, cue.start, cue.end), ext.rate);
+        const ext = await clipAudio(item);
+        if (ext && ext.cov > X.minCov) audio = encodeMp3(trimClip(ext, cue.start + item.shift, cue.end + item.shift), ext.rate);
       }
       let translation = item.translation;
       if (translation == null) {
@@ -1853,7 +2027,7 @@
     const c = S.cues[i];
     if (!v || !c) return;
     S.lastAutoPause = -1;
-    v.currentTime = c.start;
+    v.currentTime = Math.max(0, c.start + X.subShift);
     if (play) v.play();
   }
 
@@ -1867,23 +2041,24 @@
     if (!ui) return;
     mountOverlay();
     if (!S.cues.length) return;
-    const t = v.currentTime;
+    const t = v.currentTime - X.subShift;
     const a = cueIndexAt(t);
+    updateHud(v, t, a);
     if (a !== S.active) { setActiveRow(a); S.active = a; prefetchAround(a); }
     const c = S.cues[a];
-    const shown = c && t <= c.end + 0.25 ? a : -1;
+    const shown = c && t <= c.end + X.showTail ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
     if (settings.autoPause && c && !v.paused) {
       const next = S.cues[a + 1];
-      const endT = Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - 0.06);
+      const endT = Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly);
       if (t >= endT && S.lastAutoPause !== a) {
         S.lastAutoPause = a;
         v.pause();
       }
     }
   }
-  setInterval(tick, 50);
+  (function loop() { try { tick(); } catch (e) { console.warn('[ytam]', e); } setTimeout(loop, X.tickMs); })();
 
   document.addEventListener('pointerdown', () => {
     if (Tap.ctx && Tap.ctx.state === 'suspended') Tap.ctx.resume().catch(() => {});
@@ -1981,6 +2156,7 @@
     if (!data) return setStatus('Не удалось получить данные плеера. Обновите страницу.');
     S.title = data.title || document.title;
     S.tracks = data.tracks;
+    helperPrepare(videoId, token);
     if (!S.tracks.length) {
       if (settings.aiMode !== 'audio') return setStatus('У этого видео нет субтитров. Включите режим «ИИ слушает видео» — он создаст их сам.');
       S.track = { languageCode: 'ai', kind: 'ai', name: 'ИИ', baseUrl: '' };
@@ -2019,8 +2195,9 @@
   setInterval(onNavigate, 1000);
   window.addEventListener('pagehide', () => processPending(true));
 
-  Promise.all([chrome.storage.sync.get(DEFAULTS), chrome.storage.local.get({ vocab: {} })]).then(([s, l]) => {
+  Promise.all([chrome.storage.sync.get(DEFAULTS), chrome.storage.local.get({ vocab: {}, dev: {} })]).then(([s, l]) => {
     settings = { ...DEFAULTS, ...s };
+    Object.assign(X, l.dev || {});
     S.vocab = l.vocab || {};
     applySettings();
     onNavigate();
@@ -2031,6 +2208,7 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {
       if (changes.saved) { S.savedList = changes.saved.newValue || []; refreshSideTabs(); }
+      if (changes.dev) { Object.assign(X, self.YTAM_DEV_DEFAULTS, changes.dev.newValue || {}); syncDev(); }
       if (changes.vocab) {
         const nv = changes.vocab.newValue || {};
         const keys = new Set([...Object.keys(nv), ...Object.keys(S.vocab)]);
@@ -2051,6 +2229,7 @@
       renderOverlay();
     }
     if (changes.targetLang) { S.wordTr = new Map(); dict.clear(); aiCache.clear(); }
+    if ((changes.audioSource || changes.helperUrl || changes.includeAudio) && S.videoId) helperPrepare(S.videoId, S.token);
     if (changes.enabled) { if (!settings.enabled) teardown(); onNavigate(); }
     if (reload && S.track && S.words.length) { S.token++; loadTrack(S.track, S.token); }
   });
