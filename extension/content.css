@@ -245,7 +245,6 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-tip.below::after, .ytam-pop.below::after { top: auto; bottom: 100%; border-width: 0 9px 9px 9px; border-color: transparent transparent #00639e transparent; }
 .ytam-pop::after { border-top-color: #242424; }
 .ytam-pop.below::after { border-bottom-color: #005a92; }
-.ytam-pop.loading::after { border-top-color: #242424; }
 .ytam-tip-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; margin: 1px 0 3px; padding: 1px 6px; border-radius: 8px; background: rgba(255, 255, 255, .13); color: #b6dca0; font-size: .88em; white-space: normal; overflow-wrap: anywhere; }
 .ytam-tip-xsave { display: grid; place-items: center; padding: 1px 4px; border: 1px solid transparent; border-radius: 8px; background: none; color: #f0a030; font-size: 1em; cursor: pointer; opacity: .75; }
 .ytam-tip-xsave:hover { opacity: 1; background: rgba(255, 255, 255, .12); }
@@ -278,7 +277,6 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
   box-shadow: 0 10px 32px rgba(0, 0, 0, .55);
   font: var(--ytam-pop-fs)/1.45 var(--ytam-font);
 }
-.ytam-pop.loading { width: 56px; height: 56px; align-items: center; justify-content: center; }
 .ytam-spin { display: block; width: 28px; height: 28px; border: 3px solid #555; border-top-color: #bbb; border-radius: 50%; animation: ytam-rot .7s linear infinite; }
 .ytam-spin.small { width: 16px; height: 16px; border-width: 2px; }
 @keyframes ytam-rot { to { transform: rotate(360deg); } }
@@ -304,8 +302,7 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-ai-out { flex: 0 1 8.6em !important; height: 8.6em; min-height: 3em; padding: 6px 12px; overflow-y: auto; color: #e6e6e6; }
 .ytam-dim { color: #888; }
 .ytam-ask { margin: 0 10px 6px; padding: 4px 8px; border: 1px solid #444; border-radius: 6px; background: #1b1b1b; color: #eee; font: .95em var(--ytam-font); }
-.ytam-pop-dict { max-height: 7em; padding: 6px 12px; overflow-y: auto; background: #353736; }
-.ytam-pop-dict:empty { display: none; }
+.ytam-pop-dict { height: 6.2em; padding: 6px 12px; overflow-y: auto; background: #353736; }
 .ytam-dict-word { color: #c8d040; }
 .ytam-pop-dict i { color: #888; }
 .ytam-pop-ex { max-height: 7.5em; overflow-y: auto; }

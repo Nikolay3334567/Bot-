@@ -13,38 +13,66 @@ const fmtTime = (s) => {
 
 // ---------- Google Translate ----------
 
-async function gtx(text, tl, dict = false) {
+// ---- Google Translate access: one shared queue (hover requests first), spacing and retries,
+// so a burst of prefetching can never lock us out and hover always gets an answer.
+
+const gq = { hi: [], lo: [], active: 0, last: 0, pauseUntil: 0, timer: 0 };
+const GQ_CONC = 3, GQ_GAP = 110;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function gqRun(fn, prio) {
+  return new Promise((resolve, reject) => {
+    (prio ? gq.hi : gq.lo).push({ fn, resolve, reject });
+    gqPump();
+  });
+}
+
+function gqPump() {
+  clearTimeout(gq.timer);
+  while (gq.active < GQ_CONC && (gq.hi.length || gq.lo.length)) {
+    const now = Date.now();
+    const wait = Math.max(gq.last + GQ_GAP - now, gq.hi.length ? 0 : gq.pauseUntil - now);
+    if (wait > 0) { gq.timer = setTimeout(gqPump, wait); return; }
+    gq.last = now;
+    const job = gq.hi.shift() || gq.lo.shift();
+    gq.active++;
+    job.fn().then(job.resolve, job.reject).finally(() => { gq.active--; gqPump(); });
+  }
+}
+
+async function gtxFetch(text, tl, dict) {
   const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dj=1&dt=t' +
     (dict ? '&dt=bd' : '') + '&tl=' + encodeURIComponent(tl);
-  let r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-    body: 'q=' + encodeURIComponent(text),
-  });
-  if (!r.ok && text.length < 1500) r = await fetch(url + '&q=' + encodeURIComponent(text));
-  if (!r.ok) throw new Error('Переводчик ответил HTTP ' + r.status);
-  return r.json();
+  let status = 0;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    let r = null;
+    try {
+      r = attempt % 2 === 1 && text.length < 1500
+        ? await fetch(url + '&q=' + encodeURIComponent(text))
+        : await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: 'q=' + encodeURIComponent(text) });
+    } catch (_) { r = null; }
+    if (r && r.ok) return r.json();
+    status = r ? r.status : 0;
+    if (r && status !== 429 && status < 500) break; // not worth retrying
+    gq.pauseUntil = Date.now() + 800 * (attempt + 1); // back off the background traffic too
+    await sleep(350 * 2 ** attempt);
+  }
+  throw new Error(status ? 'Переводчик ответил HTTP ' + status : 'Нет связи с переводчиком');
 }
+
+const gtx = (text, tl, dict = false, prio = 0) => gqRun(() => gtxFetch(text, tl, dict), prio);
 
 const joinTrans = (j) => (j.sentences || []).map((s) => s.trans || '').join('');
 
-async function translateLines(lines, tl) {
-  try {
-    const parts = joinTrans(await gtx(lines.join('\n'), tl)).split('\n').map((s) => s.trim());
-    if (parts.length === lines.length) return parts;
-  } catch (e) {
-    if (lines.length === 1) throw e;
-  }
-  // Line count got mangled — translate one by one, 4 at a time.
-  const out = new Array(lines.length).fill('');
-  let next = 0;
-  await Promise.all(Array.from({ length: 4 }, async () => {
-    while (next < lines.length) {
-      const i = next++;
-      try { out[i] = joinTrans(await gtx(lines[i], tl)).trim(); } catch (_) {}
-    }
-  }));
-  return out;
+// Lines in, translated lines out. If Google merges/splits lines we bisect (a handful of
+// requests) instead of translating every line separately.
+async function translateLines(lines, tl, prio = 0) {
+  if (!lines.length) return [];
+  if (lines.length === 1) return [joinTrans(await gtx(lines[0], tl, false, prio)).trim()];
+  const parts = joinTrans(await gtx(lines.join('\n'), tl, false, prio)).split('\n').map((x) => x.trim());
+  if (parts.length === lines.length) return parts;
+  const mid = lines.length >> 1;
+  return [...(await translateLines(lines.slice(0, mid), tl, prio)), ...(await translateLines(lines.slice(mid), tl, prio))];
 }
 
 // Persistent caches so hover translations are instant on every video.
@@ -66,12 +94,12 @@ function persistCache(name) {
   }, 1500);
 }
 
-async function translateWords(words, tl) {
+async function translateWords(words, tl, prio = 0) {
   const cache = await getCache('trc:' + tl);
   const missing = words.filter((w) => !(w in cache));
   for (let i = 0; i < missing.length; i += 100) {
     const chunk = missing.slice(i, i + 100);
-    const out = await translateLines(chunk, tl);
+    const out = await translateLines(chunk, tl, prio);
     chunk.forEach((w, k) => { if (out[k]) cache[w] = out[k]; });
     persistCache('trc:' + tl);
   }
@@ -80,12 +108,12 @@ async function translateWords(words, tl) {
   return res;
 }
 
-async function lookup(word, tl) {
+async function lookup(word, tl, prio = 0) {
   const name = 'lkc:' + tl;
   const cache = await getCache(name);
   const key = word.toLowerCase();
   if (cache[key]) return cache[key];
-  const j = await gtx(word, tl, true);
+  const j = await gtx(word, tl, true, prio);
   const res = {
     translation: joinTrans(j).trim(),
     dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })),
@@ -456,9 +484,9 @@ async function helperPcm({ url, v, start, end, rate }) {
 
 async function handle(msg) {
   switch (msg.type) {
-    case 'translateLines': return translateLines(msg.lines, msg.tl);
-    case 'translateWords': return translateWords(msg.words, msg.tl);
-    case 'lookup': return lookup(msg.word, msg.tl);
+    case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio);
+    case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio);
+    case 'lookup': return lookup(msg.word, msg.tl, msg.prio);
     case 'aiSegment': return aiSegment(msg);
     case 'aiVideo': return aiVideo(msg);
     case 'addCard': return addCard(msg.card);

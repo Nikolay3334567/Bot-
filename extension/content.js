@@ -206,14 +206,14 @@
   function leftLearning(k, st) {
     S.pending = S.pending.filter((p) => p.key !== k);
     const del = st === 2 ? settings.ankiDeleteOnKnown : settings.ankiDeleteOnRemove;
-    if (del) scheduleAnkiDelete(k);
+    if (del) scheduleAnkiDelete(k, st);
     else if (st !== 2) updateSaved((saved) => saved.filter((e) => e.k !== k));
   }
 
-  async function scheduleAnkiDelete(k) {
+  async function scheduleAnkiDelete(k, st) {
     const { saved = [], ankiDel = [] } = await chrome.storage.local.get(['saved', 'ankiDel']);
     const e = saved.find((x) => x.k === k);
-    ankiDel.push({ k, ids: e ? e.ids || [] : [], due: Date.now() + X.ankiDeleteSec * 1000 });
+    ankiDel.push({ k, st, ids: e ? e.ids || [] : [], due: Date.now() + X.ankiDeleteSec * 1000 });
     await chrome.storage.local.set({ ankiDel, saved: saved.filter((x) => x.k !== k) });
     S.savedList = saved.filter((x) => x.k !== k);
     refreshSideTabs();
@@ -229,6 +229,8 @@
     for (const d of due) {
       // Re-marked as learning in the meantime → keep the card.
       if (!d.k.startsWith('p:') && S.vocab[d.k] === 1) continue;
+      // The setting may have been switched off since the card was scheduled (st undefined = explicit trash on a phrase).
+      if (d.st !== undefined && (d.st === 2 ? !settings.ankiDeleteOnKnown : !settings.ankiDeleteOnRemove)) continue;
       if (!d.ids.length) continue;
       try { await bg({ type: 'deleteNotes', ids: d.ids }); } catch (_) { d.due = now + 60000; keep.push(d); }
     }
@@ -1249,7 +1251,7 @@
   function renderSavedTab() {
     const items = (S.savedList || []).filter((e) => e.t === 'p' || S.vocab[e.k] === 1);
     ui.savedPane.replaceChildren(
-      h('div', { class: 'ytam-whint', text: `Сохранено: ${items.length} · 🗑 — убрать (карточка удалится из Anki через 30 с)` }),
+      h('div', { class: 'ytam-whint', text: `Сохранено: ${items.length} · 🗑 — убрать из списка` + (settings.ankiDeleteOnRemove ? ` (карточка удалится из Anki через ${X.ankiDeleteSec} с)` : ' (карточка в Anki остаётся)') }),
       ...items.slice(0, 400).map((e) => {
         const del = svgBtn('ytam-sdel', 'trash', 'Убрать', () => {
           if (e.t === 'p') {
@@ -1452,6 +1454,30 @@
     return p;
   }
 
+  // Hover/click lookups: jump the queue; fall back to the plain word translation; failures are
+  // never cached, so the next hover simply tries again.
+  const hiPending = new Map();
+  function getDictHi(w) {
+    const d = dict.get(w);
+    if (d && !(d instanceof Promise)) return Promise.resolve(d);
+    if (hiPending.has(w)) return hiPending.get(w);
+    const tl = settings.targetLang;
+    const p = bg({ type: 'lookup', word: w, tl, prio: 1 })
+      .then((r) => { if (tl === settings.targetLang) dict.set(w, r); return r; })
+      .catch(() => null)
+      .then(async (r) => {
+        if (r || S.wordTr.has(w)) return r;
+        try {
+          const res = await bg({ type: 'translateWords', words: [w], tl, prio: 1 });
+          if (res[w]) S.wordTr.set(w, res[w]);
+        } catch (_) {}
+        return null;
+      })
+      .finally(() => hiPending.delete(w));
+    hiPending.set(w, p);
+    return p;
+  }
+
   function prefetchAround(a) {
     const words = [];
     for (let i = Math.max(0, a); i < Math.min(S.cues.length, a + X.dictAhead); i++) {
@@ -1576,10 +1602,9 @@
       void tipEl.offsetWidth; // restart the fade-in
     }
     tipEl.classList.add('show');
-    const d = getDict(w);
-    if (d instanceof Promise) d.then(fill);
+    getDictHi(w).then(fill);
     for (const e of exprs) {
-      if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
+      if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
     }
   }
 
@@ -1645,22 +1670,16 @@
     if (v && !v.paused) { v.pause(); S.hoverPaused = true; }
     if (settings.speakOnClick) speak(word);
 
-    // Short loading ring first, then the popup appears at its final size.
-    const el = h('div', { class: 'ytam-pop loading' }, h('span', { class: 'ytam-spin' }));
+    // The popup opens at once at its final size; translation and dictionary fill in place.
+    const el = h('div', { class: 'ytam-pop' });
     for (const type of ['mousedown', 'click', 'contextmenu', 'keydown']) el.addEventListener(type, (e) => e.stopPropagation());
     layer().append(el);
     span.classList.add('ytam-w-sel');
     pop = { el, span };
+    const parts = popContent(span, i, word, w, cue, el);
+    el.replaceChildren(...parts.nodes);
     anchorTo(el, span, X.popGap, X.popAboveMin);
-
-    const build = () => {
-      if (!pop || pop.el !== el) return;
-      el.classList.remove('loading');
-      el.replaceChildren(...popContent(span, i, word, w, cue, el));
-      anchorTo(el, span, X.popGap, X.popAboveMin);
-    };
-    const d = getDict(w);
-    if (d instanceof Promise) Promise.race([d, sleep(X.popLoadMs)]).then(build); else build();
+    parts.load(() => !!pop && pop.el === el);
   }
 
   function popContent(span, i, word, w, cue, el) {
@@ -1687,12 +1706,23 @@
       }
     });
 
-    const d = dict.get(w);
     const dictBox = h('div', { class: 'ytam-pop-dict' });
-    if (d && !(d instanceof Promise)) {
-      dictBox.append(h('div', { class: 'ytam-dict-word', text: word }),
-        ...(d.dict.length ? d.dict.map((e) => h('div', {}, h('i', { text: `(${e.pos}) ` }), e.terms.join(', '))) : [h('div', { text: d.translation })]));
-    }
+    const trEl = h('div', { class: 'ytam-pop-tr' });
+    const fillDict = () => {
+      const d = dict.get(w);
+      trEl.textContent = variants(w).slice(0, 3).join(', ') || '…';
+      if (d && !(d instanceof Promise)) {
+        dictBox.replaceChildren(h('div', { class: 'ytam-dict-word', text: word }),
+          ...(d.dict.length ? d.dict.map((e) => h('div', {}, h('i', { text: `(${e.pos}) ` }), e.terms.join(', '))) : [h('div', { text: d.translation })]));
+      } else {
+        dictBox.replaceChildren(h('div', { class: 'ytam-dim', text: S.wordTr.get(w) ? S.wordTr.get(w) : '…' }));
+      }
+    };
+    fillDict();
+    const exprEls = exprs.map((e) => {
+      const tr = h('span', { text: ' — ' + (exprTr(e) || '…') });
+      return { e, tr };
+    });
 
     const examples = S.cues.map((c, k) => k).filter((k) => k !== i && tokensOf(S.cues[k].text).includes(w)).slice(0, 4);
     const statusBtn = (st, icon, title) => {
@@ -1710,11 +1740,11 @@
     const out = [
       h('div', { class: 'ytam-pop-head' },
         pill,
-        h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }), h('div', { class: 'ytam-pop-tr', text: variants(w).slice(0, 3).join(', ') || '—' })),
+        h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }), trEl),
         h('button', { class: 'ytam-x', title: 'Произнести', text: '🔊', onclick: () => speak(word) }),
         h('button', { class: 'ytam-x', title: 'Закрыть', text: '✕', onclick: closePop })),
-      exprs.length ? h('div', { class: 'ytam-pop-exprs' }, exprs.map((e) => h('div', {},
-        h('span', { class: 'ytam-tip-phrase', text: e.surf || e.p }), ' — ' + (exprTr(e) || '…'),
+      exprs.length ? h('div', { class: 'ytam-pop-exprs' }, exprEls.map(({ e, tr }) => h('div', {},
+        h('span', { class: 'ytam-tip-phrase', text: e.surf || e.p }), tr,
         svgBtn('ytam-tip-xsave' + (S.vocab[e.key] === 1 ? ' on' : ''), 'book', 'Выражение в Anki', (ev) => {
           setWordStatus(e.key, 1);
           queueCard(i, { word: e.p, meaning: exprTr(e), expr: true, hl: e.surf });
@@ -1733,7 +1763,17 @@
         h('button', { class: 'ytam-sb star', text: STAR, title: 'Только фраза в Anki', onclick: () => { queueCard(i, null); closePop(); } })),
     ];
     setTimeout(() => tabBtns[0].click(), 0);
-    return out.filter(Boolean);
+    return {
+      nodes: out.filter(Boolean),
+      load(alive) {
+        getDictHi(w).then(() => { if (alive()) fillDict(); });
+        for (const { e, tr } of exprEls) {
+          if (exprTr(e)) continue;
+          bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 })
+            .then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); if (alive()) tr.textContent = ' — ' + r[e.key]; } }).catch(() => {});
+        }
+      },
+    };
   }
 
   function speak(text) {
