@@ -99,22 +99,79 @@ async function lookup(word, tl) {
 
 const LANGS = { ru: 'Russian', uk: 'Ukrainian', be: 'Belarusian', kk: 'Kazakh', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pl: 'Polish', tr: 'Turkish', 'zh-CN': 'Chinese (Simplified)', ja: 'Japanese' };
 
-async function geminiKey() {
-  const { geminiKey } = await chrome.storage.local.get(YTAM_LOCAL_DEFAULTS);
-  if (!geminiKey) throw new Error('Не задан ключ Gemini API (⚙ → ИИ)');
-  return geminiKey;
+// ---- provider-agnostic LLM calls: Gemini (default) or any OpenAI-compatible API ----
+
+async function aiConfig() {
+  const [sync, local] = await Promise.all([chrome.storage.sync.get(YTAM_DEFAULTS), chrome.storage.local.get(YTAM_LOCAL_DEFAULTS)]);
+  return { ...sync, ...local };
 }
 
-async function gemini(model, body) {
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': await geminiKey() },
-    body: JSON.stringify(body),
-  });
+const parseObj = (t, what) => {
+  if (!t || !String(t).trim()) return {};
+  try { return JSON.parse(t); } catch (_) { throw new Error(`«${what}»: неверный JSON`); }
+};
+
+function parseJsonLoose(text) {
+  let t = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  try { return JSON.parse(t); } catch (_) {}
+  const i = Math.min(...['[', '{'].map((c) => (t.indexOf(c) < 0 ? Infinity : t.indexOf(c))));
+  const j = Math.max(t.lastIndexOf(']'), t.lastIndexOf('}'));
+  if (i < Infinity && j > i) return JSON.parse(t.slice(i, j + 1));
+  throw new Error('ИИ вернул не JSON');
+}
+
+const asLines = (j) => (Array.isArray(j) ? j : j && (j.lines || j.subtitles || j.items || j.result)) || [];
+
+function openAiRequest(cfg, prompt, extra = {}) {
+  const base = String(cfg.aiBaseUrl || '').replace(/\/+$/, '');
+  const url = base + (cfg.aiChatPath || '/chat/completions');
+  const headers = { 'Content-Type': 'application/json', ...parseObj(cfg.aiHeaders, 'Свои заголовки') };
+  if (cfg.aiKey) headers.Authorization = 'Bearer ' + cfg.aiKey;
+  const messages = [];
+  if (cfg.aiSystem) messages.push({ role: 'system', content: cfg.aiSystem });
+  messages.push({ role: 'user', content: prompt });
+  return { url, init: (model, temperature, stream) => ({ method: 'POST', headers, body: JSON.stringify({ model, messages, temperature, stream: !!stream, ...parseObj(cfg.aiExtraBody, 'Доп. параметры'), ...extra }) }) };
+}
+
+async function httpError(r, label) {
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || 'HTTP ' + r.status));
-  const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-  return parts.map((p) => p.text || '').join('');
+  const msg = (j.error && (j.error.message || j.error)) || j.message || 'HTTP ' + r.status;
+  throw new Error(label + ': ' + (typeof msg === 'string' ? msg : JSON.stringify(msg)).slice(0, 300));
+}
+
+// Returns the text of the model's answer.
+async function llm({ model, prompt, json, schema, temperature = 0.2, media }) {
+  const cfg = await aiConfig();
+  if (cfg.aiProvider === 'openai') {
+    if (media) throw new Error('Режим «слушает видео» работает только с Gemini');
+    const req = openAiRequest(cfg, prompt + (json ? '\n\nReturn ONLY valid JSON, without commentary or code fences.' : ''));
+    let r;
+    try { r = await fetch(req.url, req.init(model, temperature, false)); } catch (e) { throw new Error('Нет доступа к ' + req.url + ' — разрешите адрес в настройках расширения (страница настроек → ИИ) или проверьте его'); }
+    if (!r.ok) await httpError(r, 'ИИ');
+    const j = await r.json();
+    return (((j.choices || [])[0] || {}).message || {}).content || '';
+  }
+  if (!cfg.geminiKey) throw new Error('Не задан ключ Gemini API (⚙ → ИИ)');
+  const base = String(cfg.aiBaseUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+  const parts = [];
+  if (media) parts.push(media);
+  parts.push({ text: prompt });
+  const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature, ...parseObj(cfg.aiExtraBody, 'Доп. параметры') } };
+  if (cfg.aiSystem) body.systemInstruction = { parts: [{ text: cfg.aiSystem }] };
+  if (json) { body.generationConfig.responseMimeType = 'application/json'; if (schema) body.generationConfig.responseSchema = schema; }
+  if (media) body.generationConfig.mediaResolution = 'MEDIA_RESOLUTION_LOW';
+  let r;
+  try {
+    r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
+      body: JSON.stringify(body),
+    });
+  } catch (e) { throw new Error('Нет доступа к ' + base + ' — разрешите адрес в настройках расширения'); }
+  if (!r.ok) await httpError(r, 'Gemini');
+  const j = await r.json();
+  const out = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+  return out.map((p) => p.text || '').join('');
 }
 
 const EXPR_SCHEMA = {
@@ -141,18 +198,11 @@ ${EXPR_RULE(lang)}
 
 Transcript:
 ${text}`;
-  const out = await gemini(model, {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'ARRAY',
-        items: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['s', 't'] },
-      },
-    },
+  const out = await llm({
+    model, prompt, json: true, temperature,
+    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['s', 't'] } },
   });
-  return { lines: JSON.parse(out) };
+  return { lines: asLines(parseJsonLoose(out)) };
 }
 
 // Gemini watches/listens to the YouTube video itself (public videos only).
@@ -168,29 +218,12 @@ Rules:
 - "t": natural translation of the line into ${lang} using context.
 ${EXPR_RULE(lang)}
 Return JSON array of {"b","e","s","t","x"} ordered by time.`;
-  const out = await gemini(model, {
-    contents: [{
-      role: 'user',
-      parts: [
-        { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps } },
-        { text: prompt },
-      ],
-    }],
-    generationConfig: {
-      temperature,
-      mediaResolution: 'MEDIA_RESOLUTION_LOW',
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'ARRAY',
-        items: {
-          type: 'OBJECT',
-          properties: { b: { type: 'NUMBER' }, e: { type: 'NUMBER' }, s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA },
-          required: ['b', 'e', 's', 't'],
-        },
-      },
-    },
+  const out = await llm({
+    model, prompt, json: true, temperature,
+    media: { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps } },
+    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { b: { type: 'NUMBER' }, e: { type: 'NUMBER' }, s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['b', 'e', 's', 't'] } },
   });
-  let lines = JSON.parse(out).filter((l) => l && l.s);
+  let lines = asLines(parseJsonLoose(out)).filter((l) => l && l.s);
   // Some answers count from the start of the range instead of the video.
   if (from > 30 && lines.length && lines[0].b < from - 20) lines = lines.map((l) => ({ ...l, b: l.b + from, e: l.e + from }));
   return { lines };
@@ -209,16 +242,7 @@ function explainPrompt({ kind, word, sentence, question, tl }, cfg) {
   }
 }
 
-async function streamGemini(model, prompt, onDelta) {
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': await geminiKey() },
-    body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 600 } }),
-  });
-  if (!r.ok) {
-    const j = await r.json().catch(() => ({}));
-    throw new Error('Gemini: ' + ((j.error && j.error.message) || 'HTTP ' + r.status));
-  }
+async function readSse(r, onData) {
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
@@ -231,14 +255,38 @@ async function streamGemini(model, prompt, onDelta) {
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
       if (!line.startsWith('data:')) continue;
-      try {
-        const j = JSON.parse(line.slice(5));
-        const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-        const text = parts.map((p) => p.text || '').join('');
-        if (text) onDelta(text);
-      } catch (_) {}
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') return;
+      try { onData(JSON.parse(data)); } catch (_) {}
     }
   }
+}
+
+async function streamLlm(model, prompt, onDelta) {
+  const cfg = await aiConfig();
+  if (cfg.aiProvider === 'openai') {
+    const req = openAiRequest(cfg, prompt);
+    let r;
+    try { r = await fetch(req.url, req.init(model, 0.4, true)); } catch (_) { throw new Error('Нет доступа к ' + req.url + ' — разрешите адрес в настройках расширения'); }
+    if (!r.ok) await httpError(r, 'ИИ');
+    await readSse(r, (j) => { const d = ((j.choices || [])[0] || {}).delta; if (d && d.content) onDelta(d.content); });
+    return;
+  }
+  if (!cfg.geminiKey) throw new Error('Не задан ключ Gemini API (⚙ → ИИ)');
+  const base = String(cfg.aiBaseUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 600, ...parseObj(cfg.aiExtraBody, 'Доп. параметры') } };
+  if (cfg.aiSystem) body.systemInstruction = { parts: [{ text: cfg.aiSystem }] };
+  const r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) await httpError(r, 'Gemini');
+  await readSse(r, (j) => {
+    const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+    const text = parts.map((p) => p.text || '').join('');
+    if (text) onDelta(text);
+  });
 }
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -246,7 +294,7 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(async (msg) => {
     try {
       const cfg = await chrome.storage.sync.get(YTAM_DEFAULTS);
-      await streamGemini(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => port.postMessage({ delta }));
+      await streamLlm(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => port.postMessage({ delta }));
       port.postMessage({ done: true });
     } catch (e) {
       try { port.postMessage({ error: e.message || String(e) }); } catch (_) {}
@@ -347,6 +395,35 @@ async function addCard(c) {
   });
 }
 
+// ---------- Anki progress (word -> best card interval, days) ----------
+
+const unHtml = (t) => String(t || '').replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim().toLowerCase();
+
+async function ankiProgress() {
+  const noteIds = await anki('findNotes', { query: 'tag:yt-anki-miner' });
+  const words = {};
+  for (let i = 0; i < noteIds.length; i += 400) {
+    const infos = await anki('notesInfo', { notes: noteIds.slice(i, i + 400) });
+    const byCard = new Map();
+    for (const n of infos) {
+      const w = unHtml(n.fields && n.fields.Word && n.fields.Word.value);
+      if (!w) continue;
+      (words[w] = words[w] || { ivl: 0, reps: 0, notes: [] }).notes.push(n.noteId);
+      for (const c of n.cards || []) byCard.set(c, w);
+    }
+    const cards = [...byCard.keys()];
+    if (!cards.length) continue;
+    const cinfo = await anki('cardsInfo', { cards });
+    for (const c of cinfo) {
+      const w = byCard.get(c.cardId);
+      if (!w) continue;
+      words[w].ivl = Math.max(words[w].ivl, c.interval > 0 ? c.interval : 0);
+      words[w].reps = Math.max(words[w].reps, c.reps || 0);
+    }
+  }
+  return words;
+}
+
 // ---------- Local yt-dlp helper (helper/ytam_helper.py) ----------
 
 async function helperFetch(base, path) {
@@ -388,6 +465,7 @@ async function handle(msg) {
     case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);
+    case 'ankiProgress': return ankiProgress();
     case 'deleteNotes': return anki('deleteNotes', { notes: msg.ids });
     case 'ankiStatus': {
       const version = await anki('version');

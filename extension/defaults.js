@@ -9,7 +9,12 @@ self.YTAM_DEFAULTS = {
   padStart: 0.15,
   padEnd: 0.3,
   ankiOnLearning: true,
-  ankiDelete: 'drop',
+  ankiDeleteOnRemove: true,
+  ankiDeleteOnKnown: false,
+  ankiSync: true,
+  ankiAutoKnown: true,
+  ankiMatureDays: 21,
+  ankiGradient: true,
   audioSource: 'auto',
   helperUrl: 'http://127.0.0.1:8766',
   // Translation & subtitles
@@ -20,6 +25,7 @@ self.YTAM_DEFAULTS = {
   // Controls
   autoPause: false,
   pauseOnHover: true,
+  hoverPauseMode: 'now',
   hoverTranslate: true,
   showStageButtons: true,
   rightClick: 'toggle',
@@ -41,6 +47,10 @@ self.YTAM_DEFAULTS = {
   tipFontSize: 16,
   tipAnim: 160,
   tipVariants: 3,
+  tipPadX: 5,
+  tipPadY: 5,
+  tipMaxW: 260,
+  subWidth: 88,
   popWidth: 330,
   popFontSize: 13,
   // Word colors (Language Reactor scheme)
@@ -58,6 +68,12 @@ self.YTAM_DEFAULTS = {
   builtinExpr: true,
   // AI (Gemini): 'off' | 'text' | 'audio'
   aiMode: 'off',
+  aiProvider: 'gemini',
+  aiBaseUrl: 'https://generativelanguage.googleapis.com',
+  aiChatPath: '/chat/completions',
+  aiHeaders: '',
+  aiExtraBody: '',
+  aiSystem: '',
   aiModel: 'gemini-2.5-flash-lite',
   aiFastModel: 'gemini-2.5-flash-lite',
   aiPromptExplain: 'Объясни, что значит «{word}» именно в этой фразе и что значит вся фраза. Укажи оттенок значения или стиль, если важно.',
@@ -69,6 +85,7 @@ self.YTAM_DEFAULTS = {
 // Stored only on this computer (not synced).
 self.YTAM_LOCAL_DEFAULTS = {
   geminiKey: '',
+  aiKey: '',
 };
 
 const LANG_OPTIONS = [['ru', 'Русский'], ['uk', 'Українська'], ['be', 'Беларуская'], ['kk', 'Қазақша'], ['en', 'English'], ['de', 'Deutsch'], ['fr', 'Français'], ['es', 'Español'], ['it', 'Italiano'], ['pl', 'Polski'], ['tr', 'Türkçe'], ['zh-CN', '中文'], ['ja', '日本語']];
@@ -80,6 +97,7 @@ self.YTAM_SCHEMA = [
     id: 'view', title: 'Вид', fields: [
       { k: 'fontFamily', label: 'Шрифт', type: 'select', options: [['default', 'По умолчанию (Roboto)'], ['Arial', 'Arial'], ['Verdana', 'Verdana'], ['"Segoe UI"', 'Segoe UI'], ['"Open Sans"', 'Open Sans'], ['"Trebuchet MS"', 'Trebuchet MS'], ['Georgia', 'Georgia']] },
       { k: 'fontSize', label: 'Размер субтитров', type: 'range', min: 12, max: 60, step: 1, unit: 'px' },
+      { k: 'subWidth', label: 'Ширина субтитров (от ширины видео)', type: 'range', min: 40, max: 100, step: 1, unit: '%' },
       { k: 'fontWeight', label: 'Насыщенность шрифта', type: 'select', options: [['400', 'Обычный'], ['500', 'Средний'], ['600', 'Полужирный'], ['700', 'Жирный']] },
       { k: 'trScale', label: 'Размер перевода', type: 'range', min: 50, max: 110, step: 5, unit: '%' },
       { k: 'subBgOpacity', label: 'Непрозрачность подложки', type: 'range', min: 0, max: 100, step: 5, unit: '%' },
@@ -92,6 +110,9 @@ self.YTAM_SCHEMA = [
       { k: 'panelFontSize', label: 'Текст в боковой панели', type: 'range', min: 11, max: 26, step: 1, unit: 'px' },
       { k: 'tipFontSize', label: 'Текст подсказки при наведении', type: 'range', min: 10, max: 26, step: 1, unit: 'px', preview: 'tip' },
       { k: 'tipVariants', label: 'Вариантов перевода в подсказке', type: 'range', min: 1, max: 6, step: 1 },
+      { k: 'tipPadX', label: 'Подсказка: поля по бокам', type: 'range', min: 0, max: 24, step: 1, unit: 'px' },
+      { k: 'tipPadY', label: 'Подсказка: поля сверху и снизу', type: 'range', min: 0, max: 24, step: 1, unit: 'px' },
+      { k: 'tipMaxW', label: 'Подсказка: макс. ширина', type: 'range', min: 120, max: 520, step: 10, unit: 'px' },
       { k: 'tipAnim', label: 'Плавность появления подсказки', type: 'range', min: 0, max: 500, step: 10, unit: 'мс' },
       { k: 'popWidth', label: 'Ширина окна слова', type: 'range', min: 260, max: 520, step: 10, unit: 'px' },
       { k: 'popFontSize', label: 'Текст окна слова', type: 'range', min: 11, max: 18, step: 1, unit: 'px' },
@@ -99,6 +120,7 @@ self.YTAM_SCHEMA = [
   },
   {
     id: 'words', title: 'Слова', fields: [
+      { k: 'vocabSize', type: 'levels', label: 'Мой уровень', levels: [['A1', 500], ['A2', 1500], ['B1', 3000], ['B2', 5000], ['C1', 8000], ['C2', 12000]] },
       { k: 'vocabSize', label: 'Мой словарный запас', type: 'range', min: 0, max: 20000, step: 250, unit: 'слов', hint: 'Частотный словарь 50 000 слов. A2 ≈ 1500 · B1 ≈ 3000 · B2 ≈ 5000 · C1 ≈ 8000 · C2 ≈ 12000' },
       { k: 'suggestedRatio', label: 'Рекомендованных слов к известным', type: 'select', options: [['0.5', '0.5x'], ['1', '1.0x (рекомендуется)'], ['1.5', '1.5x'], ['2', '2.0x'], ['3', '3.0x']] },
       { k: 'hlKnown', color: 'colorKnown', label: 'Известные слова', type: 'toggle' },
@@ -116,6 +138,7 @@ self.YTAM_SCHEMA = [
       { k: 'rightClick', label: 'Правая кнопка мыши', type: 'select', options: [['toggle', 'Знаю ⇄ Изучаю (рекомендуется)'], ['dict', 'Открыть словарь'], ['none', 'Обычное меню браузера']] },
       { k: 'speakOnClick', label: 'Произносить слово при клике', type: 'toggle' },
       { k: 'pauseOnHover', label: 'Пауза при наведении на субтитры', type: 'toggle' },
+      { k: 'hoverPauseMode', label: 'Когда ставить на паузу при наведении', type: 'select', options: [['now', 'Сразу, как навёл на субтитры'], ['end', 'Только когда фраза доиграла до конца']], hint: 'Второй вариант: видео не дёргается, а останавливается в конце фразы, пока курсор на слове' },
       { k: 'autoPause', label: 'Автопауза после каждой фразы', type: 'toggle' },
       { k: 'arrowKeys', label: 'Стрелки ← → — предыдущая / следующая фраза', type: 'toggle' },
     ],
@@ -132,7 +155,12 @@ self.YTAM_SCHEMA = [
     id: 'anki', title: 'Anki', fields: [
       { k: 'deck', label: 'Колода', type: 'text', list: 'decks' },
       { k: 'ankiOnLearning', label: '«Изучаю» сразу создаёт карточку', type: 'toggle' },
-      { k: 'ankiDelete', label: 'Удалять карточку из Anki (через 30 с)', type: 'select', options: [['drop', 'Когда слово убрано / «не учить»'], ['all', 'Также когда отмечено «знаю»'], ['never', 'Никогда']] },
+      { k: 'ankiDeleteOnRemove', label: 'Удалять карточку, если слово убрано / «не учить»', type: 'toggle', hint: 'Через время из настройки «Удалять из Anki через» (🛠, по умолчанию 30 с)' },
+      { k: 'ankiDeleteOnKnown', label: 'Удалять карточку, если слово отмечено «знаю»', type: 'toggle' },
+      { k: 'ankiSync', label: 'Подтягивать прогресс из Anki', type: 'toggle', hint: 'Чем лучше вы знаете карточку в Anki, тем «зеленее» слово. Нужен запущенный Anki' },
+      { k: 'ankiGradient', label: 'Градиент рамки: оранжевый → зелёный', type: 'toggle' },
+      { k: 'ankiAutoKnown', label: 'Выученная в Anki карточка → слово «знаю»', type: 'toggle' },
+      { k: 'ankiMatureDays', label: 'Считать выученной при интервале', type: 'range', min: 3, max: 120, step: 1, unit: 'дней' },
       { k: 'includeAudio', label: 'Аудио фразы (MP3)', type: 'toggle' },
       { k: 'audioSource', label: 'Откуда брать звук', type: 'select', options: [['auto', 'Помощник yt-dlp, если запущен, иначе запись (рекомендуется)'], ['helper', 'Только помощник yt-dlp'], ['capture', 'Только запись с видео']] },
       { k: 'helperUrl', label: 'Адрес помощника', type: 'text', hint: 'Запустите helper/start-helper.bat (см. README)' },
@@ -145,7 +173,14 @@ self.YTAM_SCHEMA = [
   {
     id: 'ai', title: 'ИИ', fields: [
       { k: 'aiMode', label: 'Обработка субтитров', type: 'select', options: [['off', 'Выключена'], ['text', 'Текст: пунктуация, предложения, перевод'], ['audio', '🎧 ИИ слушает видео']] },
+      { k: 'aiProvider', label: 'Провайдер ИИ', type: 'select', options: [['gemini', 'Google Gemini'], ['openai', 'OpenAI-совместимый (OpenAI, OpenRouter, DeepSeek, Groq, Ollama, LM Studio…)']], hint: 'Режим «слушает видео» работает только с Gemini' },
       { k: 'geminiKey', label: 'Ключ Gemini API', type: 'password', local: true, hint: 'Хранится только на этом компьютере · aistudio.google.com/apikey' },
+      { k: 'aiBaseUrl', label: 'Адрес API', type: 'text', hint: 'Gemini: https://generativelanguage.googleapis.com · OpenAI: https://api.openai.com/v1 · Ollama: http://localhost:11434/v1' },
+      { k: 'aiChatPath', label: 'Путь запроса (OpenAI-совместимый)', type: 'text' },
+      { k: 'aiKey', label: 'Ключ API (OpenAI-совместимый)', type: 'password', local: true },
+      { k: 'aiHeaders', label: 'Свои заголовки (JSON)', type: 'textarea', hint: '{"HTTP-Referer": "https://my.site"}' },
+      { k: 'aiExtraBody', label: 'Доп. параметры запроса (JSON)', type: 'textarea', hint: '{"reasoning_effort": "low"} — добавляется в тело запроса' },
+      { k: 'aiSystem', label: 'Системный промпт', type: 'textarea', hint: 'Добавляется ко всем запросам ИИ' },
       { k: 'aiModel', label: 'Модель для субтитров', type: 'text', list: 'ytam-models' },
       { k: 'aiFastModel', label: 'Модель для разбора слова', type: 'text', list: 'ytam-models' },
       { k: 'aiPromptExplain', label: 'Промпт «Объяснить»', type: 'textarea', hint: '{word} — слово, {sentence} — фраза' },
@@ -228,6 +263,19 @@ self.YTAM_DEV_SCHEMA = [
       { k: 'imgWidth', label: 'Ширина кадра', def: 640, min: 240, max: 1920, step: 40, unit: 'px' },
       { k: 'jpegQuality', label: 'Качество кадра', def: 0.82, min: 0.3, max: 1, step: 0.02 },
       { k: 'ankiDeleteSec', label: 'Удалять из Anki через', def: 30, min: 0, max: 600, step: 5, unit: 'с' },
+    ],
+  },
+  {
+    title: 'Подсказка и субтитры: геометрия', fields: [
+      { k: 'ovBottomMin', label: 'Мин. высота субтитров от низа', def: 0, min: 0, max: 40, step: 1, unit: '%' },
+      { k: 'dragSmooth', label: 'Плавность перетаскивания', def: 0, min: 0, max: 0.9, step: 0.05, hint: '0 = точно за мышью' },
+      { k: 'apRedMs', label: 'AP краснеет не раньше чем через', def: 0, min: 0, max: 1000, step: 20, unit: 'мс' },
+    ],
+  },
+  {
+    title: 'Anki: синхронизация прогресса', fields: [
+      { k: 'ankiSyncMin', label: 'Опрашивать Anki каждые', def: 10, min: 1, max: 120, step: 1, unit: 'мин' },
+      { k: 'ankiGradMax', label: 'Интервал, при котором рамка полностью зелёная', def: 21, min: 3, max: 180, step: 1, unit: 'дней' },
     ],
   },
   {

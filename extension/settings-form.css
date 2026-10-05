@@ -33,3 +33,11 @@
   .ytam-set-row { grid-template-columns: 1fr; gap: 6px; }
   .ytam-set-label { text-align: left; }
 }
+
+.ytam-lvl { padding: 6px 12px; border: 1px solid #555; border-radius: 16px; background: none; color: #ddd; font: 600 13px Roboto, Arial, sans-serif; cursor: pointer; }
+.ytam-lvl:hover { border-color: #999; }
+.ytam-lvl.on { border-color: #7cc4ff; background: #27465e; color: #fff; }
+.ytam-set-ctl .ytam-set-num { width: 84px; max-width: 84px; }
+.ytam-set-rst { padding: 0 4px; border: 0; background: none; color: #c98a4b; font-size: 15px; cursor: pointer; }
+.ytam-set-group { margin: 18px 0 4px; padding: 6px 10px; border-radius: 4px; background: #333; color: #ddd; font-weight: 500; }
+.ytam-set-note { margin: 10px 0; color: #9a9a9a; font-size: 12px; }

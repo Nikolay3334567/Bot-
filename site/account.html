@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Кабинет — {name}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%278%27 fill=%27%237c5cff%27/%3E%3Ctext x=%2716%27 y=%2722%27 font-size=%2714%27 text-anchor=%27middle%27 fill=%27white%27 font-family=%27Arial%27 font-weight=%27700%27%3EYA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+<script src="config.js"></script><script src="plans.js"></script><script src="auth.js"></script>
+</head><body>
+<div data-nav></div>
+<main><div class="wrap" style="padding-top:34px">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <div id="avatar" style="width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:700;font-size:20px;color:#fff;overflow:hidden"></div>
+    <div><h1 style="margin:0;font-size:26px" id="who"></h1><div style="color:var(--mute)" id="mail"></div></div>
+  </div>
+  <div class="tabs" id="tabs">
+    <button data-t="overview" class="on">Обзор</button><button data-t="plan">Подписка</button><button data-t="setup">Установка</button><button data-t="econ" id="econTab" style="display:none">Экономика (админ)</button>
+  </div>
+
+  <section data-pane="overview">
+    <div class="grid g2">
+      <div class="card"><h3>Тариф</h3><div class="kv"><span>Текущий</span><b id="curPlan"></b></div><div class="kv"><span>Способ входа</span><b id="prov"></b></div><div class="kv"><span>Статус оплаты</span><b>тестовый режим</b></div></div>
+      <div class="card"><h3>Использование в этом месяце</h3><div id="usage"></div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h3>Ключ доступа расширения</h3><p style="margin-bottom:10px">Вставьте в расширении: ⚙ → ИИ → «Ключ API» (когда подключим сервер ИИ). Пока что можно использовать свой ключ Gemini.</p><code id="key" style="display:block;padding:10px;border-radius:8px;background:var(--bg2);border:1px solid var(--line);word-break:break-all"></code></div>
+  </section>
+
+  <section data-pane="plan" hidden>
+    <div class="note" style="margin-bottom:16px">🧪 Тестовый режим: тариф переключается без оплаты.</div>
+    <div class="grid g3" id="plans"></div>
+  </section>
+
+  <section data-pane="setup" hidden>
+    <div class="grid g2">
+      <div class="card"><h3>1. Расширение для Chrome</h3><p>chrome://extensions → «Режим разработчика» → «Загрузить распакованное» → папка <code>extension</code>.</p></div>
+      <div class="card"><h3>2. Anki + AnkiConnect</h3><p>Установите Anki и дополнение AnkiConnect (код <code>2055492159</code>).</p></div>
+      <div class="card"><h3>3. Лончер (чистый звук)</h3><p>Запустите <code>launcher/dist/ytam-launcher-windows-arm64.exe</code> (или amd64). Он сам скачает yt-dlp и ffmpeg, запустит Anki. Статус: <a href="http://localhost:8766/" target="_blank">localhost:8766</a>.</p></div>
+      <div class="card"><h3>4. ИИ</h3><p>⚙ → ИИ: ключ Gemini или любой OpenAI-совместимый адрес (OpenRouter, Ollama, DeepSeek…).</p></div>
+    </div>
+  </section>
+
+  <section data-pane="econ" hidden>
+    <p class="lead">Калькулятор экономики подписки. Цены токенов — Gemini 2.5 Flash-Lite по умолчанию; меняйте, чтобы проверить сценарии.</p>
+    <div class="grid g2">
+      <div class="card" id="inputs"></div>
+      <div class="card" id="result"></div>
+    </div>
+  </section>
+</div></main>
+<div data-footer></div>
+<script src="common.js"></script>
+<script src="account.js"></script>
+</body></html>

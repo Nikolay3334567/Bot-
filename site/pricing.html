@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Тарифы — {name}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%278%27 fill=%27%237c5cff%27/%3E%3Ctext x=%2716%27 y=%2722%27 font-size=%2714%27 text-anchor=%27middle%27 fill=%27white%27 font-family=%27Arial%27 font-weight=%27700%27%3EYA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+<script src="config.js"></script><script src="plans.js"></script><script src="auth.js"></script>
+</head><body>
+<div data-nav></div>
+<main><div class="wrap" style="padding-top:50px">
+  <h1 style="font-size:40px;margin:0 0 8px">Тарифы</h1>
+  <p class="lead">Свой ключ ИИ — бесплатно. Готовый ИИ в подписке — без настроек и ключей.</p>
+  <div class="note" style="margin-bottom:22px">🧪 Тестовый режим: оплата не подключена. Тариф можно выбрать в кабинете — деньги не списываются.</div>
+  <div class="switch" id="period"><button data-p="m" class="on">Помесячно</button><button data-p="y">За год <small style="color:var(--ok)">−30%</small></button></div>
+  <div class="grid g3" id="plans"></div>
+</div></main>
+<div data-footer></div>
+<script src="common.js"></script>
+<script>
+  let period = 'm';
+  const fmt = (n) => (n === 0 ? '0' : n.toFixed(2).replace(/\.00$/, ''));
+  function render() {
+    const cur = (Auth.session() || {}).plan;
+    document.getElementById('plans').innerHTML = PLANS.map((p) => {
+      const amount = period === 'y' ? p.yearly / 12 : p.price;
+      return `<div class="card price ${p.popular ? 'pop' : ''}">
+        ${p.popular ? '<span class="badge">Популярный</span>' : ''}
+        <h3 style="margin-top:${p.popular ? 8 : 0}px">${p.name}</h3><p>${p.tagline}</p>
+        <div class="amount">$${fmt(amount)}<small> / мес</small></div>
+        <small style="color:var(--mute)">${p.price === 0 ? 'навсегда' : period === 'y' ? `$${fmt(p.yearly)} в год` : 'оплата каждый месяц'}</small>
+        <ul>${p.features.map((f) => `<li>${f}</li>`).join('')}</ul>
+        <a class="btn ${p.popular ? '' : 'sec'}" href="${Auth.session() ? 'account.html?plan=' + p.id : 'login.html'}">${cur === p.id ? 'Ваш тариф' : p.price === 0 ? 'Начать' : 'Выбрать ' + p.name}</a>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('period').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; period = b.dataset.p; document.querySelectorAll('#period button').forEach((x) => x.classList.toggle('on', x === b)); render(); };
+  render();
+</script>
+</body></html>

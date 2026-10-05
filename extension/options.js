@@ -1,4 +1,16 @@
-document.getElementById('settings').append(YTAM_buildSettings());
+const grantBtn = Object.assign(document.createElement('button'), { className: 'ytam-set-reset', textContent: 'Разрешить доступ к адресу API' });
+const grantNote = document.createElement('span');
+grantNote.style.cssText = 'margin-left:10px;font-size:12px;color:#9a9a9a';
+grantBtn.onclick = async () => {
+  const { aiBaseUrl } = await chrome.storage.sync.get(YTAM_DEFAULTS);
+  try {
+    const ok = await chrome.permissions.request({ origins: [new URL(aiBaseUrl).origin + '/*'] });
+    grantNote.textContent = ok ? '✓ доступ разрешён' : 'доступ не выдан';
+  } catch (e) { grantNote.textContent = 'неверный адрес: ' + e.message; }
+};
+const grantBox = document.createElement('div');
+grantBox.append(grantBtn, grantNote);
+document.getElementById('settings').append(YTAM_buildSettings({ extra: { ai: grantBox } }));
 const $ = (id) => document.getElementById(id);
 const STATUS = { 1: 'Изучаю', 2: 'Знаю', 3: 'Не учить' };
 let vocab = {};

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -66,5 +66,9 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  }
+  },
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ]
 }

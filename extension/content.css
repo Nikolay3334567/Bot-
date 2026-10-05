@@ -16,6 +16,10 @@
   --ytam-tip-anim: 160ms;
   --ytam-pop-w: 330px;
   --ytam-pop-fs: 13px;
+  --ytam-sub-w: 88;
+  --ytam-tip-px: 5px;
+  --ytam-tip-py: 5px;
+  --ytam-tip-maxw: 260px;
 }
 
 html.ytam-hide-native .ytp-caption-window-container { display: none !important; }
@@ -27,8 +31,8 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
 .ytam-w.ytam-known { color: var(--ytam-c-known); }
 .ytam-w.ytam-next { color: var(--ytam-c-next); }
 .ytam-w.ytam-rare { color: var(--ytam-c-rare); }
-.ytam-w.ytam-learning { color: #fff; box-shadow: inset 0 0 0 1.5px var(--ytam-c-learning); }
-.ytam-w.ytam-learn-text { color: var(--ytam-c-learning); }
+.ytam-w.ytam-learning { color: #fff; box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--ytam-c-known) calc(var(--p, 0) * 100%), var(--ytam-c-learning)); }
+.ytam-w.ytam-learn-text { color: color-mix(in srgb, var(--ytam-c-known) calc(var(--p, 0) * 100%), var(--ytam-c-learning)); }
 .ytam-w:hover, .ytam-w.ytam-w-sel { background: rgba(120, 120, 120, .45); }
 
 /* ---------- side panel ---------- */
@@ -145,13 +149,16 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
   font-family: var(--ytam-sub-font);
 }
 #ytam-overlay.ytam-hidden { display: none; }
-.ytam-ov-line { display: flex; align-items: center; gap: 8px; max-width: 92%; padding: 2px 0; pointer-events: auto; }
+.ytam-ov-line { display: flex; align-items: center; gap: 8px; max-width: calc(var(--ytam-sub-w) * 1%); padding: 2px 0; pointer-events: auto; }
 .ytam-ov-box { padding: 3px 12px; border-radius: 6px; background: rgba(8, 8, 8, var(--ytam-bg-a)); }
 .ytam-ov-text { color: #fff; font-size: var(--ytam-fs); font-weight: var(--ytam-fw); line-height: 1.32; }
-.ytam-ov-tr { max-width: 82%; padding: 3px 14px; border-radius: 6px; background: rgba(8, 8, 8, var(--ytam-bg-a)); color: #fff; font-size: calc(var(--ytam-fs) * var(--ytam-tr-scale)); line-height: 1.32; pointer-events: auto; }
+.ytam-ov-tr { max-width: calc(var(--ytam-sub-w) * .9%); padding: 3px 14px; border-radius: 6px; background: rgba(8, 8, 8, var(--ytam-bg-a)); color: #fff; font-size: calc(var(--ytam-fs) * var(--ytam-tr-scale)); line-height: 1.32; pointer-events: auto; }
 .ytam-ov-tr:empty { display: none; }
-#ytam-overlay.ytam-two .ytam-ov-line { max-width: min(70%, 34em); }
-#ytam-overlay.ytam-two .ytam-ov-text, #ytam-overlay.ytam-two .ytam-ov-tr { text-wrap: balance; }
+/* Two-line mode: both rows stretch over the full subtitle width (text wraps to two lines). */
+#ytam-overlay.ytam-two .ytam-ov-line, #ytam-overlay.ytam-two .ytam-ov-tr { width: calc(var(--ytam-sub-w) * 1%); max-width: none; box-sizing: border-box; }
+#ytam-overlay.ytam-two .ytam-ov-box { flex: 1; min-width: 0; }
+#ytam-overlay.ytam-two .ytam-ov-tr { width: calc(var(--ytam-sub-w) * 1% - 12px); }
+#ytam-overlay.ytam-two .ytam-ov-text, #ytam-overlay.ytam-two .ytam-ov-tr { text-wrap: pretty; }
 #ytam-overlay .ytam-play { width: calc(var(--ytam-fs) * 1.05); height: calc(var(--ytam-fs) * 1.05); opacity: .85; }
 #ytam-overlay .ytam-play::after { left: 38%; top: 28%; border-width: calc(var(--ytam-fs) * .24) 0 calc(var(--ytam-fs) * .24) calc(var(--ytam-fs) * .36); }
 #ytam-overlay .ytam-star { width: auto; height: auto; font-size: calc(var(--ytam-fs) * 1.05); }
@@ -159,17 +166,17 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
 #ytam-overlay.ytam-no-tr .ytam-ov-tr { display: none; }
 #ytam-overlay.ytam-blur-tr .ytam-ov-tr, #ytam-overlay.ytam-blur-orig .ytam-ov-text { filter: blur(7px); transition: filter .15s; }
 #ytam-overlay.ytam-blur-tr .ytam-ov-tr:hover, #ytam-overlay.ytam-blur-orig .ytam-ov-line:hover .ytam-ov-text { filter: none; }
-/* Position editing: translucent rectangle like in LR */
-#ytam-overlay.ytam-pos-edit, #ytam-overlay.ytam-pos-flash {
-  left: 6%;
-  right: 6%;
-  padding: 10px 0;
-  border: 2px dashed rgba(255, 255, 255, .7);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, .18);
+/* Position editing: the subtitle rows become translucent rectangles that follow the pointer. */
+#ytam-overlay.ytam-pos-edit .ytam-ov-box, #ytam-overlay.ytam-pos-edit .ytam-ov-tr {
+  background: rgba(255, 255, 255, .3);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .55);
+  color: transparent;
 }
-#ytam-overlay.ytam-pos-edit { pointer-events: auto; cursor: ns-resize; }
-#ytam-overlay.ytam-pos-edit * { cursor: ns-resize; }
+#ytam-overlay.ytam-pos-edit .ytam-ov-box *, #ytam-overlay.ytam-pos-edit .ytam-ov-tr { color: transparent !important; box-shadow: none; }
+#ytam-overlay.ytam-pos-edit .ytam-play, #ytam-overlay.ytam-pos-edit .ytam-star { visibility: hidden; }
+#ytam-overlay.ytam-pos-edit .ytam-ov-tr { display: block; box-shadow: 0 0 0 1px rgba(255, 255, 255, .55); }
+html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-select: none !important; }
+.ytam-posbtn { cursor: grab; touch-action: none; }
 
 /* side buttons on the video (LR): next / repeat / prev on the left, AP + position on the right */
 .ytam-side { position: absolute; bottom: 14%; z-index: 61; display: flex; flex-direction: column; align-items: center; gap: 14px; transition: opacity .25s; }
@@ -186,6 +193,10 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
 .ytam-ap input:checked + span { background: rgba(40, 180, 60, .55); }
 .ytam-ap input:checked + span::after { transform: translateX(18px); background: #2ecc40; }
 .ytam-ap b { font-weight: 500; }
+.ytam-ap.held span { background: rgba(230, 60, 60, .55); }
+.ytam-ap.held span::after { background: #ff4d4f; }
+.ytam-ap.held b { color: #ff8a8a; }
+.ytam-ap span, .ytam-ap span::after { transition: transform .15s, background .2s; }
 
 /* button in the YouTube control bar */
 .ytam-ytbtn { display: inline-flex; align-items: center; gap: 6px; height: 100%; margin-left: 6px; padding: 0 6px; vertical-align: top; }
@@ -201,14 +212,16 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
 .ytam-tip {
   position: fixed;
   z-index: 2147483646;
-  min-width: 120px;
-  max-width: 320px;
-  padding: 6px 8px 8px;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 0;
+  max-width: var(--ytam-tip-maxw);
+  padding: var(--ytam-tip-py) var(--ytam-tip-px);
   border-radius: 12px;
   background: #00639e;
   color: #fff;
   box-shadow: 0 6px 22px rgba(0, 0, 0, .45);
-  font: var(--ytam-tip-fs)/1.3 var(--ytam-font);
+  font: var(--ytam-tip-fs)/1.28 var(--ytam-font);
   text-align: center;
   opacity: 0;
   transform: translateY(4px);
@@ -222,23 +235,27 @@ html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !i
   left: var(--arrow-x);
   top: 100%;
   margin-left: -9px;
-  border: 9px solid transparent;
-  border-top-color: #00639e;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 9px 9px 0 9px;
+  border-color: #00639e transparent transparent transparent;
+  pointer-events: none;
 }
-.ytam-tip.below::after, .ytam-pop.below::after { top: auto; bottom: 100%; border-top-color: transparent; border-bottom-color: #00639e; }
+.ytam-tip.below::after, .ytam-pop.below::after { top: auto; bottom: 100%; border-width: 0 9px 9px 9px; border-color: transparent transparent #00639e transparent; }
 .ytam-pop::after { border-top-color: #242424; }
 .ytam-pop.below::after { border-bottom-color: #005a92; }
 .ytam-pop.loading::after { border-top-color: #242424; }
-.ytam-tip-head { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 2px 0 4px; padding: 2px 10px; border-radius: 8px; background: rgba(255, 255, 255, .13); color: #b6dca0; font-size: .9em; }
+.ytam-tip-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; margin: 1px 0 3px; padding: 1px 6px; border-radius: 8px; background: rgba(255, 255, 255, .13); color: #b6dca0; font-size: .88em; white-space: normal; overflow-wrap: anywhere; }
 .ytam-tip-xsave { display: grid; place-items: center; padding: 1px 4px; border: 1px solid transparent; border-radius: 8px; background: none; color: #f0a030; font-size: 1em; cursor: pointer; opacity: .75; }
 .ytam-tip-xsave:hover { opacity: 1; background: rgba(255, 255, 255, .12); }
 .ytam-tip-xsave.on { border-color: #f0a030; opacity: 1; }
-.ytam-tip-vars { padding: 0 6px; }
+.ytam-tip-vars { padding: 0 1px; white-space: normal; overflow-wrap: anywhere; }
 .ytam-tip-vars div:nth-child(1) { color: #fff; }
 .ytam-tip-vars div:nth-child(2) { color: rgba(255, 255, 255, .78); }
 .ytam-tip-vars div:nth-child(3) { color: rgba(255, 255, 255, .6); }
 .ytam-tip-vars div:nth-child(n+4) { color: rgba(255, 255, 255, .48); }
-.ytam-tip-btns { display: inline-flex; margin-top: 6px; border-radius: 16px; overflow: hidden; background: rgba(255, 255, 255, .13); }
+.ytam-tip-btns { display: inline-flex; margin-top: 4px; border-radius: 16px; overflow: hidden; background: rgba(255, 255, 255, .13); }
 .ytam-tb { display: grid; place-items: center; width: 2.4em; height: 1.65em; border: 0; background: none; font-size: 1em; cursor: pointer; }
 .ytam-tb + .ytam-tb { border-left: 1px solid rgba(0, 0, 0, .25); }
 .ytam-tb.known { color: #a0f8d0; }

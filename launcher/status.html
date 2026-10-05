@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YT → Anki — лончер</title>
+<style>
+  :root { --bg:#161616; --card:#232323; --fg:#eee; --mute:#9a9a9a; --line:#383838; --ok:#6fd08a; --bad:#ff8a80; --acc:#1f6fb0; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1d1d1f; --mute:#666; --line:#dcdde1; --ok:#1e7e34; --bad:#c62828; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--mute); margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; } .row small { color:var(--mute); display:block; word-break:break-all; }
+  .ok { color:var(--ok); font-weight:600; } .bad { color:var(--bad); font-weight:600; }
+  button { padding:7px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff; font:inherit; cursor:pointer; }
+  button.sec { background:#5f6368; } button.danger { background:#b3261e; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+  pre { margin:0; max-height:240px; overflow:auto; font:12px/1.45 ui-monospace,Consolas,monospace; color:var(--mute); white-space:pre-wrap; }
+  .bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; margin-top:4px; } .bar i { display:block; height:100%; background:var(--acc); }
+  label.chk { display:flex; align-items:center; gap:8px; padding:5px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>YT → Anki — лончер</h1>
+  <p class="sub">Окно можно закрыть: лончер продолжит работать в фоне. Закройте его кнопкой «Выключить лончер».</p>
+
+  <div class="card" id="status"></div>
+  <div class="card">
+    <div class="btns">
+      <button id="startAnki">Запустить Anki</button>
+      <button id="install" class="sec">Скачать yt-dlp и ffmpeg</button>
+      <button id="update" class="sec">Обновить yt-dlp</button>
+      <button id="clear" class="sec">Очистить кэш</button>
+      <button id="quit" class="danger">Выключить лончер</button>
+    </div>
+  </div>
+  <div class="card" id="settings"></div>
+  <div class="card" id="jobs"></div>
+  <div class="card"><b>Журнал</b><pre id="log"></pre></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const post = (path, body) => fetch(path, { method: 'POST', headers: { 'X-YTAM': '1' }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json());
+const row = (name, ok, text, small) => `<div class="row"><div>${name}<small>${small || ''}</small></div><div class="${ok ? 'ok' : 'bad'}">${text}</div></div>`;
+let cfg = null;
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/status')).json(); } catch (_) { $('status').innerHTML = '<span class="bad">Лончер остановлен</span>'; return; }
+  cfg = s.config;
+  $('status').innerHTML =
+    row('Лончер', true, 'работает', s.os + ' · кэш ' + s.cacheMB + ' МБ') +
+    row('yt-dlp', !!s.ytdlp, s.ytdlp ? s.ytdlpVersion : 'не найден', s.ytdlp || 'Нажмите «Скачать yt-dlp и ffmpeg» или положите yt-dlp.exe рядом с лончером') +
+    row('ffmpeg', !!s.ffmpeg, s.ffmpeg ? 'найден' : 'не найден', s.ffmpeg || '') +
+    row('Anki + AnkiConnect', s.ankiConnect, s.ankiConnect ? 'на связи' : 'не отвечает', s.ankiConnect ? '' : (s.ankiPath ? 'Anki: ' + s.ankiPath + ' — нажмите «Запустить Anki»' : 'Установите дополнение AnkiConnect (код 2055492159) и запустите Anki')) +
+    row('Автозапуск с Windows', s.autostart, s.autostart ? 'включён' : 'выключен', '') ;
+  const c = s.config;
+  if (!$('settings').dataset.built) { $('settings').dataset.built = '1'; $('settings').innerHTML = '<b>Настройки</b>' +
+    `<label class="chk"><input type="checkbox" id="c_anki" ${c.launchAnki ? 'checked' : ''}> Запускать Anki вместе с лончером</label>` +
+    `<label class="chk"><input type="checkbox" id="c_dl" ${c.autoDownload ? 'checked' : ''}> Скачивать yt-dlp и ffmpeg автоматически, если их нет</label>` +
+    `<label class="chk"><input type="checkbox" id="c_open" ${c.openStatusPage ? 'checked' : ''}> Открывать это окно при запуске</label>` +
+    `<label class="chk"><input type="checkbox" id="c_auto" ${s.autostart ? 'checked' : ''}> Запускать лончер при входе в Windows</label>` +
+    '<small style="color:var(--mute)">Остальное — в config.json рядом с лончером (пути к yt-dlp/ffmpeg/Anki, аргументы yt-dlp, размер кэша).</small>';
+  for (const id of ['c_anki', 'c_dl', 'c_open']) $(id).onchange = save;
+  $('c_auto').onchange = async () => { const r = await post('/api/autostart?on=' + ($('c_auto').checked ? 1 : 0)); if (r.error) alert(r.error); refresh(); };
+  } else if ($('c_auto')) $('c_auto').checked = s.autostart;
+  $('jobs').innerHTML = '<b>Загрузки аудио</b>' + (s.jobs && s.jobs.length ? s.jobs.map((j) =>
+    `<div class="row"><div>${j.id}<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><small>${j.error || ''}</small></div><div class="${j.state === 'error' ? 'bad' : j.state === 'ready' ? 'ok' : ''}">${j.state === 'downloading' ? Math.round(j.progress * 100) + '%' : j.state}</div></div>`).join('') : '<div class="row"><div style="color:var(--mute)">Пока пусто — откройте видео на YouTube</div></div>');
+  $('log').textContent = (s.log || []).join('\n');
+}
+async function save() {
+  cfg.launchAnki = $('c_anki').checked; cfg.autoDownload = $('c_dl').checked; cfg.openStatusPage = $('c_open').checked;
+  await post('/api/config', cfg);
+}
+$('startAnki').onclick = async () => { const r = await post('/api/start-anki'); if (r.error) alert(r.error); setTimeout(refresh, 1500); };
+$('install').onclick = async () => { await post('/api/install'); setTimeout(refresh, 800); };
+$('update').onclick = async () => { await post('/api/update-ytdlp'); setTimeout(refresh, 800); };
+$('clear').onclick = async () => { if (confirm('Удалить скачанное аудио?')) { await post('/api/clear-cache'); refresh(); } };
+$('quit').onclick = async () => { if (confirm('Выключить лончер? Звук карточек вернётся к записи с видео.')) { await post('/api/quit'); setTimeout(refresh, 600); } };
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

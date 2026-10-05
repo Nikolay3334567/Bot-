@@ -30,6 +30,8 @@
     hoverWord: null,
     pending: [],        // cards waiting for their audio to be played
     helper: { state: 'off', progress: 0, error: '' },
+    progress: {},       // word -> Anki card interval in days
+    hoverIn: false,     // pointer is over the subtitle line
   };
   let ui = null;
   let pop = null;
@@ -136,17 +138,25 @@
     return c.replace(/\s+/g, ' ').trim();
   }
 
-  function recolor(word) {
-    const sel = word ? `.ytam-w[data-w="${CSS.escape(word)}"]` : '.ytam-w';
-    document.querySelectorAll(sel).forEach((el) => { el.className = spanClass(el); });
+  // Class + progress variable (--p: 0 = orange … 1 = green) from Anki intervals.
+  function styleSpan(el) {
+    el.className = spanClass(el);
+    const ivl = S.vocab[el.dataset.w] === 1 && settings.ankiGradient && settings.ankiSync ? S.progress[el.dataset.w] : null;
+    if (ivl != null) el.style.setProperty('--p', Math.max(0, Math.min(1, ivl / X.ankiGradMax)).toFixed(2));
+    else el.style.removeProperty('--p');
   }
 
-  async function setWordStatus(w, st) {
+  function recolor(word) {
+    const sel = word ? `.ytam-w[data-w="${CSS.escape(word)}"]` : '.ytam-w';
+    document.querySelectorAll(sel).forEach(styleSpan);
+  }
+
+  async function setWordStatus(w, st, silent) {
     const prev = S.vocab[w];
     if (st) S.vocab[w] = st; else delete S.vocab[w];
     if (w.includes(' ')) { renderList(); renderOverlay(); } else recolor(w);
     if (st === 1 && prev !== 1) logSaved({ k: w, t: w.includes(' ') ? 'x' : 'w', text: w });
-    if (prev === 1 && st !== 1) leftLearning(w, st);
+    if (prev === 1 && st !== 1) { if (silent) updateSaved((saved) => saved.filter((e) => e.k !== w)); else leftLearning(w, st); }
     try {
       const { vocab = {} } = await chrome.storage.local.get('vocab');
       if (st) vocab[w] = st; else delete vocab[w];
@@ -195,7 +205,7 @@
   // A word left "learning": drop its pending card, and maybe its Anki note (after 30 s).
   function leftLearning(k, st) {
     S.pending = S.pending.filter((p) => p.key !== k);
-    const del = settings.ankiDelete === 'all' || (settings.ankiDelete === 'drop' && st !== 2);
+    const del = st === 2 ? settings.ankiDeleteOnKnown : settings.ankiDeleteOnRemove;
     if (del) scheduleAnkiDelete(k);
     else if (st !== 2) updateSaved((saved) => saved.filter((e) => e.k !== k));
   }
@@ -225,6 +235,37 @@
     await chrome.storage.local.set({ ankiDel: keep });
   }
   setInterval(() => { processAnkiDeletes().catch(() => {}); }, 5000);
+
+  // ---------- progress from Anki ----------
+  // Card intervals of our notes → gradient of the "learning" outline and auto "known".
+
+  async function syncAnki() {
+    if (!settings.ankiSync) return;
+    let words;
+    try { words = await bg({ type: 'ankiProgress' }); } catch (_) { return; } // Anki closed: silently skip
+    S.progress = {};
+    const noteIds = {};
+    for (const [w, info] of Object.entries(words)) {
+      S.progress[w] = info.ivl;
+      noteIds[w] = info.notes;
+    }
+    // Remember note ids (so the card can be deleted later) for words we track.
+    await updateSaved((saved) => {
+      for (const e of saved) if (noteIds[e.k]) e.ids = [...new Set([...(e.ids || []), ...noteIds[e.k]])];
+    });
+    if (settings.ankiAutoKnown) {
+      for (const [w, ivl] of Object.entries(S.progress)) {
+        if (S.vocab[w] === 1 && ivl >= settings.ankiMatureDays) await setWordStatus(w, 2, true);
+      }
+    }
+    recolor();
+    refreshSideTabs();
+  }
+
+  function syncLoop() {
+    syncAnki().catch(() => {}).finally(() => setTimeout(syncLoop, Math.max(1, X.ankiSyncMin) * 60000));
+  }
+  setTimeout(syncLoop, 4000); // after settings and vocabulary have loaded
 
   // ---------- expressions (idioms, phrasal verbs) ----------
 
@@ -757,7 +798,7 @@
       if (m.index > last) el.append(text.slice(last, m.index));
       const span = h('span', { 'data-w': norm(m[0]), 'data-ti': String(ti), text: m[0] });
       if (learnedTok.has(ti)) span.dataset.xl = '1';
-      span.className = spanClass(span);
+      styleSpan(span);
       el.append(span);
       ti++;
       last = m.index + m[0].length;
@@ -873,10 +914,12 @@
     // The whole English line (with its background) is one pause zone.
     ovLine.addEventListener('mouseenter', () => {
       clearTimeout(S.resumeTimer);
+      S.hoverIn = true;
       const v = getVideo();
-      if (settings.pauseOnHover && v && !v.paused && !S.posEdit) { v.pause(); S.hoverPaused = true; }
+      // 'now': stop at once. 'end': keep playing, tick() stops at the end of the phrase.
+      if (settings.pauseOnHover && settings.hoverPauseMode === 'now' && v && !v.paused && !S.posEdit) { v.pause(); S.hoverPaused = true; }
     });
-    ovLine.addEventListener('mouseleave', () => scheduleResume());
+    ovLine.addEventListener('mouseleave', () => { S.hoverIn = false; scheduleResume(); });
 
     // --- buttons at the sides of the video (LR) ---
     const apInput = h('input', { type: 'checkbox', 'data-k': 'autoPause', onchange: () => chrome.storage.sync.set({ autoPause: apInput.checked }) });
@@ -884,9 +927,18 @@
       svgBtn('ytam-sbtn', 'next', 'Следующая фраза (D)', () => seekCue(Math.min(S.cues.length - 1, Math.max(0, S.active) + 1), true)),
       svgBtn('ytam-sbtn', 'repeat', 'Повторить (S)', () => seekCue(Math.max(0, S.active), true)),
       svgBtn('ytam-sbtn', 'prev', 'Предыдущая фраза (A)', () => seekCue(Math.max(0, S.active - 1), true)));
+    const posBtn = svgBtn('ytam-sbtn ytam-posbtn', 'updown', 'Положение субтитров: зажмите и тяните (или крутите колесо)', null);
+    posBtn.addEventListener('pointerdown', startPosDrag);
+    posBtn.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      setPos(settings.subPos + (e.deltaY < 0 ? 1 : -1));
+      clearTimeout(S.posSaveTimer);
+      S.posSaveTimer = setTimeout(() => chrome.storage.sync.set({ subPos: settings.subPos }), 400);
+      showPosRect(900);
+    }, { passive: false });
     const sideR = h('div', { class: 'ytam-side right' },
       h('label', { class: 'ytam-ap', title: 'Автопауза после фразы (Q)' }, apInput, h('span'), h('b', { text: 'AP' })),
-      svgBtn('ytam-sbtn', 'updown', 'Положение субтитров: тяните мышью или крутите колесо', () => togglePosEdit()));
+      posBtn);
     for (const el of [sideL, sideR]) {
       for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) el.addEventListener(type, (e) => e.stopPropagation());
     }
@@ -997,7 +1049,7 @@
     const row = ui.rows[a];
     if (!row) return;
     row.classList.add('ytam-active');
-    if (S.tab === 'subs' && Date.now() - S.userScrollAt > 4000 && !ui.panel.classList.contains('ytam-collapsed')) {
+    if (S.tab === 'subs' && Date.now() - S.userScrollAt > 4000 && !ui.panel.classList.contains('ytam-collapsed') && !ui.list.matches(':hover')) {
       ui.list.scrollTo({ top: row.offsetTop - ui.list.clientHeight / 3, behavior: 'smooth' });
     }
   }
@@ -1007,7 +1059,7 @@
     const c = S.cues[S.shown];
     ui.overlay.classList.toggle('ytam-hidden', !c && !S.posEdit);
     if (!c) {
-      if (S.posEdit) { ui.ovText.textContent = 'Тяните, чтобы переместить субтитры'; ui.ovTr.textContent = 'Перевод'; }
+      if (S.posEdit) { ui.ovText.textContent = 'Субтитры будут здесь, на этой высоте'; ui.ovTr.textContent = 'Перевод субтитров'; }
       return;
     }
     ui.ovText.replaceChildren(...wordsNode(c.text, 'x', S.shown).childNodes);
@@ -1030,6 +1082,10 @@
     st.setProperty('--ytam-tr-scale', String((+settings.trScale || 80) / 100));
     st.setProperty('--ytam-bg-a', String((+settings.subBgOpacity) / 100));
     st.setProperty('--ytam-pos', String(+settings.subPos));
+    st.setProperty('--ytam-sub-w', String(+settings.subWidth || 92));
+    st.setProperty('--ytam-tip-px', (+settings.tipPadX) + 'px');
+    st.setProperty('--ytam-tip-py', (+settings.tipPadY) + 'px');
+    st.setProperty('--ytam-tip-maxw', (+settings.tipMaxW || 260) + 'px');
     st.setProperty('--ytam-panel-fs', (+settings.panelFontSize || 16) + 'px');
     st.setProperty('--ytam-tip-fs', (+settings.tipFontSize || 16) + 'px');
     st.setProperty('--ytam-tip-anim', (+settings.tipAnim || 0) + 'ms');
@@ -1068,52 +1124,70 @@
     if (ui.sideL.parentNode !== player) player.append(ui.sideL, ui.sideR);
   }
 
-  // ---------- subtitle position editing (⌃⌄ button / settings slider) ----------
+  // ---------- subtitle position: press the ⌃⌄ button and drag ----------
+  // While dragging, a translucent rectangle (the size of the subtitles) follows the pointer.
 
-  function togglePosEdit(on = !S.posEdit) {
-    S.posEdit = on;
+  function showPosRect(ms) {
     if (!ui) return;
-    ui.overlay.classList.toggle('ytam-pos-edit', on);
+    S.posEdit = true;
+    ui.overlay.classList.add('ytam-pos-edit');
     renderOverlay();
-    if (!on) chrome.storage.sync.set({ subPos: settings.subPos });
+    clearTimeout(S.flashTimer);
+    if (ms) S.flashTimer = setTimeout(hidePosRect, ms);
   }
 
-  function flashPos() {
-    if (!ui || S.posEdit) return;
-    ui.overlay.classList.add('ytam-pos-flash');
-    clearTimeout(S.flashTimer);
-    S.flashTimer = setTimeout(() => ui.overlay.classList.remove('ytam-pos-flash'), 1200);
+  function hidePosRect() {
+    if (!ui || S.posDrag) return;
+    S.posEdit = false;
+    ui.overlay.classList.remove('ytam-pos-edit');
+    renderOverlay();
   }
+
+  function flashPos() { showPosRect(1200); }
 
   function setPos(p) {
-    settings.subPos = Math.max(0, Math.min(70, Math.round(p)));
+    settings.subPos = Math.max(X.ovBottomMin, Math.min(70, Math.round(p * 100) / 100));
     document.documentElement.style.setProperty('--ytam-pos', String(settings.subPos));
   }
 
-  document.addEventListener('pointerdown', (e) => {
-    if (!S.posEdit || !ui || !ui.overlay.contains(e.target)) return;
+  function startPosDrag(e) {
+    if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
     const player = document.getElementById('movie_player');
-    const r = player.getBoundingClientRect();
+    if (!player) return;
+    const height = player.getBoundingClientRect().height || 1;
     const startY = e.clientY, startPos = settings.subPos;
-    const move = (ev) => setPos(startPos + ((startY - ev.clientY) / r.height) * 100);
+    let target = startPos, shown = startPos, raf = 0;
+    S.posDrag = true;
+    showPosRect(0);
+    document.documentElement.classList.add('ytam-dragging');
+    const frame = () => {
+      raf = 0;
+      shown += (target - shown) * (1 - X.dragSmooth);
+      if (Math.abs(target - shown) < 0.02) shown = target;
+      setPos(shown);
+      if (shown !== target) raf = requestAnimationFrame(frame);
+    };
+    const move = (ev) => {
+      target = startPos + ((startY - ev.clientY) / height) * 100;
+      if (!raf) raf = requestAnimationFrame(frame);
+    };
     const up = () => {
       document.removeEventListener('pointermove', move, true);
       document.removeEventListener('pointerup', up, true);
+      document.removeEventListener('pointercancel', up, true);
+      cancelAnimationFrame(raf);
+      setPos(target);
+      S.posDrag = false;
+      document.documentElement.classList.remove('ytam-dragging');
+      hidePosRect();
       chrome.storage.sync.set({ subPos: settings.subPos });
     };
     document.addEventListener('pointermove', move, true);
     document.addEventListener('pointerup', up, true);
-  }, true);
-
-  document.addEventListener('wheel', (e) => {
-    if (!S.posEdit || !ui || !ui.overlay.contains(e.target)) return;
-    e.preventDefault();
-    setPos(settings.subPos + (e.deltaY < 0 ? 1 : -1));
-    clearTimeout(S.posSaveTimer);
-    S.posSaveTimer = setTimeout(() => chrome.storage.sync.set({ subPos: settings.subPos }), 400);
-  }, { passive: false, capture: true });
+    document.addEventListener('pointercancel', up, true);
+  }
 
   // ---------- side panel tabs: words of the video / saved items ----------
 
@@ -1167,7 +1241,7 @@
         h('div', { class: 'ytam-wg-title', text: title }),
         h('div', { class: 'ytam-wg-words' }, ws.map((w) => {
           const s = h('span', { 'data-w': w, 'data-ti': '-1', text: w });
-          s.className = spanClass(s);
+          styleSpan(s);
           return s;
         })))));
   }
@@ -2049,15 +2123,32 @@
     const shown = c && t <= c.end + X.showTail ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
-    if (settings.autoPause && c && !v.paused) {
+    if (c && !v.paused) {
       const next = S.cues[a + 1];
       const endT = Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly);
-      if (t >= endT && S.lastAutoPause !== a) {
+      if (settings.autoPause && t >= endT && S.lastAutoPause !== a) {
         S.lastAutoPause = a;
         v.pause();
       }
+      // Hover mode 'end': the pointer is on the subtitles/tooltip — stop when the phrase has finished.
+      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && hoverActive() && t >= endT) {
+        v.pause();
+        S.hoverPaused = true;
+      }
+    }
+
+    // AP switch turns red while playback is held (AP on + paused, or paused by hover).
+    const held = (settings.autoPause && v.paused) || S.hoverPaused;
+    if (held) S.heldSince = S.heldSince || Date.now(); else S.heldSince = 0;
+    const red = held && Date.now() - S.heldSince >= X.apRedMs;
+    if (red !== S.apRed) {
+      S.apRed = red;
+      const ap = ui.sideR.querySelector('.ytam-ap');
+      if (ap) ap.classList.toggle('held', red);
     }
   }
+
+  const hoverActive = () => S.hoverIn || !!(tipEl && tipEl.isConnected && tipEl.matches(':hover'));
   (function loop() { try { tick(); } catch (e) { console.warn('[ytam]', e); } setTimeout(loop, X.tickMs); })();
 
   document.addEventListener('pointerdown', () => {
@@ -2065,7 +2156,7 @@
   }, true);
 
   document.addEventListener('keydown', (e) => {
-    if (e.code === 'Escape' && (pop || S.posEdit)) { closePop(); togglePosEdit(false); return; }
+    if (e.code === 'Escape' && pop) { closePop(); return; }
     if (!S.cues.length || e.metaKey || e.altKey) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
@@ -2130,7 +2221,8 @@
     closePop();
     hideTip();
     document.documentElement.classList.remove('ytam-hide-native');
-    if (S.posEdit) togglePosEdit(false);
+    S.posDrag = false;
+    hidePosRect();
     setProgress(null);
     document.documentElement.classList.remove('ytam-hidebar');
     if (ui) { ui.panel.remove(); ui.overlay.remove(); ui.sideL.remove(); ui.sideR.remove(); }
@@ -2203,7 +2295,7 @@
     onNavigate();
   });
 
-  const RELOAD_KEYS = ['aiMode', 'aiModel', 'maxWords', 'targetLang'];
+  const RELOAD_KEYS = ['aiMode', 'aiProvider', 'aiBaseUrl', 'aiModel', 'maxWords', 'targetLang'];
   const RERENDER_KEYS = ['vocabSize', 'suggestedRatio', 'hlKnown', 'hlLearning', 'hlLearnText', 'hlNext', 'hlRare', 'builtinExpr'];
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {
@@ -2230,6 +2322,7 @@
     }
     if (changes.targetLang) { S.wordTr = new Map(); dict.clear(); aiCache.clear(); }
     if ((changes.audioSource || changes.helperUrl || changes.includeAudio) && S.videoId) helperPrepare(S.videoId, S.token);
+    if (changes.ankiSync || changes.ankiMatureDays || changes.ankiAutoKnown || changes.ankiGradient) { if (changes.ankiSync && !settings.ankiSync) S.progress = {}; syncAnki().catch(() => {}); }
     if (changes.enabled) { if (!settings.enabled) teardown(); onNavigate(); }
     if (reload && S.track && S.words.length) { S.token++; loadTrack(S.track, S.token); }
   });

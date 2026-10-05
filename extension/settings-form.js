@@ -15,7 +15,8 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
   const body = mk('div', 'ytam-set-body');
   root.append(nav, body);
 
-  const controls = {};       // key -> (value) => void
+  const controls = {};       // key -> [(value) => void]
+  const addCtl = (k, fn) => { (controls[k] = controls[k] || []).push(fn); };
   const timers = {};
   const isLocal = (k) => k in L;
   const def = (k) => (isLocal(k) ? L[k] : D[k]);
@@ -28,6 +29,24 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     if (delay) timers[k] = setTimeout(run, delay); else run();
   }
 
+  // Switching provider swaps the default address (only if the user did not customise it).
+  const PROVIDER_URL = { gemini: 'https://generativelanguage.googleapis.com', openai: 'https://api.openai.com/v1' };
+  function switchProvider(v) {
+    chrome.storage.sync.get({ aiBaseUrl: '' }, (r) => {
+      const isDefault = !r.aiBaseUrl || Object.values(PROVIDER_URL).includes(r.aiBaseUrl);
+      if (isDefault) { save('aiBaseUrl', PROVIDER_URL[v]); save('aiChatPath', '/chat/completions'); }
+    });
+  }
+
+  // Custom API addresses need a host permission (asked only from the extension's own page).
+  function requestHost(url) {
+    try {
+      const o = new URL(url);
+      if (!chrome.permissions || !chrome.permissions.request) return;
+      chrome.permissions.request({ origins: [o.origin + '/*'] });
+    } catch (_) {}
+  }
+
   function fieldRow(f) {
     const row = mk('div', 'ytam-set-row');
     const label = mk('div', 'ytam-set-label');
@@ -37,19 +56,28 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     row.append(label, ctl);
     const k = f.k;
 
-    if (f.type === 'toggle') {
+    if (f.type === 'levels') {
+      const btns = f.levels.map(([name, n]) => {
+        const b = mk('button', 'ytam-lvl', name);
+        b.title = `${n} слов`;
+        b.addEventListener('click', () => { onPreview(k, n); save(k, n); });
+        return [b, n];
+      });
+      ctl.append(...btns.map(([b]) => b));
+      addCtl(k, (v) => btns.forEach(([b, n]) => b.classList.toggle('on', +v === n)));
+    } else if (f.type === 'toggle') {
       const sw = mk('label', 'ytam-switch');
       const inp = mk('input');
       inp.type = 'checkbox';
       sw.append(inp, mk('span'));
       inp.addEventListener('change', () => { onPreview(k, inp.checked); save(k, inp.checked); });
-      controls[k] = (v) => { inp.checked = !!v; };
+      addCtl(k, (v) => { inp.checked = !!v; });
       ctl.append(sw);
       if (f.color) {
         const c = mk('input');
         c.type = 'color';
         c.addEventListener('input', () => { onPreview(f.color, c.value); save(f.color, c.value, 300); });
-        controls[f.color] = (v) => { c.value = v; };
+        addCtl(f.color, (v) => { c.value = v; });
         ctl.append(c);
         label.firstChild.dataset.colorKey = f.color;
       }
@@ -64,13 +92,18 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
         onPreview(k, v, f.preview);
         save(k, v, 350);
       });
-      controls[k] = (v) => { inp.value = v; show(v); };
+      addCtl(k, (v) => { inp.value = v; show(v); });
       ctl.append(inp, val);
     } else if (f.type === 'select') {
       const sel = mk('select');
       for (const [v, t] of f.options) sel.append(new Option(t, v));
-      sel.addEventListener('change', () => { const v = cast(k, sel.value); onPreview(k, v); save(k, v); });
-      controls[k] = (v) => { sel.value = String(v); };
+      sel.addEventListener('change', () => {
+        const v = cast(k, sel.value);
+        onPreview(k, v);
+        save(k, v);
+        if (k === 'aiProvider') switchProvider(v);
+      });
+      addCtl(k, (v) => { sel.value = String(v); });
       ctl.append(sel);
     } else if (f.type === 'textarea') {
       const ta = mk('textarea');
@@ -78,7 +111,7 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
       ta.spellcheck = false;
       ta.addEventListener('input', () => save(k, ta.value, 600));
       ta.addEventListener('keydown', (e) => e.stopPropagation());
-      controls[k] = (v) => { if (document.activeElement !== ta) ta.value = v; };
+      addCtl(k, (v) => { if (document.activeElement !== ta) ta.value = v; });
       ctl.append(ta);
       row.classList.add('wide');
     } else {
@@ -86,9 +119,14 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
       inp.type = f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text';
       if (f.list) inp.setAttribute('list', f.list);
       inp.spellcheck = false;
-      inp.addEventListener('change', () => { const v = cast(k, inp.value.trim()) || def(k); inp.value = v; save(k, v); });
+      inp.addEventListener('change', () => {
+        const v = cast(k, inp.value.trim()) || def(k);
+        inp.value = v;
+        save(k, v);
+        if (k === 'aiBaseUrl') requestHost(v);
+      });
       inp.addEventListener('keydown', (e) => e.stopPropagation());
-      controls[k] = (v) => { if (document.activeElement !== inp) inp.value = v; };
+      addCtl(k, (v) => { if (document.activeElement !== inp) inp.value = v; });
       ctl.append(inp);
     }
     return row;
@@ -116,6 +154,54 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     body.append(pane);
     panes[sec.id] = { btn, pane };
   }
+  // Developer / experimental tab: every internal number (chrome.storage.local.dev).
+  if (!opts.only || opts.only.includes('dev')) {
+    const btn = mk('button', 'ytam-set-tab', 'Разработчик');
+    const pane = mk('div', 'ytam-set-pane');
+    const DD = self.YTAM_DEV_DEFAULTS;
+    let dev = { ...DD };
+    const setters = {};
+    let t = 0;
+    const saveDev = () => { clearTimeout(t); t = setTimeout(() => chrome.storage.local.set({ dev: { ...dev } }), 300); };
+    pane.append(mk('p', 'ytam-set-note', 'Экспериментальные параметры: меняйте на ходу, всё применяется сразу. ↺ — вернуть по умолчанию. Те же значения есть во вкладке 🛠 боковой панели (там же прослушивание клипа).'));
+    for (const g of self.YTAM_DEV_SCHEMA) {
+      pane.append(mk('div', 'ytam-set-group', g.title));
+      for (const f of g.fields) {
+        const row = mk('div', 'ytam-set-row');
+        const label = mk('div', 'ytam-set-label');
+        label.append(mk('span', '', f.label));
+        if (f.hint) label.append(mk('small', '', f.hint));
+        const ctl = mk('div', 'ytam-set-ctl');
+        const rng = mk('input');
+        Object.assign(rng, { type: 'range', min: f.min, max: f.max, step: f.step });
+        const num = mk('input');
+        Object.assign(num, { type: 'number', min: f.min, max: f.max, step: f.step });
+        num.className = 'ytam-set-num';
+        const rst = mk('button', 'ytam-set-rst', '↺');
+        const set = (v) => { rng.value = v; num.value = v; rst.style.visibility = +v === f.def ? 'hidden' : 'visible'; };
+        setters[f.k] = set;
+        const put = (v) => { dev[f.k] = v; set(v); saveDev(); };
+        rng.addEventListener('input', () => put(+rng.value));
+        num.addEventListener('change', () => { const v = Math.min(f.max, Math.max(f.min, +num.value)); if (!isNaN(v)) put(v); });
+        num.addEventListener('keydown', (e) => e.stopPropagation());
+        rst.addEventListener('click', () => put(f.def));
+        ctl.append(rng, num, f.unit ? mk('span', 'ytam-set-val', f.unit) : mk('span'), rst);
+        row.append(label, ctl);
+        pane.append(row);
+      }
+    }
+    const resetAll = mk('button', 'ytam-set-reset', 'Сбросить все параметры разработчика');
+    resetAll.addEventListener('click', () => { dev = { ...DD }; for (const [k, fn] of Object.entries(setters)) fn(DD[k]); saveDev(); });
+    pane.append(resetAll);
+    btn.addEventListener('click', () => select('dev'));
+    nav.append(btn);
+    body.append(pane);
+    panes.dev = { btn, pane };
+    const applyDev = (d) => { dev = { ...DD, ...(d || {}) }; for (const [k, fn] of Object.entries(setters)) fn(dev[k]); };
+    chrome.storage.local.get({ dev: {} }, (r) => applyDev(r.dev));
+    chrome.storage.onChanged.addListener((ch, area) => { if (area === 'local' && ch.dev) applyDev(ch.dev.newValue); });
+  }
+
   const models = mk('datalist');
   models.id = 'ytam-models';
   for (const m of ['gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash']) models.append(new Option(m, m));
@@ -132,7 +218,7 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
   try { if (panes[localStorage.getItem('ytam-set-tab')]) first = localStorage.getItem('ytam-set-tab'); } catch (_) {}
   select(first);
 
-  const apply = (vals) => { for (const [k, v] of Object.entries(vals)) if (controls[k]) controls[k](v); };
+  const apply = (vals) => { for (const [k, v] of Object.entries(vals)) for (const fn of controls[k] || []) fn(v); };
   chrome.storage.sync.get(D, apply);
   chrome.storage.local.get(L, apply);
   const onChange = (changes) => {

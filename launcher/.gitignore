@@ -1,0 +1,6 @@
+dist/*linux*
+dist/*macos*
+cache/
+bin/
+config.json
+launcher.log
