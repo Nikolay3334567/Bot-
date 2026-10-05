@@ -233,6 +233,14 @@ ${text}`;
   return { lines: asLines(parseJsonLoose(out)) };
 }
 
+// "03:07.4", "1:02:03", "187.4" or 187.4 -> seconds
+const parseTs = (v) => {
+  if (typeof v === 'number') return v;
+  const parts = String(v == null ? '' : v).trim().split(':').map(parseFloat);
+  if (!parts.length || parts.some((x) => isNaN(x))) return NaN;
+  return parts.reduce((a, x) => a * 60 + x, 0);
+};
+
 // Gemini watches/listens to the YouTube video itself (public videos only).
 async function aiVideo({ videoId, from, to, tl, maxWords, model, fps = 0.2, temperature = 0.1 }) {
   const lang = LANGS[tl] || tl;
@@ -242,16 +250,19 @@ async function aiVideo({ videoId, from, to, tl, maxWords, model, fps = 0.2, temp
 Rules:
 - Transcribe verbatim in the spoken language, with correct punctuation and capitalization. Do not summarize or skip anything said in that range. Ignore music and sound effects.
 - One subtitle line = one complete sentence. If a sentence is longer than ${maxWords} words, split it at natural clause boundaries.
-- "b" and "e": start and end of the line in seconds from the BEGINNING OF THE WHOLE VIDEO (not of the range), precise to 0.1 s. "e" must be when the last word of the line actually ends.
+- "b" and "e": start and end of the line as a timestamp string "MM:SS.s" (e.g. "03:07.4", or "H:MM:SS.s" past one hour) measured from the BEGINNING OF THE WHOLE VIDEO (not of the range), precise to 0.1 s. "b" is when the first word of the line starts and "e" is when its last word actually ends.
 - "t": natural translation of the line into ${lang} using context.
 ${EXPR_RULE(lang)}
 Return JSON array of {"b","e","s","t","x"} ordered by time.`;
   const out = await llm({
     model, prompt, json: true, temperature,
     media: { fileData: { fileUri: 'https://www.youtube.com/watch?v=' + videoId }, videoMetadata: { startOffset: Math.floor(from) + 's', endOffset: Math.ceil(to) + 's', fps } },
-    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { b: { type: 'NUMBER' }, e: { type: 'NUMBER' }, s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['b', 'e', 's', 't'] } },
+    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { b: { type: 'STRING' }, e: { type: 'STRING' }, s: { type: 'STRING' }, t: { type: 'STRING' }, x: EXPR_SCHEMA }, required: ['b', 'e', 's', 't'] } },
   });
-  let lines = asLines(parseJsonLoose(out)).filter((l) => l && l.s);
+  let lines = asLines(parseJsonLoose(out)).filter((l) => l && l.s)
+    .map((l) => ({ ...l, b: parseTs(l.b), e: parseTs(l.e) }))
+    .filter((l) => isFinite(l.b));
+  lines.forEach((l) => { if (!isFinite(l.e) || l.e <= l.b) l.e = l.b + 2; });
   // Some answers count from the start of the range instead of the video.
   if (from > 30 && lines.length && lines[0].b < from - 20) lines = lines.map((l) => ({ ...l, b: l.b + from, e: l.e + from }));
   return { lines };
@@ -390,7 +401,7 @@ async function ensureModel() {
   modelReady = true;
 }
 
-async function addCard(c) {
+async function addCard(c) {  // writes one note to Anki (throws when Anki is unreachable)
   await ensureModel();
   await anki('createDeck', { deck: c.deck });
   const base = `ytam_${c.videoId}_${Math.round(c.start * 1000)}_${Date.now().toString(36)}`;
@@ -422,6 +433,66 @@ async function addCard(c) {
     },
   });
 }
+
+// ---------- Anki outbox: cards made while Anki is closed are kept and sent later ----------
+
+const OUTBOX = 'outbox';
+const outboxGet = async () => (await chrome.storage.local.get({ [OUTBOX]: [] }))[OUTBOX];
+const outboxSet = (box) => chrome.storage.local.set({ [OUTBOX]: box });
+let flushing = null;
+
+// Remember which Anki note belongs to a tracked word/phrase (so it can be removed later).
+async function recordNote(key, id) {
+  if (!key || !id) return;
+  const { saved = [] } = await chrome.storage.local.get('saved');
+  const e = saved.find((x) => x.k === key);
+  if (!e) return;
+  e.ids = [...new Set([...(e.ids || []), id])];
+  await chrome.storage.local.set({ saved });
+}
+
+async function addCardOrQueue(card) {
+  try {
+    const noteId = await addCard(card);
+    flushOutbox().catch(() => {}); // Anki is up: send whatever has been waiting
+    return { noteId, queued: false };
+  } catch (e) {
+    const box = await outboxGet();
+    box.push({ ...card, queuedAt: Date.now(), error: e.message });
+    await outboxSet(box);
+    return { queued: true, error: e.message, count: box.length };
+  }
+}
+
+async function flushOutbox() {
+  if (flushing) return flushing;
+  flushing = (async () => {
+    let box = await outboxGet();
+    if (!box.length) return { sent: 0, left: 0 };
+    try { await anki('version'); } catch (e) { return { sent: 0, left: box.length, error: e.message }; }
+    let sent = 0, error = '';
+    const keep = [];
+    for (const card of box) {
+      try {
+        const id = await addCard(card);
+        await recordNote(card.key, id);
+        sent++;
+      } catch (e) {
+        error = e.message;
+        card.error = e.message;
+        keep.push(card);
+        if (/Нет связи/.test(e.message)) { keep.push(...box.slice(box.indexOf(card) + 1)); break; }
+      }
+    }
+    await outboxSet(keep);
+    return { sent, left: keep.length, error };
+  })().finally(() => { flushing = null; });
+  return flushing;
+}
+
+chrome.alarms.create('ytam-outbox', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'ytam-outbox') flushOutbox().catch(() => {}); });
+flushOutbox().catch(() => {});
 
 // ---------- Anki progress (word -> best card interval, days) ----------
 
@@ -474,8 +545,8 @@ function bytesToB64(bytes) {
   return btoa(s);
 }
 
-async function helperPcm({ url, v, start, end, rate }) {
-  const q = `/pcm?v=${encodeURIComponent(v)}&start=${start.toFixed(3)}&end=${end.toFixed(3)}&rate=${rate}`;
+async function helperPcm({ url, v, start, end, rate, wait = 20 }) {
+  const q = `/pcm?v=${encodeURIComponent(v)}&start=${start.toFixed(3)}&end=${end.toFixed(3)}&rate=${rate}&wait=${wait}`;
   const buf = new Uint8Array(await (await helperFetch(url, q)).arrayBuffer());
   return { b64: bytesToB64(buf), rate };
 }
@@ -489,7 +560,9 @@ async function handle(msg) {
     case 'lookup': return lookup(msg.word, msg.tl, msg.prio);
     case 'aiSegment': return aiSegment(msg);
     case 'aiVideo': return aiVideo(msg);
-    case 'addCard': return addCard(msg.card);
+    case 'addCard': return addCardOrQueue(msg.card);
+    case 'syncNow': return flushOutbox();
+    case 'outboxClear': return outboxSet([]);
     case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);

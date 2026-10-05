@@ -204,7 +204,7 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
 
   const models = mk('datalist');
   models.id = 'ytam-models';
-  for (const m of ['gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash']) models.append(new Option(m, m));
+  for (const m of ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash']) models.append(new Option(m, m));
   root.append(models);
 
   function select(id) {

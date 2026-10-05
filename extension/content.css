@@ -377,3 +377,9 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-dev-reset { width: 22px; padding: 0; border: 0; background: none; color: #c98a4b; font-size: 14px; cursor: pointer; }
 
 .ytam-hud { position: absolute; left: 10px; top: 10px; z-index: 62; padding: 6px 9px; border-radius: 6px; background: rgba(0, 0, 0, .72); color: #9f9; font: 11px/1.45 monospace; white-space: pre; pointer-events: none; }
+
+/* Anki outbox button */
+.ytam-syncbtn { position: relative; font-size: 18px; }
+.ytam-syncbtn.has { color: #ffb454; }
+.ytam-qbadge { position: absolute; right: -2px; top: -2px; min-width: 15px; padding: 0 3px; border-radius: 8px; background: #ff7a45; color: #fff; font: 700 10px/15px var(--ytam-font); text-align: center; }
+.ytam-qbadge:empty { display: none; }

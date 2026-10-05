@@ -238,6 +238,26 @@
   }
   setInterval(() => { processAnkiDeletes().catch(() => {}); }, 5000);
 
+  // ---------- Anki outbox (cards made while Anki was closed) ----------
+
+  function renderOutbox(n) {
+    S.outboxCount = n;
+    if (!ui) return;
+    ui.syncBadge.textContent = n ? String(n) : '';
+    ui.syncBtn.classList.toggle('has', n > 0);
+    ui.syncBtn.title = n ? `Синхронизировать с Anki — в очереди: ${n}` : 'Синхронизировать с Anki';
+  }
+
+  async function syncNow(quiet) {
+    if (!quiet) toast('⟳ Синхронизирую с Anki…', '', 0);
+    let r;
+    try { r = await bg({ type: 'syncNow' }); } catch (e) { r = { sent: 0, left: S.outboxCount, error: e.message }; }
+    if (r.left && r.error && !r.sent) toast(`✗ Anki не отвечает${r.left ? ` — в очереди: ${r.left}` : ''}. Откройте Anki и нажмите ⟳ снова`, 'err', 5000);
+    else if (r.sent) toast(`✓ Отправлено в Anki: ${r.sent}` + (r.left ? `, осталось ${r.left}` : ''), 'ok', 3500);
+    else if (!quiet) toast('✓ Всё уже в Anki', 'ok', 2000);
+    syncAnki().catch(() => {});
+  }
+
   // ---------- progress from Anki ----------
   // Card intervals of our notes → gradient of the "learning" outline and auto "known".
 
@@ -550,6 +570,63 @@
     cues.sort((a, b) => a.start - b.start);
     if (!cues.length) throw new Error('ИИ не вернул субтитры');
 
+    // The model's timestamps can be seconds off; YouTube's word times are not. Align by text.
+    const ratio = alignToWords(cues, words);
+    if (words.length) setStatus(`Тайминги ИИ выровнены по YouTube: ${Math.round(ratio * 100)}% фраз`);
+    for (let i = 1; i < cues.length; i++) if (cues[i].start < cues[i - 1].start) cues[i].start = cues[i - 1].start;
+    await saveAiCache(key, cues);
+    return cues;
+  }
+
+  async function saveAiCache(key, cues) {
+    try {
+      const { aiKeys = [] } = await chrome.storage.local.get('aiKeys');
+      aiKeys.push(key);
+      const drop = aiKeys.splice(0, Math.max(0, aiKeys.length - 150));
+      if (drop.length) await chrome.storage.local.remove(drop);
+      await chrome.storage.local.set({ [key]: cues.map(({ _expr, ...c }) => c), aiKeys });
+    } catch (_) {}
+  }
+
+  // Gemini listens to the video itself; YouTube word timings (if any) refine the times.
+  async function aiVideoProcess(words, token) {
+    const key = `aiv:${S.videoId}:${settings.targetLang}:${settings.maxWords}:${settings.aiModel}`;
+    const cached = (await chrome.storage.local.get(key))[key];
+    if (cached) return cached;
+    let dur = 0;
+    for (let i = 0; i < 40 && !(dur > 0 && isFinite(dur)); i++) {
+      const v = getVideo();
+      dur = v ? v.duration : 0;
+      if (!(dur > 0 && isFinite(dur))) await sleep(250);
+      if (token !== S.token) return null;
+    }
+    if (!(dur > 0 && isFinite(dur))) throw new Error('неизвестна длительность видео');
+
+    const CHUNK = X.aiVideoChunkSec;
+    const ranges = [];
+    if (dur <= X.aiSingleMaxMin * 60) ranges.push([0, dur]);
+    else for (let t = 0; t < dur; t += CHUNK) ranges.push([t, Math.min(dur, t + CHUNK)]);
+
+    const results = new Array(ranges.length);
+    let next = 0, done = 0;
+    await Promise.all(Array.from({ length: X.aiConc }, async () => {
+      while (next < ranges.length) {
+        const i = next++;
+        if (token !== S.token) return;
+        const [from, to] = ranges[i];
+        const res = await bg({ type: 'aiVideo', videoId: S.videoId, from, to, tl: settings.targetLang, maxWords: settings.maxWords, model: settings.aiModel, fps: X.aiVideoFps, temperature: X.aiTemp });
+        results[i] = res.lines.filter((l) => l.b >= from - 5 && l.b < to + 5);
+        ++done;
+        setProgress(ranges.length > 1 ? `🎧 ИИ слушает видео ${done}/${ranges.length}` : '🎧 ИИ слушает видео', ranges.length > 1 ? done / ranges.length : null);
+      }
+    }));
+    if (token !== S.token) return null;
+
+    let cues = results.flat().map((l) => ({ start: +l.b || 0, end: +l.e || (+l.b + 2), text: cleanText(String(l.s)), tr: String(l.t || ''), x: l.x || [] }))
+      .filter((c) => c.text);
+    cues.sort((a, b) => a.start - b.start);
+    if (!cues.length) throw new Error('ИИ не вернул субтитры');
+
     // Snap to YouTube's word timings where the text matches.
     if (words.length) {
       const W = words.map((w) => normTok(w.text));
@@ -575,6 +652,45 @@
     for (let i = 1; i < cues.length; i++) if (cues[i].start < cues[i - 1].start) cues[i].start = cues[i - 1].start;
     await saveAiCache(key, cues);
     return cues;
+  }
+
+  // Aligns cues (text + approximate times) to timed words: each cue gets the start of its first
+  // word and the end of its last word, searched near its approximate time. Returns the aligned share.
+  function alignToWords(cues, words) {
+    if (!words.length || !cues.length) return 0;
+    const W = words.map((w) => normTok(w.text));
+    const idx = new Map();
+    W.forEach((t, i) => { if (t) { if (!idx.has(t)) idx.set(t, []); idx.get(t).push(i); } });
+    let prevLast = -1, ok = 0;
+    for (const c of cues) {
+      const toks = c.text.split(' ').map(normTok).filter(Boolean);
+      if (!toks.length) continue;
+      const cand = new Set();
+      for (let k = 0; k < Math.min(3, toks.length); k++) {
+        for (const i of idx.get(toks[k]) || []) {
+          if (Math.abs(words[i].start - c.start) <= X.aiAlignWin && i - k > prevLast - 3) cand.add(Math.max(0, i - k));
+        }
+      }
+      let best = null;
+      for (const s0 of cand) {
+        let q = s0, hits = 0, first = -1, last = -1;
+        for (const tok of toks) {
+          for (let j = q; j < Math.min(W.length, q + 4); j++) {
+            if (W[j] === tok) { if (first < 0) first = j; last = j; q = j + 1; hits++; break; }
+          }
+        }
+        if (first < 0 || hits < Math.min(3, toks.length) || hits / toks.length < 0.6) continue;
+        const score = hits / toks.length - Math.abs(words[first].start - c.start) * 0.02;
+        if (!best || score > best.score) best = { first, last, score };
+      }
+      if (!best) continue;
+      c.start = words[best.first].start;
+      c.end = Math.max(words[best.last].end, c.start + 0.3);
+      c.aligned = true;
+      prevLast = best.last;
+      ok++;
+    }
+    return ok / cues.length;
   }
 
   function cueIndexAt(t) {
@@ -865,9 +981,11 @@
     const tabs = [tabBtn('subs', 'Субтитры'), tabBtn('words', 'Слова'), tabBtn('saved', 'Сохранённые'), tabBtn('dev', '🛠')];
     tabs[3].title = 'Меню разработчика: все параметры вживую';
     const collapse = h('button', { class: 'ytam-icon', title: 'Свернуть', text: '–' });
+    const syncBadge = h('span', { class: 'ytam-qbadge' });
+    const syncBtn = h('button', { class: 'ytam-icon ytam-syncbtn', title: 'Синхронизировать с Anki', onclick: () => syncNow() }, '⟳', syncBadge);
     const panel = h('div', { id: 'ytam-panel' },
       h('div', { class: 'ytam-head' }, tabs, h('span', { class: 'ytam-sp' }),
-        svgBtn('ytam-icon', 'gear', 'Настройки', () => openSettings()), collapse),
+        syncBtn, svgBtn('ytam-icon', 'gear', 'Настройки', () => openSettings()), collapse),
       h('div', { class: 'ytam-subbar' }, select, h('label', { class: 'ytam-toggle' }, trToggle, 'Перевод')),
       status, prog, list, wordsPane, savedPane, devPane,
       h('div', { class: 'ytam-foot' },
@@ -945,7 +1063,7 @@
       for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) el.addEventListener(type, (e) => e.stopPropagation());
     }
 
-    return { panel, list, status, select, prog, progLabel, progBar, progFill, wordsPane, savedPane, devPane, tabs, overlay, ovLine, ovBox, ovText, ovTr, ovStar, sideL, sideR, rows: [] };
+    return { syncBtn, syncBadge, panel, list, status, select, prog, progLabel, progBar, progFill, wordsPane, savedPane, devPane, tabs, overlay, ovLine, ovBox, ovText, ovTr, ovStar, sideL, sideR, rows: [] };
   }
 
   function scheduleResume() {
@@ -1796,7 +1914,7 @@
   // (tagged with video time). Saving a phrase cuts it from there — playback
   // is never interrupted.
 
-  const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null };
+  const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null, peak: 0, quietMs: 0 };
 
   function tapEnsure(v) {
     if (!settings.includeAudio || !v) return;
@@ -1838,7 +1956,7 @@
     if (!v || v.paused || v.seeking || !Tap.src || !S.videoId) return;
     const inp = e.inputBuffer;
     const n = inp.length, sr = inp.sampleRate;
-    const t1 = v.currentTime;
+    const t1 = v.currentTime + X.tapOffset;
     const t0 = t1 - (n / sr) * v.playbackRate;
     if (Tap.lastEnd == null || Math.abs(t0 - Tap.lastEnd) > 0.25) Tap.pass++;
     Tap.lastEnd = t1;
@@ -1851,6 +1969,12 @@
       s /= 2 * f;
       out[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
     }
+    // Live silence detector (used to stop at the real end of a phrase, not at YouTube's guess).
+    let e2 = 0;
+    for (let i = 0; i < out.length; i++) e2 += out[i] * out[i];
+    const rmsNow = Math.sqrt(e2 / Math.max(1, out.length));
+    Tap.peak = Math.max(rmsNow, Tap.peak * 0.97);
+    Tap.quietMs = rmsNow < Math.max(X.trimThrMin, Tap.peak * X.trimThrFactor) ? Tap.quietMs + (n / sr) * 1000 : 0;
     Tap.blocks.push({ t0, t1, pass: Tap.pass, rate: sr / f, data: out });
     const maxBlocks = Math.ceil((X.tapMinutes * 60 * sr) / n);
     if (Tap.blocks.length > maxBlocks) Tap.blocks.splice(0, Tap.blocks.length - maxBlocks);
@@ -1888,16 +2012,15 @@
     return { data, rate: best[0].rate, t0: first, t1: last, cov: bestCov };
   }
 
-  // Snap clip edges to nearby pauses (YouTube timings are often off).
-  // Returns PCM; trimClip.last holds the chosen edges (video time) for the dev menu.
-  function trimClip(ext, cueStart, cueEnd) {
+  // Finds the clip edges: snaps to nearby pauses (YouTube timings are often off by half a second).
+  // endFound = a long enough pause after the phrase is already in the audio, so nothing more must be waited for.
+  function edgesOf(ext, cueStart, cueEnd) {
     const { data, rate } = ext;
     const frame = Math.max(1, Math.round((rate * X.trimFrameMs) / 1000));
     const nF = Math.floor(data.length / frame);
     const fAt = (t) => Math.max(0, Math.min(nF - 1, Math.round(((t - ext.t0) / (ext.t1 - ext.t0)) * data.length / frame)));
-    const tAt = (f) => ext.t0 + ((f * frame) / data.length) * (ext.t1 - ext.t0);
     let sF = fAt(cueStart - settings.padStart), eF = fAt(cueEnd + settings.padEnd);
-    let how = 'запас';
+    let how = 'запас', endFound = false;
 
     if (settings.smartTrim && nF > 10) {
       const rms = new Float32Array(nF);
@@ -1915,11 +2038,22 @@
         if (rms[f] < thr && rms[f - 1] < thr) { sF = Math.max(0, f - keepS); how = 'по паузам'; break; }
       }
       // end: walk forward from the cue end to the first long enough quiet run
-      for (let f = fAt(cueEnd - X.trimEndFrom), lim = fAt(cueEnd + X.trimFwd), run = 0; f <= lim; f++) {
+      const fEnd = fAt(cueEnd + X.trimFwd);
+      let run = 0, f = fAt(cueEnd - X.trimEndFrom);
+      for (; f <= fEnd; f++) {
         run = rms[f] < thr ? run + 1 : 0;
-        if (run >= need) { eF = Math.min(nF, f - run + 1 + keepE); how = 'по паузам'; break; }
+        if (run >= need) { eF = Math.min(nF, f - run + 1 + keepE); how = 'по паузам'; endFound = true; break; }
       }
+      // The recording simply stops in silence (playback was paused right after the speech).
+      if (!endFound && fEnd >= nF - 1 && run >= 3) { eF = Math.min(nF, nF - run + keepE); how = 'до тишины'; endFound = true; }
     }
+    return { frame, nF, sF, eF, how, endFound, tAt: (f) => ext.t0 + ((f * frame) / data.length) * (ext.t1 - ext.t0) };
+  }
+
+  // Returns PCM; trimClip.last holds the chosen edges (video time) for the dev menu.
+  function trimClip(ext, cueStart, cueEnd) {
+    const { data, rate } = ext;
+    const { frame, sF, eF, how, tAt } = edgesOf(ext, cueStart, cueEnd);
     const out = data.slice(sF * frame, Math.max(sF + 1, eF) * frame);
     const fade = Math.min(out.length >> 1, Math.round((rate * X.fadeMs) / 1000));
     for (let i = 0; i < fade; i++) {
@@ -1980,7 +2114,7 @@
     const { from, to } = audioSpan(item);
     if (settings.audioSource !== 'capture' && (helperUsable(item.videoId) || settings.audioSource === 'helper')) {
       try {
-        const r = await bg({ type: 'helperPcm', url: settings.helperUrl, v: item.videoId, start: from, end: to, rate: X.helperRate });
+        const r = await bg({ type: 'helperPcm', url: settings.helperUrl, v: item.videoId, start: from, end: to, rate: X.helperRate, wait: X.helperWaitSec });
         const bytes = Uint8Array.from(atob(r.b64), (ch) => ch.charCodeAt(0));
         const data = new Int16Array(bytes.buffer, 0, bytes.length >> 1);
         if (data.length) return { data, rate: r.rate, t0: from, t1: from + data.length / r.rate, cov: 1, src: 'yt-dlp' };
@@ -2061,19 +2195,33 @@
     processPending(false);
   }
 
+  // Share of the phrase itself (not the padding) that is present in an audio window.
+  function coreCoverage(ext, cs, ce) {
+    if (!ext || ce <= cs) return 0;
+    return Math.max(0, Math.min(ext.t1, ce) - Math.max(ext.t0, cs)) / (ce - cs);
+  }
+
   function processPending(force) {
     if (!S.pending.length) return;
     const v = getVideo();
     for (const item of [...S.pending]) {
-      // With the yt-dlp helper the audio does not depend on playback: ready at once.
-      let ready = force || !settings.includeAudio || helperUsable(item.videoId) || Date.now() - item.queuedAt > 10 * 60 * 1000;
+      const age = Date.now() - item.queuedAt;
+      // With the yt-dlp launcher the audio does not depend on playback: ready at once.
+      let ready = force || !settings.includeAudio || helperUsable(item.videoId);
       if (!ready) {
+        // Capture path: the phrase itself must have been heard. Its tail is waited for only while
+        // playback runs; on pause (hover, popup) we go with what we have after a moment.
         const a = audioSpan(item);
+        const cs = item.cue.start + item.shift, ce = item.cue.end + item.shift;
         const ext = tapExtract(a.from, a.to);
-        ready = !!ext && ext.cov > X.pendingCov;
-        // Seeked away / phrase passed without being fully heard: don't wait forever.
-        if (!ready && v && !v.paused && item.videoId === S.videoId &&
-            (v.currentTime > item.cue.end + 5 || v.currentTime < item.cue.start - 30)) ready = Date.now() - item.queuedAt > 3000;
+        if (ext && coreCoverage(ext, cs, ce) >= X.minCov) {
+          const idle = !v || v.paused;
+          ready = ext.t1 >= a.to - 0.05 || edgesOf(ext, cs, ce).endFound || (idle && age > X.pausedWaitMs) || age > 8000;
+        } else if (v && !v.paused && item.videoId === S.videoId && (v.currentTime > ce + 5 || v.currentTime < cs - 30)) {
+          ready = age > 3000; // played past it / jumped away without hearing it
+        } else {
+          ready = age > X.giveUpSec * 1000;
+        }
       }
       if (!ready) continue;
       S.pending.splice(S.pending.indexOf(item), 1);
@@ -2087,7 +2235,7 @@
       let audio = null;
       if (settings.includeAudio) {
         const ext = await clipAudio(item);
-        if (ext && ext.cov > X.minCov) audio = encodeMp3(trimClip(ext, cue.start + item.shift, cue.end + item.shift), ext.rate);
+        if (ext && coreCoverage(ext, cue.start + item.shift, cue.end + item.shift) >= Math.min(X.minCov, 0.9)) audio = encodeMp3(trimClip(ext, cue.start + item.shift, cue.end + item.shift), ext.rate);
       }
       let translation = item.translation;
       if (translation == null) {
@@ -2104,9 +2252,10 @@
           meaning = [res.translation, ...terms.slice(0, 4)].filter(Boolean).join(', ');
         } catch (_) {}
       }
-      const noteId = await bg({
+      const res = await bg({
         type: 'addCard',
         card: {
+          key: item.key,
           deck: settings.deck || DEFAULTS.deck,
           videoId: item.videoId,
           title: item.title,
@@ -2119,7 +2268,11 @@
           image: item.image,
         },
       });
-      await addNoteId(item.key, noteId);
+      if (res.queued) {
+        toast(`⏳ Anki не отвечает — карточка сохранена в очереди (${res.count}). Откройте Anki или нажмите ⟳`, 'warn', 6000);
+      } else {
+        await addNoteId(item.key, res.noteId);
+      }
       // Status changed while the card was being made → remove it again.
       if (!item.key.startsWith('p:') && S.vocab[item.key] !== 1) leftLearning(item.key, S.vocab[item.key]);
       if (item.videoId === S.videoId) {
@@ -2141,7 +2294,7 @@
     const c = S.cues[i];
     if (!v || !c) return;
     S.lastAutoPause = -1;
-    v.currentTime = Math.max(0, c.start + X.subShift);
+    v.currentTime = Math.max(0, c.start + X.subShift - X.seekLead);
     if (play) v.play();
   }
 
@@ -2160,18 +2313,26 @@
     updateHud(v, t, a);
     if (a !== S.active) { setActiveRow(a); S.active = a; prefetchAround(a); }
     const c = S.cues[a];
-    const shown = c && t <= c.end + X.showTail ? a : -1;
+    const next = S.cues[a + 1];
+    const endT = c ? Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly) : 0;
+    // Stop at the real end of the speech: after YouTube's end, wait (a little) for actual silence.
+    const hardT = c ? Math.min(endT + X.endWaitMax, next ? next.start - 0.02 : Infinity) : 0;
+    const speaking = !!Tap.src && Tap.quietMs < X.endQuietMs;
+    if (!v.paused || S.holdCue !== a) S.holdCue = -1;
+    // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
+    const shown = c && (t <= c.end + X.showTail || (!v.paused && speaking && t <= hardT) || S.holdCue === a) ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
     if (c && !v.paused) {
-      const next = S.cues[a + 1];
-      const endT = Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly);
-      if (settings.autoPause && t >= endT && S.lastAutoPause !== a) {
+      const atEnd = t >= endT && (t >= hardT || !Tap.src || Tap.quietMs >= X.endQuietMs);
+      if (settings.autoPause && atEnd && S.lastAutoPause !== a) {
         S.lastAutoPause = a;
+        S.holdCue = a;
         v.pause();
       }
       // Hover mode 'end': the pointer is on the subtitles/tooltip — stop when the phrase has finished.
-      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && hoverActive() && t >= endT) {
+      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && hoverActive() && atEnd) {
+        S.holdCue = a;
         v.pause();
         S.hoverPaused = true;
       }
@@ -2327,10 +2488,11 @@
   setInterval(onNavigate, 1000);
   window.addEventListener('pagehide', () => processPending(true));
 
-  Promise.all([chrome.storage.sync.get(DEFAULTS), chrome.storage.local.get({ vocab: {}, dev: {} })]).then(([s, l]) => {
+  Promise.all([chrome.storage.sync.get(DEFAULTS), chrome.storage.local.get({ vocab: {}, dev: {}, outbox: [] })]).then(([s, l]) => {
     settings = { ...DEFAULTS, ...s };
     Object.assign(X, l.dev || {});
     S.vocab = l.vocab || {};
+    renderOutbox((l.outbox || []).length);
     applySettings();
     onNavigate();
   });
@@ -2340,6 +2502,7 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {
       if (changes.saved) { S.savedList = changes.saved.newValue || []; refreshSideTabs(); }
+      if (changes.outbox) renderOutbox((changes.outbox.newValue || []).length);
       if (changes.dev) { Object.assign(X, self.YTAM_DEV_DEFAULTS, changes.dev.newValue || {}); syncDev(); }
       if (changes.vocab) {
         const nv = changes.vocab.newValue || {};

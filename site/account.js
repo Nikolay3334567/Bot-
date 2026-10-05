@@ -48,7 +48,7 @@
   };
   // Tokens per hour of video: audio 32 tok/s; frames at 0.2 fps × 66 tok; output ≈ 30k (text + translation + expressions).
   const TOK = { listen: { audio: 115200, frames: 47520, out: 30000 }, text: { in: 15000, out: 30000 }, explain: { in: 700, out: 200 } };
-  const state = { model: 'Gemini 2.5 Flash-Lite', paying: 200, price: 6.99, yearlyShare: 40, yearlyPrice: 59, listenH: 10, textH: 4, explains: 600, freeNew: 300, freeTrialH: 1, mor: true, merchantPct: COSTS.merchantPct, merchantFixed: COSTS.merchantFixed, infra: COSTS.infraMonthly, support: 1.0 };
+  const state = { model: 'Gemini 3.5 Flash-Lite', paying: 200, price: 6.99, yearlyShare: 40, yearlyPrice: 59, listenH: 5, textH: 4, explains: 300, freeNew: 300, freeTrialH: 1, mor: true, merchantPct: COSTS.merchantPct, merchantFixed: COSTS.merchantFixed, infra: COSTS.infraMonthly, support: 1.0 };
   let built = false;
 
   function calc() {
