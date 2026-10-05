@@ -24,10 +24,35 @@ func exeName(n string) string {
 }
 
 // findTool looks for a program: explicit path, next to the launcher, ./bin, then PATH.
+func toolWorks(p string) bool {
+	cmd := exec.Command(p, "--version")
+	hide(cmd)
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err == nil
+	case <-time.After(30 * time.Second):
+		cmd.Process.Kill()
+		return false
+	}
+}
+
 func findTool(explicit string, names ...string) string {
+	if l := findTools(explicit, names...); len(l) > 0 {
+		return l[0]
+	}
+	return ""
+}
+
+func findTools(explicit string, names ...string) []string {
+	var out []string
 	if explicit != "" {
 		if _, err := os.Stat(explicit); err == nil {
-			return explicit
+			out = append(out, explicit)
 		}
 	}
 	dirs := []string{appDir, filepath.Join(appDir, "bin")}
@@ -41,17 +66,17 @@ func findTool(explicit string, names ...string) string {
 			for _, n := range names {
 				// matches yt-dlp.exe, yt-dlp_arm64.exe, yt-dlp_x86.exe ...
 				if strings.HasPrefix(low, n) && (strings.HasSuffix(low, ".exe") || runtime.GOOS != "windows") && !strings.HasSuffix(low, ".part") && !strings.Contains(low, "launcher") {
-					return filepath.Join(d, e.Name())
+					out = append(out, filepath.Join(d, e.Name()))
 				}
 			}
 		}
 	}
 	for _, n := range names {
 		if p, err := exec.LookPath(n); err == nil {
-			return p
+			out = append(out, p)
 		}
 	}
-	return ""
+	return out
 }
 
 func download(url, dest string) error {
@@ -82,8 +107,12 @@ func download(url, dest string) error {
 }
 
 func ensureYtdlp() (string, error) {
-	if p := findTool(cfg.YtdlpPath, "yt-dlp"); p != "" {
-		return p, nil
+	// Every yt-dlp* file found is test-run (--version); a build for the wrong CPU/Windows is skipped.
+	for _, p := range findTools(cfg.YtdlpPath, "yt-dlp") {
+		if toolWorks(p) {
+			return p, nil
+		}
+		logf("yt-dlp %s не запускается на этом ПК — пропускаю", p)
 	}
 	if !cfg.AutoDownload {
 		return "", errors.New("yt-dlp не найден. Положите yt-dlp.exe рядом с лончером (или в папку bin) либо включите autoDownload")

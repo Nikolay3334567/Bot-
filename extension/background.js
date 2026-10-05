@@ -226,19 +226,22 @@ async function lookup(word, tl, prio = 0, sl = 'auto') {
   const name = 'lkc:' + tl;
   const cache = await getCache(name);
   const key = word.toLowerCase();
-  if (cache[key]) return cache[key];
   const c = await cloudCfg();
+  const hit = cache[key];
+  // A cached cloud result without dictionary variants is retried (the free dictionary may have been slow or blocked).
+  if (hit && (hit.dict && hit.dict.length || !c.cloudVariants || (hit.dt && Date.now() - hit.dt < 600000))) return hit;
   let res;
   if (await cloudOk('tr', word.length)) {
     // Cloud gives one reliable translation at once; variants come from the free dictionary if it answers quickly.
     const variants = c.cloudVariants
-      ? Promise.race([gtx(word, tl, true, prio).catch(() => null), sleep(1500).then(() => null)])
+      ? Promise.race([gtx(word, tl, true, prio).catch(() => null), sleep(prio ? 3500 : 6000).then(() => null)])
       : Promise.resolve(null);
     try {
       const [tr, j] = await Promise.all([cloudTranslate([word], tl, sl), variants]);
       res = {
         translation: tr[0] || (j ? joinTrans(j).trim() : ''),
         dict: j ? (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })) : [],
+        dt: Date.now(),
       };
     } catch (_) { res = null; }
   }

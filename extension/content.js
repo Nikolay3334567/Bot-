@@ -1692,6 +1692,7 @@
     }
     const w = span.dataset.w;
     const wasShown = !!tipFor && tipEl.isConnected;
+    const moved = wasShown && tipFor !== span && tipEl.classList.contains('show');
     tipFor = span;
     const exprs = exprsAt(i, +span.dataset.ti).slice(0, 2);
     const n = Math.max(1, +settings.tipVariants || 3);
@@ -1729,12 +1730,23 @@
     };
 
     layer().append(tipEl);
-    fill();
-    if (!wasShown) {
+    if (moved) {
+      // Moving between words: fade out where it was, fade in at the new word (quick, never blocks).
       tipEl.classList.remove('show');
-      void tipEl.offsetWidth; // restart the fade-in
+      setTimeout(() => {
+        if (tipFor !== span) return;
+        fill();
+        void tipEl.offsetWidth;
+        tipEl.classList.add('show');
+      }, Math.min(90, +settings.tipAnim || 0));
+    } else {
+      fill();
+      if (!wasShown) {
+        tipEl.classList.remove('show');
+        void tipEl.offsetWidth; // restart the fade-in
+      }
+      tipEl.classList.add('show');
     }
-    tipEl.classList.add('show');
     getDictHi(w).then(fill);
     for (const e of exprs) {
       if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});

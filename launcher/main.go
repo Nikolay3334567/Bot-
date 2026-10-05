@@ -213,7 +213,7 @@ func runDownload(id string, j *job) {
 			msg += " — установите Microsoft Visual C++ Redistributable (arm64/x64 по вашему ПК) или скачайте свежий yt-dlp"
 		case strings.Contains(low, "http error 403") || strings.Contains(low, "unable to download") || strings.Contains(low, "requested format"):
 			msg += " — обновите yt-dlp: положите свежий yt-dlp рядом с лончером (yt-dlp -U или новый exe с GitHub), перезапустите"
-		case strings.Contains(low, "not a valid win32") || strings.Contains(low, "не является приложением"):
+		case strings.Contains(low, "not compatible") || strings.Contains(low, "not a valid win32") || strings.Contains(low, "не является приложением"):
 			msg += " — архитектура yt-dlp не подходит ПК: нужен yt-dlp_win_arm64.exe для ARM или yt-dlp.exe для x64"
 		}
 		fail(msg)
