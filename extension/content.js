@@ -138,7 +138,7 @@
 
   function spanClass(el) {
     let c = 'ytam-w ' + wordLevel(el.dataset.w);
-    if (el.dataset.xl === '1') c = c.replace(/ytam-(known|next|rare)/, '') + ' ' + learnClass();
+    if (el.dataset.xl === '1') c += ' ytam-xphrase';
     return c.replace(/\s+/g, ' ').trim();
   }
 
@@ -1201,7 +1201,7 @@
     st.setProperty('--ytam-c-next', settings.colorNext);
     st.setProperty('--ytam-c-rare', settings.colorRare);
     st.setProperty('--ytam-sub-font', settings.fontFamily === 'default' ? FONT_STACK : `${settings.fontFamily}, ${FONT_STACK}`);
-    st.setProperty('--ytam-fs', (+settings.fontSize || 26) + 'px');
+    st.setProperty('--ytam-fs', (+settings.fontSize || 18) + 'px');
     st.setProperty('--ytam-fw', String(settings.fontWeight || 600));
     st.setProperty('--ytam-tr-scale', String((+settings.trScale || 80) / 100));
     st.setProperty('--ytam-bg-a', String((+settings.subBgOpacity) / 100));
@@ -1357,11 +1357,21 @@
       if (!groups.has(b)) groups.set(b, []);
       groups.get(b).push(w);
     }
-    const stat = (icon, n, cls) => { const s = h('span', { class: 'ytam-wstat ' + cls }); s.innerHTML = ICON[icon]; s.append(' ' + n); return s; };
+    const filt = S.wordFilter || (S.wordFilter = new Set());
+    const grpOf = (w) => S.vocab[w] === 1 ? 'l' : isKnown(w) ? 'k' : wordLevel(w).includes('ytam-rare') ? 'r' : 'o';
+    const stat = (icon, n, cls) => {
+      const s = h('span', { class: 'ytam-wstat ' + cls + (filt.has(cls) ? ' on' : ''), title: 'Фильтр (можно несколько)' });
+      s.innerHTML = ICON[icon]; s.append(' ' + n);
+      s.addEventListener('click', () => { filt.has(cls) ? filt.delete(cls) : filt.add(cls); renderWordsTab(); });
+      return s;
+    };
+    const other = words.length - known - learning - skip;
+    const shown = (ws) => filt.size ? ws.filter((w) => filt.has(grpOf(w))) : ws;
     ui.wordsPane.replaceChildren(
-      h('div', { class: 'ytam-whint', text: 'Слова этого видео по частоте · ПКМ — отметить · клик — словарь' }),
-      h('div', { class: 'ytam-wstats' }, stat('check', known, 'k'), stat('book', learning, 'l'), stat('ban', skip, 'r'), h('span', { class: 'ytam-wstat t', text: '/ ' + words.length })),
-      ...[...groups].map(([title, ws]) => h('div', { class: 'ytam-wgroup' },
+      h('div', { class: 'ytam-whint', text: 'Слова этого видео по частоте · клик по значку — фильтр группы · ПКМ — отметить' }),
+      h('div', { class: 'ytam-wstats' }, stat('check', known, 'k'), stat('book', learning, 'l'), stat('ban', skip, 'r'),
+        h('span', { class: 'ytam-wstat t' + (filt.has('o') ? ' on' : ''), text: 'др. ' + other, onclick: () => { filt.has('o') ? filt.delete('o') : filt.add('o'); renderWordsTab(); } })),
+      ...[...groups].map(([title, ws]) => [title, shown(ws)]).filter(([, ws]) => ws.length).map(([title, ws]) => h('div', { class: 'ytam-wgroup' },
         h('div', { class: 'ytam-wg-title', text: title }),
         h('div', { class: 'ytam-wg-words' }, ws.map((w) => {
           const s = h('span', { 'data-w': w, 'data-ti': '-1', text: w });
@@ -1783,7 +1793,7 @@
 
   function openWord(span, i) {
     // Second click on the same word closes the popup (LR behaviour).
-    if (pop && pop.span === span) { closePop(); return; }
+    if (pop && pop.span === span) { closePop(); showTip(span, i); return; }
     closePop();
     hideTip();
     const word = span.textContent;
@@ -1860,7 +1870,13 @@
       return b;
     };
     const tabBar = h('div', { class: 'ytam-tabs' }, tabBtns);
+    const rk = rankOf(w);
+    const rankEl = rk < Infinity ? h('div', { class: 'ytam-rank', title: 'Частотность слова' },
+      h('span', { text: 'Частотность' }),
+      h('div', { class: 'ytam-rank-bar' }, h('i', { style: `width:${Math.max(3, Math.round(100 * (1 - Math.log(rk) / Math.log(FREQ.size || 50000))))}%` })),
+      h('b', { text: String(rk) })) : null;
     const out = [
+      ...(rankEl ? [rankEl] : []),
       h('div', { class: 'ytam-pop-head' },
         pill,
         h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }), trEl),

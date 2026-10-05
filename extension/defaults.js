@@ -40,7 +40,7 @@ self.YTAM_DEFAULTS = {
   arrowKeys: false,
   // Look
   fontFamily: 'default',
-  fontSize: 26,
+  fontSize: 18,
   fontWeight: 600,
   trScale: 80,
   subBgOpacity: 60,

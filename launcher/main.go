@@ -205,6 +205,17 @@ func runDownload(id string, j *job) {
 		if strings.Contains(strings.ToLower(msg), "javascript runtime") || strings.Contains(strings.ToLower(msg), "n challenge") {
 			msg += " — установите Deno (winget install DenoLand.Deno) и перезапустите лончер"
 		}
+		low := strings.ToLower(msg)
+		switch {
+		case strings.Contains(low, "not a bot") || strings.Contains(low, "sign in to confirm"):
+			msg += " — YouTube просит подтвердить вход: добавьте в config.json ytdlpArgs [\"--cookies-from-browser\",\"chrome\"] (или edge/firefox) и перезапустите лончер"
+		case strings.Contains(low, "python dll") || strings.Contains(low, "vcruntime") || strings.Contains(low, "api-ms-win"):
+			msg += " — установите Microsoft Visual C++ Redistributable (arm64/x64 по вашему ПК) или скачайте свежий yt-dlp"
+		case strings.Contains(low, "http error 403") || strings.Contains(low, "unable to download") || strings.Contains(low, "requested format"):
+			msg += " — обновите yt-dlp: положите свежий yt-dlp рядом с лончером (yt-dlp -U или новый exe с GitHub), перезапустите"
+		case strings.Contains(low, "not a valid win32") || strings.Contains(low, "не является приложением"):
+			msg += " — архитектура yt-dlp не подходит ПК: нужен yt-dlp_win_arm64.exe для ARM или yt-dlp.exe для x64"
+		}
 		fail(msg)
 		return
 	}

@@ -383,3 +383,12 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-syncbtn.has { color: #ffb454; }
 .ytam-qbadge { position: absolute; right: -2px; top: -2px; min-width: 15px; padding: 0 3px; border-radius: 8px; background: #ff7a45; color: #fff; font: 700 10px/15px var(--ytam-font); text-align: center; }
 .ytam-qbadge:empty { display: none; }
+
+.ytam-w.ytam-xphrase { background: rgba(255, 170, 60, .28); border-radius: 3px; }
+.ytam-wstat { cursor: pointer; user-select: none; }
+.ytam-wstat.on { outline: 2px solid #fff; background: #3a3a3a; }
+.ytam-rank { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: #1c1c1c; color: #bbb; font-size: 12px; border-radius: 10px 10px 0 0; }
+.ytam-rank-bar { flex: 1; height: 6px; border-radius: 3px; background: #333; overflow: hidden; }
+.ytam-rank-bar i { display: block; height: 100%; background: #2cc4a0; }
+.ytam-rank b { color: #fff; }
+.ytam-rank + .ytam-pop-head { border-radius: 0; }
