@@ -202,6 +202,39 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     chrome.storage.onChanged.addListener((ch, area) => { if (area === 'local' && ch.dev) applyDev(ch.dev.newValue); });
   }
 
+  // Google Cloud usage / key test (Перевод tab)
+  if (panes.subs && chrome.runtime && chrome.runtime.sendMessage) {
+    const box = mk('div', 'ytam-cloud');
+    const line = mk('div', 'ytam-cloud-line');
+    const note = mk('div', 'ytam-cloud-note');
+    const test = mk('button', 'ytam-set-reset', 'Проверить ключ Google Cloud');
+    const fmt = (n) => Number(n || 0).toLocaleString('ru-RU');
+    const draw = (u, limits) => {
+      u = u || {};
+      line.textContent = `В этом месяце · перевод: ${fmt(u.tr)} знаков` + (limits ? ` из ${fmt(limits.tr)}` : '') +
+        ` · озвучка: ${fmt(u.tts)} знаков` + (limits ? ` из ${fmt(limits.tts)}` : '') +
+        (u.fallbackTr ? ` · раз переключались на бесплатный перевод: ${u.fallbackTr}` : '');
+    };
+    const refresh = () => chrome.storage.sync.get(D, (c) => chrome.storage.local.get({ usage: null }, (r) => {
+      const u = r.usage && r.usage.m === new Date().toISOString().slice(0, 7) ? r.usage : { tr: 0, tts: 0 };
+      draw(u, { tr: c.cloudTrLimit, tts: c.ttsLimit });
+    }));
+    test.addEventListener('click', () => {
+      note.textContent = 'Проверяю…';
+      chrome.runtime.sendMessage({ type: 'cloudTest' }, (r) => {
+        const res = r && r.result;
+        if (!res) { note.textContent = (r && r.error) || 'Нет ответа от расширения'; return; }
+        if (res.error) { note.textContent = res.error; return; }
+        note.textContent = `Перевод: ${res.tr} · Озвучка: ${res.tts}`;
+        refresh();
+      });
+    });
+    box.append(line, test, note);
+    panes.subs.pane.append(box);
+    refresh();
+    chrome.storage.onChanged.addListener((ch, area) => { if (ch.usage || ch.cloudTrLimit || ch.ttsLimit) refresh(); });
+  }
+
   const models = mk('datalist');
   models.id = 'ytam-models';
   for (const m of ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash']) models.append(new Option(m, m));

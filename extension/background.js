@@ -13,6 +13,112 @@ const fmtTime = (s) => {
 
 // ---------- Google Translate ----------
 
+// ---- Google Cloud (Translation Basic v2 + Text-to-Speech) with a hard monthly character guard ----
+
+const monthKey = () => new Date().toISOString().slice(0, 7);
+
+async function usageGet() {
+  const { usage } = await chrome.storage.local.get('usage');
+  return usage && usage.m === monthKey() ? usage : { m: monthKey(), tr: 0, tts: 0, fallbackTr: 0 };
+}
+async function usageAdd(kind, n) {
+  const u = await usageGet();
+  u[kind] = (u[kind] || 0) + n;
+  await chrome.storage.local.set({ usage: u });
+  return u;
+}
+
+async function cloudCfg() {
+  const [sync, local] = await Promise.all([chrome.storage.sync.get(YTAM_DEFAULTS), chrome.storage.local.get(YTAM_LOCAL_DEFAULTS)]);
+  return { ...sync, key: local.googleCloudKey || '' };
+}
+
+// Can this request be sent to Google Cloud (key present, provider allows it, under the monthly guard)?
+async function cloudOk(kind, chars) {
+  const c = await cloudCfg();
+  if (!c.key) return false;
+  const provider = kind === 'tr' ? c.trProvider : c.ttsProvider;
+  if (provider === 'free' || provider === 'browser') return false;
+  const u = await usageGet();
+  const limit = kind === 'tr' ? c.cloudTrLimit : c.ttsLimit;
+  if ((u[kind] || 0) + chars > limit) {
+    if (kind === 'tr') await usageAdd('fallbackTr', 1);
+    return false;
+  }
+  return true;
+}
+
+async function cloudFetch(url, body, label) {
+  let r;
+  try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+  catch (_) { throw new Error(label + ': нет связи'); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const m = (j.error && j.error.message) || 'HTTP ' + r.status;
+    throw new Error(label + ': ' + String(m).slice(0, 240));
+  }
+  return j;
+}
+
+// Array in, aligned array out (no line-count guessing). ≤ 100 strings / ~20k characters per request.
+async function cloudTranslate(texts, tl, sl) {
+  const { key } = await cloudCfg();
+  const out = [];
+  let i = 0;
+  while (i < texts.length) {
+    const chunk = [];
+    let chars = 0;
+    while (i < texts.length && chunk.length < 100 && chars + texts[i].length < 20000) { chars += texts[i].length; chunk.push(texts[i++]); }
+    if (!chunk.length) { chunk.push(texts[i++].slice(0, 20000)); chars = chunk[0].length; }
+    const body = { q: chunk, target: tl, format: 'text' };
+    if (sl && sl !== 'auto') body.source = sl;
+    const j = await cloudFetch('https://translation.googleapis.com/language/translate/v2?key=' + encodeURIComponent(key), body, 'Cloud Translation');
+    const tr = (j.data && j.data.translations) || [];
+    if (tr.length !== chunk.length) throw new Error('Cloud Translation: неожиданный ответ');
+    await usageAdd('tr', chars);
+    for (const t of tr) out.push(String(t.translatedText || '').trim());
+  }
+  return out;
+}
+
+const ttsCache = new Map();
+async function cloudTts(text, voice, rate) {
+  const { key } = await cloudCfg();
+  const ck = voice + '|' + rate + '|' + text.toLowerCase();
+  if (ttsCache.has(ck)) return ttsCache.get(ck);
+  const stored = (await chrome.storage.local.get('ttsCache')).ttsCache || {};
+  if (stored[ck]) { ttsCache.set(ck, stored[ck]); return stored[ck]; }
+  const lang = String(voice).split('-').slice(0, 2).join('-') || 'en-US';
+  const j = await cloudFetch('https://texttospeech.googleapis.com/v1/text:synthesize?key=' + encodeURIComponent(key), {
+    input: { text }, voice: { languageCode: lang, name: voice }, audioConfig: { audioEncoding: 'MP3', speakingRate: rate || 1 },
+  }, 'Cloud Text-to-Speech');
+  if (!j.audioContent) throw new Error('Cloud Text-to-Speech: пустой ответ');
+  await usageAdd('tts', text.length);
+  ttsCache.set(ck, j.audioContent);
+  const keys = Object.keys(stored);
+  if (keys.length > 400) for (const k of keys.slice(0, keys.length - 399)) delete stored[k];
+  stored[ck] = j.audioContent;
+  await chrome.storage.local.set({ ttsCache: stored });
+  return j.audioContent;
+}
+
+async function speakCloud({ text }) {
+  const c = await cloudCfg();
+  if (!(await cloudOk('tts', text.length))) throw new Error('озвучка Google недоступна (нет ключа, выключена или предел)');
+  return { b64: await cloudTts(text, c.ttsVoice, c.ttsRate) };
+}
+
+// Key check for the settings page: translates one word and synthesises one short word.
+async function cloudTest() {
+  const out = { tr: null, tts: null };
+  const c = await cloudCfg();
+  if (!c.key) return { error: 'Ключ не задан' };
+  try { out.tr = (await cloudTranslate(['hello'], c.targetLang, 'en'))[0]; } catch (e) { out.tr = '✗ ' + e.message; }
+  try { await cloudTts('hello', c.ttsVoice, c.ttsRate); out.tts = 'ok'; } catch (e) { out.tts = '✗ ' + e.message; }
+  out.usage = await usageGet();
+  return out;
+}
+
 // ---- Google Translate access: one shared queue (hover requests first), spacing and retries,
 // so a burst of prefetching can never lock us out and hover always gets an answer.
 
@@ -66,13 +172,21 @@ const joinTrans = (j) => (j.sentences || []).map((s) => s.trans || '').join('');
 
 // Lines in, translated lines out. If Google merges/splits lines we bisect (a handful of
 // requests) instead of translating every line separately.
-async function translateLines(lines, tl, prio = 0) {
+async function translateLines(lines, tl, prio = 0, sl = 'auto') {
   if (!lines.length) return [];
+  const chars = lines.reduce((n, l) => n + l.length, 0);
+  if (await cloudOk('tr', chars)) {
+    try { return await cloudTranslate(lines, tl, sl); } catch (e) { /* key/quota problem: fall back to the free endpoint */ }
+  }
+  return translateLinesFree(lines, tl, prio);
+}
+
+async function translateLinesFree(lines, tl, prio = 0) {
   if (lines.length === 1) return [joinTrans(await gtx(lines[0], tl, false, prio)).trim()];
   const parts = joinTrans(await gtx(lines.join('\n'), tl, false, prio)).split('\n').map((x) => x.trim());
   if (parts.length === lines.length) return parts;
   const mid = lines.length >> 1;
-  return [...(await translateLines(lines.slice(0, mid), tl, prio)), ...(await translateLines(lines.slice(mid), tl, prio))];
+  return [...(await translateLinesFree(lines.slice(0, mid), tl, prio)), ...(await translateLinesFree(lines.slice(mid), tl, prio))];
 }
 
 // Persistent caches so hover translations are instant on every video.
@@ -94,12 +208,12 @@ function persistCache(name) {
   }, 1500);
 }
 
-async function translateWords(words, tl, prio = 0) {
+async function translateWords(words, tl, prio = 0, sl = 'auto') {
   const cache = await getCache('trc:' + tl);
   const missing = words.filter((w) => !(w in cache));
   for (let i = 0; i < missing.length; i += 100) {
     const chunk = missing.slice(i, i + 100);
-    const out = await translateLines(chunk, tl, prio);
+    const out = await translateLines(chunk, tl, prio, sl);
     chunk.forEach((w, k) => { if (out[k]) cache[w] = out[k]; });
     persistCache('trc:' + tl);
   }
@@ -108,16 +222,30 @@ async function translateWords(words, tl, prio = 0) {
   return res;
 }
 
-async function lookup(word, tl, prio = 0) {
+async function lookup(word, tl, prio = 0, sl = 'auto') {
   const name = 'lkc:' + tl;
   const cache = await getCache(name);
   const key = word.toLowerCase();
   if (cache[key]) return cache[key];
-  const j = await gtx(word, tl, true, prio);
-  const res = {
-    translation: joinTrans(j).trim(),
-    dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })),
-  };
+  const c = await cloudCfg();
+  let res;
+  if (await cloudOk('tr', word.length)) {
+    // Cloud gives one reliable translation at once; variants come from the free dictionary if it answers quickly.
+    const variants = c.cloudVariants
+      ? Promise.race([gtx(word, tl, true, prio).catch(() => null), sleep(1500).then(() => null)])
+      : Promise.resolve(null);
+    try {
+      const [tr, j] = await Promise.all([cloudTranslate([word], tl, sl), variants]);
+      res = {
+        translation: tr[0] || (j ? joinTrans(j).trim() : ''),
+        dict: j ? (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })) : [],
+      };
+    } catch (_) { res = null; }
+  }
+  if (!res) {
+    const j = await gtx(word, tl, true, prio);
+    res = { translation: joinTrans(j).trim(), dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })) };
+  }
   cache[key] = res;
   persistCache(name);
   return res;
@@ -555,9 +683,12 @@ async function helperPcm({ url, v, start, end, rate, wait = 20 }) {
 
 async function handle(msg) {
   switch (msg.type) {
-    case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio);
-    case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio);
-    case 'lookup': return lookup(msg.word, msg.tl, msg.prio);
+    case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
+    case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
+    case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl);
+    case 'speakCloud': return speakCloud(msg);
+    case 'cloudTest': return cloudTest();
+    case 'usage': return usageGet();
     case 'aiSegment': return aiSegment(msg);
     case 'aiVideo': return aiVideo(msg);
     case 'addCard': return addCardOrQueue(msg.card);

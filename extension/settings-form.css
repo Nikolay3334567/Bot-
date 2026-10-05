@@ -41,3 +41,7 @@
 .ytam-set-rst { padding: 0 4px; border: 0; background: none; color: #c98a4b; font-size: 15px; cursor: pointer; }
 .ytam-set-group { margin: 18px 0 4px; padding: 6px 10px; border-radius: 4px; background: #333; color: #ddd; font-weight: 500; }
 .ytam-set-note { margin: 10px 0; color: #9a9a9a; font-size: 12px; }
+
+.ytam-cloud { margin: 14px 0; padding: 12px 14px; border: 1px solid #3a3a3a; border-radius: 8px; background: #232323; }
+.ytam-cloud-line { margin-bottom: 8px; color: #cfcfcf; font-size: 13px; }
+.ytam-cloud-note { margin-top: 8px; color: #9fd0ff; font-size: 13px; }

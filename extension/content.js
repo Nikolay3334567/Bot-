@@ -62,7 +62,11 @@
     return el;
   }
 
+  // Source language of the subtitles (en, de, …) — lets Cloud Translation skip language detection.
+  const srcLang = () => (S.track && /^[a-z]{2,3}/i.test(S.track.languageCode || '') && S.track.languageCode !== 'ai' ? S.track.languageCode.slice(0, 2).toLowerCase() : 'en');
+
   function bg(msg) {
+    if ((msg.type === 'translateLines' || msg.type === 'translateWords' || msg.type === 'lookup') && !msg.sl) msg = { ...msg, sl: srcLang() };
     return new Promise((resolve, reject) => {
       try {
         chrome.runtime.sendMessage(msg, (r) => {
@@ -1486,6 +1490,7 @@
       `запись в памяти ${Math.round(buf)} с · проходов ${Tap.pass}`,
       `помощник: ${S.helper.state}${S.helper.state === 'downloading' ? ' ' + Math.round(S.helper.progress * 100) + '%' : ''}`,
       `ждут аудио: ${S.pending.length} · словарь в очереди: ${dictQueue.length}`,
+      `речь/фон: ${Tap.reliable ? 'ясно' : 'неясно'} (перепад ${Tap.contrast.toFixed(0)} дБ) · тишина ${Math.round(Tap.quietMs)} мс`,
     ].join('\n');
   }
 
@@ -1894,7 +1899,8 @@
     };
   }
 
-  function speak(text) {
+  let speakAudio = null;
+  function speakBrowser(text) {
     try {
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
@@ -1903,18 +1909,74 @@
     } catch (_) {}
   }
 
+  // Google Cloud voice (cached on disk, so each word is paid for once) with the browser voice as fallback.
+  function speak(text) {
+    if (settings.ttsProvider === 'browser') return speakBrowser(text);
+    bg({ type: 'speakCloud', text }).then((r) => {
+      try { if (speakAudio) speakAudio.pause(); } catch (_) {}
+      speakAudio = new Audio('data:audio/mpeg;base64,' + r.b64);
+      speakAudio.play().catch(() => speakBrowser(text));
+    }).catch(() => { if (settings.ttsProvider !== 'cloud') speakBrowser(text); });
+  }
+
   document.addEventListener('mousedown', (e) => {
     if (!pop || pop.el.contains(e.target)) return;
     if (e.target.closest && e.target.closest('.ytam-w') === pop.span) return; // handled by the click toggle
     closePop();
   }, true);
 
+  // ---------- speech-aware pauses (music under the voice does not fool them) ----------
+  // Levels are measured in the speech band only. A pause is a stretch quieter than a threshold placed
+  // between the background level (silence OR music) and the speech level, so a steady music bed does not
+  // hide the gaps between phrases. If speech is not clearly louder than the background we say so
+  // ("unreliable") and the callers fall back to YouTube's own timings.
+
+  function biquad(type, fc, fs) {
+    const q = 0.7071, w = (2 * Math.PI * fc) / fs, c = Math.cos(w), al = Math.sin(w) / (2 * q);
+    const b0 = type === 'hp' ? (1 + c) / 2 : (1 - c) / 2;
+    const b1 = type === 'hp' ? -(1 + c) : 1 - c;
+    const a0 = 1 + al;
+    return { b0: b0 / a0, b1: b1 / a0, b2: b0 / a0, a1: (-2 * c) / a0, a2: (1 - al) / a0, x1: 0, x2: 0, y1: 0, y2: 0 };
+  }
+  const makeBand = (fs) => [biquad('hp', X.vadLoHz, fs), biquad('hp', X.vadLoHz, fs), biquad('lp', Math.min(X.vadHiHz, fs * 0.45), fs)];
+  function bandStep(filters, x) {
+    for (const f of filters) {
+      const y = f.b0 * x + f.b1 * f.x1 + f.b2 * f.x2 - f.a1 * f.y1 - f.a2 * f.y2;
+      f.x2 = f.x1; f.x1 = x; f.y2 = f.y1; f.y1 = y;
+      x = y;
+    }
+    return x;
+  }
+  const levelOf = (e) => 10 * Math.log10(e + 1);
+  function bandLevels(data, rate, frame) {
+    const filters = makeBand(rate);
+    const nF = Math.floor(data.length / frame);
+    const L = new Float32Array(nF);
+    for (let f = 0; f < nF; f++) {
+      let e = 0;
+      for (let i = f * frame; i < (f + 1) * frame; i++) { const y = bandStep(filters, data[i]); e += y * y; }
+      L[f] = levelOf(e / frame);
+    }
+    return L;
+  }
+  function pctOf(arr, p) {
+    const a = Float32Array.from(arr).sort();
+    return a[Math.min(a.length - 1, Math.floor((a.length * p) / 100))];
+  }
+  function speechThreshold(L) {
+    const floorL = pctOf(L, X.vadFloorPct), peakL = pctOf(L, X.vadPeakPct);
+    const contrast = peakL - floorL;
+    // midway between background and speech, but never stricter than the classic "−18 dB below speech"
+    const thr = Math.max(floorL + X.vadMix * contrast, peakL + 20 * Math.log10(X.trimThrFactor));
+    return { thr, floorL, peakL, contrast, reliable: contrast >= X.vadMinContrast };
+  }
+
   // ---------- background audio capture ----------
   // While the video plays we keep the last few minutes of its sound in memory
   // (tagged with video time). Saving a phrase cuts it from there — playback
   // is never interrupted.
 
-  const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null, peak: 0, quietMs: 0 };
+  const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null, quietMs: 0, reliable: false, ring: [], band: null, bandRate: 0, contrast: 0 };
 
   function tapEnsure(v) {
     if (!settings.includeAudio || !v) return;
@@ -1958,7 +2020,7 @@
     const n = inp.length, sr = inp.sampleRate;
     const t1 = v.currentTime + X.tapOffset;
     const t0 = t1 - (n / sr) * v.playbackRate;
-    if (Tap.lastEnd == null || Math.abs(t0 - Tap.lastEnd) > 0.25) Tap.pass++;
+    if (Tap.lastEnd == null || Math.abs(t0 - Tap.lastEnd) > 0.25) { Tap.pass++; Tap.ring = []; Tap.quietMs = 0; }
     Tap.lastEnd = t1;
     const f = sr >= 44100 ? 2 : 1;
     const c0 = inp.getChannelData(0), c1 = inp.numberOfChannels > 1 ? inp.getChannelData(1) : c0;
@@ -1969,12 +2031,18 @@
       s /= 2 * f;
       out[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
     }
-    // Live silence detector (used to stop at the real end of a phrase, not at YouTube's guess).
+    // Live pause detector (speech band, adaptive): stops playback at the real end of a phrase.
+    const rate = sr / f;
+    if (!Tap.band || Tap.bandRate !== rate) { Tap.band = makeBand(rate); Tap.bandRate = rate; Tap.ring = []; }
     let e2 = 0;
-    for (let i = 0; i < out.length; i++) e2 += out[i] * out[i];
-    const rmsNow = Math.sqrt(e2 / Math.max(1, out.length));
-    Tap.peak = Math.max(rmsNow, Tap.peak * 0.97);
-    Tap.quietMs = rmsNow < Math.max(X.trimThrMin, Tap.peak * X.trimThrFactor) ? Tap.quietMs + (n / sr) * 1000 : 0;
+    for (let i = 0; i < out.length; i++) { const y = bandStep(Tap.band, out[i]); e2 += y * y; }
+    const lvl = levelOf(e2 / Math.max(1, out.length));
+    Tap.ring.push(lvl);
+    if (Tap.ring.length > 64) Tap.ring.shift();
+    const th = speechThreshold(Tap.ring);
+    Tap.contrast = th.contrast;
+    Tap.reliable = Tap.ring.length >= 16 && th.reliable;
+    Tap.quietMs = lvl < th.thr ? Tap.quietMs + (n / sr) * 1000 : 0;
     Tap.blocks.push({ t0, t1, pass: Tap.pass, rate: sr / f, data: out });
     const maxBlocks = Math.ceil((X.tapMinutes * 60 * sr) / n);
     if (Tap.blocks.length > maxBlocks) Tap.blocks.splice(0, Tap.blocks.length - maxBlocks);
@@ -2022,32 +2090,33 @@
     let sF = fAt(cueStart - settings.padStart), eF = fAt(cueEnd + settings.padEnd);
     let how = 'запас', endFound = false;
 
+    let reliable = true;
     if (settings.smartTrim && nF > 10) {
-      const rms = new Float32Array(nF);
-      for (let f = 0; f < nF; f++) {
-        let sum = 0;
-        for (let i = f * frame; i < (f + 1) * frame; i++) sum += data[i] * data[i];
-        rms[f] = Math.sqrt(sum / frame);
-      }
-      const sorted = Array.from(rms).sort((a, b) => a - b);
-      const thr = Math.max(X.trimThrMin, sorted[Math.floor(nF * 0.9)] * X.trimThrFactor);
+      const L = bandLevels(data, rate, frame);
+      const th = speechThreshold(L);
+      reliable = th.reliable;
+      const quiet = (f) => L[f] < th.thr;
       const keepS = Math.round(X.startKeepMs / X.trimFrameMs), keepE = Math.round(X.endKeepMs / X.trimFrameMs);
       const need = Math.max(1, Math.round(X.silenceMs / X.trimFrameMs));
-      // start: walk back from the cue start to the first quiet spot
-      for (let f = fAt(cueStart), lim = fAt(cueStart - X.trimBack); f > lim; f--) {
-        if (rms[f] < thr && rms[f - 1] < thr) { sF = Math.max(0, f - keepS); how = 'по паузам'; break; }
+      if (!reliable) {
+        how = 'без анализа (фон громкий)';
+      } else {
+        // start: walk back from the cue start to the first quiet spot
+        for (let f = fAt(cueStart), lim = fAt(cueStart - X.trimBack); f > lim; f--) {
+          if (quiet(f) && quiet(f - 1)) { sF = Math.max(0, f - keepS); how = 'по паузам'; break; }
+        }
+        // end: walk forward from the cue end to the first long enough quiet run
+        const fEnd = fAt(cueEnd + X.trimFwd);
+        let run = 0, f = fAt(cueEnd - X.trimEndFrom);
+        for (; f <= fEnd; f++) {
+          run = quiet(f) ? run + 1 : 0;
+          if (run >= need) { eF = Math.min(nF, f - run + 1 + keepE); how = 'по паузам'; endFound = true; break; }
+        }
+        // The recording simply stops in a pause (playback was paused right after the speech).
+        if (!endFound && fEnd >= nF - 1 && run >= 3) { eF = Math.min(nF, nF - run + keepE); how = 'до тишины'; endFound = true; }
       }
-      // end: walk forward from the cue end to the first long enough quiet run
-      const fEnd = fAt(cueEnd + X.trimFwd);
-      let run = 0, f = fAt(cueEnd - X.trimEndFrom);
-      for (; f <= fEnd; f++) {
-        run = rms[f] < thr ? run + 1 : 0;
-        if (run >= need) { eF = Math.min(nF, f - run + 1 + keepE); how = 'по паузам'; endFound = true; break; }
-      }
-      // The recording simply stops in silence (playback was paused right after the speech).
-      if (!endFound && fEnd >= nF - 1 && run >= 3) { eF = Math.min(nF, nF - run + keepE); how = 'до тишины'; endFound = true; }
     }
-    return { frame, nF, sF, eF, how, endFound, tAt: (f) => ext.t0 + ((f * frame) / data.length) * (ext.t1 - ext.t0) };
+    return { frame, nF, sF, eF, how, endFound, reliable, tAt: (f) => ext.t0 + ((f * frame) / data.length) * (ext.t1 - ext.t0) };
   }
 
   // Returns PCM; trimClip.last holds the chosen edges (video time) for the dev menu.
@@ -2317,14 +2386,14 @@
     const endT = c ? Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly) : 0;
     // Stop at the real end of the speech: after YouTube's end, wait (a little) for actual silence.
     const hardT = c ? Math.min(endT + X.endWaitMax, next ? next.start - 0.02 : Infinity) : 0;
-    const speaking = !!Tap.src && Tap.quietMs < X.endQuietMs;
+    const speaking = !!Tap.src && Tap.reliable && Tap.quietMs < X.endQuietMs;
     if (!v.paused || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
     const shown = c && (t <= c.end + X.showTail || (!v.paused && speaking && t <= hardT) || S.holdCue === a) ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
     if (c && !v.paused) {
-      const atEnd = t >= endT && (t >= hardT || !Tap.src || Tap.quietMs >= X.endQuietMs);
+      const atEnd = t >= endT && (t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
       if (settings.autoPause && atEnd && S.lastAutoPause !== a) {
         S.lastAutoPause = a;
         S.holdCue = a;

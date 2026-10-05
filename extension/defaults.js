@@ -19,6 +19,13 @@ self.YTAM_DEFAULTS = {
   helperUrl: 'http://127.0.0.1:8766',
   // Translation & subtitles
   targetLang: 'ru',
+  trProvider: 'auto',
+  cloudTrLimit: 450000,
+  cloudVariants: true,
+  ttsProvider: 'auto',
+  ttsVoice: 'en-US-Neural2-F',
+  ttsRate: 1,
+  ttsLimit: 900000,
   showTranslation: true,
   hideSubs: 'off',
   maxWords: 18,
@@ -86,6 +93,7 @@ self.YTAM_DEFAULTS = {
 self.YTAM_LOCAL_DEFAULTS = {
   geminiKey: '',
   aiKey: '',
+  googleCloudKey: '',
 };
 
 const LANG_OPTIONS = [['ru', 'Русский'], ['uk', 'Українська'], ['be', 'Беларуская'], ['kk', 'Қазақша'], ['en', 'English'], ['de', 'Deutsch'], ['fr', 'Français'], ['es', 'Español'], ['it', 'Italiano'], ['pl', 'Polski'], ['tr', 'Türkçe'], ['zh-CN', '中文'], ['ja', '日本語']];
@@ -146,6 +154,14 @@ self.YTAM_SCHEMA = [
   {
     id: 'subs', title: 'Перевод', fields: [
       { k: 'targetLang', label: 'Язык перевода', type: 'select', options: LANG_OPTIONS },
+      { k: 'trProvider', label: 'Чем переводить', type: 'select', options: [['auto', 'Google Cloud, если задан ключ (иначе бесплатный)'], ['cloud', 'Только Google Cloud'], ['free', 'Только бесплатный (неофициальный)']], hint: 'Cloud Translation: 500 000 знаков в месяц бесплатно — переводит всё заранее, без сбоев' },
+      { k: 'googleCloudKey', label: 'Ключ Google Cloud', type: 'password', local: true, hint: 'Один ключ для перевода и озвучки. Хранится только на этом компьютере. Инструкция: docs/GOOGLE_CLOUD.md' },
+      { k: 'cloudTrLimit', label: 'Предел перевода в месяц (защита от платы)', type: 'range', min: 0, max: 500000, step: 10000, unit: 'знаков', hint: 'Дойдя до предела, расширение переключается на бесплатный перевод. Бесплатно у Google — 500 000' },
+      { k: 'cloudVariants', label: 'Варианты слова для подсказки (бесплатным словарём)', type: 'toggle', hint: 'Cloud даёт один перевод; варианты столбиком берутся из бесплатного словаря, если он отвечает' },
+      { k: 'ttsProvider', label: 'Озвучка слов', type: 'select', options: [['auto', 'Google Cloud, если задан ключ (иначе браузер)'], ['cloud', 'Только Google Cloud'], ['browser', 'Только голос браузера']] },
+      { k: 'ttsVoice', label: 'Голос Google', type: 'text', hint: 'Напр. en-US-Neural2-F (1 млн знаков бесплатно), en-US-Standard-C (4 млн), en-GB-Neural2-B' },
+      { k: 'ttsRate', label: 'Скорость озвучки', type: 'range', min: 0.6, max: 1.4, step: 0.05, unit: '×' },
+      { k: 'ttsLimit', label: 'Предел озвучки в месяц (защита от платы)', type: 'range', min: 0, max: 1000000, step: 50000, unit: 'знаков' },
       { k: 'showTranslation', label: 'Показывать перевод фразы', type: 'toggle' },
       { k: 'hideSubs', label: 'Скрывать субтитры', type: 'select', options: [['off', 'Нет'], ['tr', 'Размыть перевод (виден при наведении)'], ['orig', 'Размыть оригинал'], ['both', 'Размыть оба']] },
       { k: 'maxWords', label: 'Макс. слов во фразе', type: 'range', min: 6, max: 40, step: 1 },
@@ -196,13 +212,18 @@ self.YTAM_SCHEMA = [
 self.YTAM_DEV_SCHEMA = [
   {
     title: 'Аудио: окно и обрезка', fields: [
-      { k: 'clipLead', label: 'Окно до фразы (поиск начала)', def: 0.9, min: 0, max: 3, step: 0.05, unit: 'с' },
-      { k: 'clipTail', label: 'Окно после фразы (поиск конца)', def: 1.6, min: 0, max: 4, step: 0.05, unit: 'с' },
-      { k: 'trimBack', label: 'Искать тишину назад от начала', def: 0.8, min: 0, max: 3, step: 0.05, unit: 'с' },
-      { k: 'trimFwd', label: 'Искать тишину вперёд от конца', def: 1.3, min: 0, max: 4, step: 0.05, unit: 'с' },
+      { k: 'clipLead', label: 'Окно до фразы (поиск начала)', def: 0.7, min: 0, max: 3, step: 0.05, unit: 'с' },
+      { k: 'clipTail', label: 'Окно после фразы (поиск конца)', def: 0.9, min: 0, max: 4, step: 0.05, unit: 'с' },
+      { k: 'trimBack', label: 'Искать тишину назад от начала', def: 0.6, min: 0, max: 3, step: 0.05, unit: 'с' },
+      { k: 'trimFwd', label: 'Искать тишину вперёд от конца', def: 0.8, min: 0, max: 4, step: 0.05, unit: 'с' },
       { k: 'trimEndFrom', label: 'Начинать поиск конца раньше на', def: 0.15, min: 0, max: 1.5, step: 0.05, unit: 'с' },
-      { k: 'trimThrFactor', label: 'Порог тишины (доля громкости)', def: 0.12, min: 0.01, max: 0.6, step: 0.01 },
-      { k: 'trimThrMin', label: 'Минимальный порог тишины', def: 250, min: 0, max: 4000, step: 50 },
+      { k: 'trimThrFactor', label: 'Порог тишины без музыки (доля громкости)', def: 0.12, min: 0.01, max: 0.6, step: 0.01 },
+      { k: 'vadMix', label: 'Речь на фоне музыки: порог между фоном и речью', def: 0.4, min: 0.1, max: 0.9, step: 0.05, hint: '0.5 = ровно посередине (в децибелах)' },
+      { k: 'vadMinContrast', label: 'Речь на фоне музыки: минимальный перепад', def: 10, min: 3, max: 30, step: 1, unit: 'дБ', hint: 'Если речь громче фона меньше, чем на столько, паузы не ищем — берём время YouTube' },
+      { k: 'vadFloorPct', label: 'Уровень фона — перцентиль громкости', def: 10, min: 1, max: 40, step: 1, unit: '%' },
+      { k: 'vadPeakPct', label: 'Уровень речи — перцентиль громкости', def: 90, min: 60, max: 99, step: 1, unit: '%' },
+      { k: 'vadLoHz', label: 'Полоса речи: нижняя граница', def: 250, min: 80, max: 600, step: 10, unit: 'Гц' },
+      { k: 'vadHiHz', label: 'Полоса речи: верхняя граница', def: 4500, min: 2000, max: 9000, step: 100, unit: 'Гц' },
       { k: 'trimFrameMs', label: 'Окно анализа громкости', def: 20, min: 5, max: 60, step: 1, unit: 'мс' },
       { k: 'silenceMs', label: 'Пауза = тишина не короче', def: 160, min: 20, max: 800, step: 10, unit: 'мс' },
       { k: 'startKeepMs', label: 'Оставить перед началом речи', def: 40, min: 0, max: 400, step: 10, unit: 'мс' },
