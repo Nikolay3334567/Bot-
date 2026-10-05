@@ -161,13 +161,20 @@
     if (w.includes(' ')) { renderList(); renderOverlay(); } else recolor(w);
     if (st === 1 && prev !== 1) logSaved({ k: w, t: w.includes(' ') ? 'x' : 'w', text: w });
     if (prev === 1 && st !== 1) { if (silent) updateSaved((saved) => saved.filter((e) => e.k !== w)); else leftLearning(w, st); }
-    try {
-      const { vocab = {} } = await chrome.storage.local.get('vocab');
-      if (st) vocab[w] = st; else delete vocab[w];
-      await chrome.storage.local.set({ vocab });
-    } catch (_) {}
+    // Writes are serialized and always carry the in-memory state: rapid right-clicks used to race
+    // (stale read → stale write → storage listener flipped the word back).
+    vocabWrites++;
+    vocabChain = vocabChain.then(async () => {
+      try {
+        const { vocab = {} } = await chrome.storage.local.get('vocab');
+        if (S.vocab[w]) vocab[w] = S.vocab[w]; else delete vocab[w];
+        await chrome.storage.local.set({ vocab });
+      } catch (_) {}
+      vocabWrites--;
+    });
     refreshSideTabs();
   }
+  let vocabChain = Promise.resolve(), vocabWrites = 0;
 
   // Right / middle click (LR): learning ↔ known; anything else → learning.
   function toggleStatus(w, i, meaning) {
@@ -1692,7 +1699,8 @@
     }
     const w = span.dataset.w;
     const wasShown = !!tipFor && tipEl.isConnected;
-    const moved = wasShown && tipFor !== span && tipEl.classList.contains('show');
+    const same = tipFor && tipFor !== span && !tipFor.isConnected && tipFor.dataset.w === span.dataset.w && tipFor.dataset.ti === span.dataset.ti;
+    const moved = (+settings.tipAnim > 0) && wasShown && !same && tipFor !== span && tipEl.classList.contains('show');
     tipFor = span;
     const exprs = exprsAt(i, +span.dataset.ti).slice(0, 2);
     const n = Math.max(1, +settings.tipVariants || 3);
@@ -2601,7 +2609,7 @@
       if (changes.saved) { S.savedList = changes.saved.newValue || []; refreshSideTabs(); }
       if (changes.outbox) renderOutbox((changes.outbox.newValue || []).length);
       if (changes.dev) { Object.assign(X, self.YTAM_DEV_DEFAULTS, changes.dev.newValue || {}); syncDev(); }
-      if (changes.vocab) {
+      if (changes.vocab && !vocabWrites) {
         const nv = changes.vocab.newValue || {};
         const keys = new Set([...Object.keys(nv), ...Object.keys(S.vocab)]);
         const diff = [...keys].filter((k) => nv[k] !== S.vocab[k]);

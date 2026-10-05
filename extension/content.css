@@ -224,11 +224,9 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
   font: var(--ytam-tip-fs)/1.28 var(--ytam-font);
   text-align: center;
   opacity: 0;
-  transform: translateY(4px);
-  transition: opacity var(--ytam-tip-anim) ease-out, transform var(--ytam-tip-anim) ease-out;
+  transition: opacity var(--ytam-tip-anim) linear;
 }
-.ytam-tip.below { transform: translateY(-4px); }
-.ytam-tip.show { opacity: 1; transform: none; }
+.ytam-tip.show { opacity: 1; }
 .ytam-tip::after, .ytam-pop::after {
   content: '';
   position: absolute;
