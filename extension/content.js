@@ -20,6 +20,8 @@
     active: -1,
     shown: -1,
     lastAutoPause: -1,
+    lastHoverPause: -1,
+    lineRect: null,
     token: 0,
     captured: new Map(), // videoId -> { url, body } of the player's own subtitle request
     waitingCapture: false,
@@ -836,7 +838,8 @@
     S.cues = cues;
     S.trans = cues.map((c) => c.tr || null);
     S.active = -1;
-    S.shown = -1;
+    S.lastAutoPause = -1;
+    S.lastHoverPause = -1;
     S.lastAutoPause = -1;
     renderList();
   }
@@ -948,7 +951,8 @@
       const w = e.target.closest('.ytam-w');
       if (!w || (e.relatedTarget && w.contains(e.relatedTarget))) return;
       S.hoverWord = null;
-      scheduleHideTip();
+      if (settings.tipInteract === 'full' || (settings.tipInteract === 'key' && S.ctrlDown)) scheduleHideTip();
+      else { clearTimeout(tipHideTimer); hideTip(); scheduleResume(); }
     });
     root.addEventListener('mousedown', (e) => {
       if (e.button === 1 && e.target.closest('.ytam-w')) e.preventDefault(); // no autoscroll
@@ -1014,7 +1018,7 @@
       if (e.target.closest('.ytam-star')) return queueCard(i, null);
       if (e.target.closest('.ytam-play')) return seekCue(i, true);
       const w = e.target.closest('.ytam-w');
-      if (w) return openWord(w, i);
+      if (w) return shiftSave(e, w, i) || openWord(w, i);
       seekCue(i, true);
     });
     bindWords(list, (w) => +w.closest('.ytam-row').dataset.i);
@@ -1038,7 +1042,7 @@
         e.stopPropagation();
         if (type !== 'click') return;
         const w = e.target.closest('.ytam-w');
-        if (w && S.shown >= 0) openWord(w, S.shown);
+        if (w && S.shown >= 0 && !shiftSave(e, w, S.shown)) openWord(w, S.shown);
       });
     }
     bindWords(ovBox, () => S.shown);
@@ -1087,7 +1091,7 @@
 
   function resumeAfterHover() {
     if (!S.hoverPaused) return;
-    if (ui && ui.ovLine.matches(':hover')) return;
+    if (hoverActive()) return;
     S.hoverPaused = false;
     const v = getVideo();
     if (v) v.play();
@@ -1690,6 +1694,26 @@
     return c && ti >= 0 ? cueExpr(c).filter((e) => e.idx.includes(ti)) : [];
   }
 
+  // Save an expression as a card (with audio) + mark it; its words are not turned into "learning".
+  function saveExpr(e, i) {
+    if (S.vocab[e.key] === 1) return;
+    setWordStatus(e.key, 1);
+    queueCard(i, { word: e.p, meaning: exprTr(e), expr: true, hl: e.surf });
+  }
+
+  // Shift + click: save the expression(s) under the word. Returns true when the click was consumed.
+  function shiftSave(ev, span, i) {
+    if (!ev.shiftKey || settings.exprSave === 'button') return false;
+    const exprs = exprsAt(i, +span.dataset.ti).slice(0, 2);
+    if (!exprs.length) { toast('Здесь нет выражения', 'warn', 1800); return true; }
+    const fresh = exprs.filter((e) => S.vocab[e.key] !== 1);
+    if (!fresh.length) { toast('Выражение уже сохранено', '', 1800); return true; }
+    fresh.forEach((e) => saveExpr(e, i));
+    toast('Выражение сохранено: ' + fresh.map((e) => e.surf || e.p).join(' · '));
+    if (tipFor === span) showTip(span, i);
+    return true;
+  }
+
   function showTip(span, i) {
     clearTimeout(tipHideTimer);
     if (!tipEl) {
@@ -1698,6 +1722,8 @@
       for (const type of ['mousedown', 'click', 'contextmenu']) tipEl.addEventListener(type, (e) => e.stopPropagation());
     }
     const w = span.dataset.w;
+    tipEl.classList.toggle('passive', settings.tipInteract === 'none' || (settings.tipInteract === 'key' && !S.ctrlDown));
+    tipEl.classList.toggle('xs-key', settings.exprSave === 'shift');
     const wasShown = !!tipFor && tipEl.isConnected;
     const same = tipFor && tipFor !== span && !tipFor.isConnected && tipFor.dataset.w === span.dataset.w && tipFor.dataset.ti === span.dataset.ti;
     const moved = (+settings.tipAnim > 0) && wasShown && !same && tipFor !== span && tipEl.classList.contains('show');
@@ -1711,12 +1737,10 @@
       const varsEl = (list) => h('div', { class: 'ytam-tip-vars' }, list.length ? list.map((t) => h('div', { text: t })) : h('div', { class: 'ytam-dim', text: '…' }));
       const kids = [];
       for (const e of exprs) {
-        const save = svgBtn('ytam-tip-xsave' + (S.vocab[e.key] === 1 ? ' on' : ''), S.vocab[e.key] === 1 ? 'bookClock' : 'book', 'Сохранить выражение в Anki', () => {
-          if (S.vocab[e.key] === 1) return;
-          setWordStatus(e.key, 1);
-          queueCard(i, { word: e.p, meaning: exprTr(e), expr: true, hl: e.surf });
-          fill();
-        });
+        const saved = S.vocab[e.key] === 1;
+        const save = settings.exprSave === 'shift'
+          ? svgBtn('ytam-tip-xsave ind' + (saved ? ' on' : ''), saved ? 'bookClock' : 'book', saved ? 'Выражение сохранено' : 'Shift + клик по слову — сохранить выражение', null)
+          : svgBtn('ytam-tip-xsave' + (saved ? ' on' : ''), saved ? 'bookClock' : 'book', 'Сохранить выражение в Anki', () => { saveExpr(e, i); fill(); });
         kids.push(h('div', { class: 'ytam-tip-head' }, h('span', { text: e.surf || e.p }), save), varsEl(exprTr(e) ? [exprTr(e)] : []));
       }
       if (exprs.length) kids.push(h('div', { class: 'ytam-tip-head' }, h('span', { text: span.textContent })));
@@ -2399,6 +2423,7 @@
     const c = S.cues[i];
     if (!v || !c) return;
     S.lastAutoPause = -1;
+    S.lastHoverPause = -1;
     v.currentTime = Math.max(0, c.start + X.subShift - X.seekLead);
     if (play) v.play();
   }
@@ -2436,11 +2461,20 @@
         v.pause();
       }
       // Hover mode 'end': the pointer is on the subtitles/tooltip — stop when the phrase has finished.
-      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && hoverActive() && atEnd) {
+      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && S.lastHoverPause !== a && atEnd && hoverActive()) {
+        S.lastHoverPause = a; // once per phrase: pressing play again lets it run on to the next phrase end
         S.holdCue = a;
         v.pause();
         S.hoverPaused = true;
       }
+    }
+
+    // Resume once the pointer has really left (enter/leave events can be lost when the line re-renders).
+    if (S.hoverPaused) {
+      if (!v.paused) S.hoverPaused = false;
+      else if (pop || hoverActive() || S.posEdit) S.hoverGone = 0;
+      else if (!S.hoverGone) S.hoverGone = Date.now();
+      else if (Date.now() - S.hoverGone >= X.resumeMs) { S.hoverGone = 0; resumeAfterHover(); }
     }
 
     // AP switch turns red while playback is held (AP on + paused, or paused by hover).
@@ -2454,12 +2488,35 @@
     }
   }
 
-  const hoverActive = () => S.hoverIn || !!(tipEl && tipEl.isConnected && tipEl.matches(':hover'));
+  // Hover is decided from the real pointer position, not from enter/leave events: those are lost
+  // whenever the subtitle line is re-rendered or hidden under a resting pointer.
+  const ptr = { x: -1, y: -1, t: 0 };
+  for (const type of ['pointermove', 'mousemove']) {
+    window.addEventListener(type, (e) => { ptr.x = e.clientX; ptr.y = e.clientY; ptr.t = Date.now(); }, true);
+  }
+  document.addEventListener('mouseleave', () => { ptr.x = ptr.y = -1; });
+  const inRect = (r, pad = 0) => r && r.width > 0 && ptr.x >= r.left - pad && ptr.x <= r.right + pad && ptr.y >= r.top - pad && ptr.y <= r.bottom + pad;
+  function hoverActive() {
+    if (!ui) return false;
+    if (ui.ovLine.offsetParent !== null) S.lineRect = ui.ovLine.getBoundingClientRect(); // remembered while hidden
+    if (S.hoverIn && ui.ovLine.matches(':hover')) return true;
+    if (tipEl && tipEl.isConnected && tipEl.matches(':hover')) return true;
+    return inRect(S.lineRect, 2);
+  }
   (function loop() { try { tick(); } catch (e) { console.warn('[ytam]', e); } setTimeout(loop, X.tickMs); })();
 
   document.addEventListener('pointerdown', () => {
     if (Tap.ctx && Tap.ctx.state === 'suspended') Tap.ctx.resume().catch(() => {});
   }, true);
+
+  const setCtrl = (down) => {
+    if (S.ctrlDown === down) return;
+    S.ctrlDown = down;
+    if (tipEl && settings.tipInteract === 'key') tipEl.classList.toggle('passive', !down);
+  };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Control') setCtrl(true); }, true);
+  document.addEventListener('keyup', (e) => { if (e.key === 'Control') setCtrl(false); }, true);
+  window.addEventListener('blur', () => setCtrl(false));
 
   document.addEventListener('keydown', (e) => {
     if (e.code === 'Escape' && pop) { closePop(); return; }

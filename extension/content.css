@@ -390,3 +390,7 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-rank-bar i { display: block; height: 100%; background: #2cc4a0; }
 .ytam-rank b { color: #fff; }
 .ytam-rank + .ytam-pop-head { border-radius: 0; }
+
+.ytam-tip.passive { pointer-events: none; }
+.ytam-tip-xsave.ind { cursor: default; pointer-events: none; opacity: .5; }
+.ytam-tip-xsave.ind.on { opacity: 1; }
