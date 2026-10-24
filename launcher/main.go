@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -411,6 +412,32 @@ func handler() http.Handler {
 			break
 		}
 	}
+	// Relay to AnkiConnect without an Origin header: AnkiConnect's CORS / origin rules never apply to it.
+	mux.HandleFunc("/anki", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Header.Get("X-YTAM") != "1" {
+			writeJSON(w, 403, map[string]string{"error": "forbidden"})
+			return
+		}
+		port := r.Header.Get("X-Anki-Port")
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			port = "8765"
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 128<<20))
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port, bytes.NewReader(body))
+		resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+		if err != nil {
+			writeJSON(w, 502, map[string]string{"error": "Anki не отвечает: " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		s := status()
 		writeJSON(w, 200, map[string]any{"ok": true, "ytdlp": s["ytdlpVersion"], "ffmpeg": s["ffmpeg"] != "", "ankiConnect": s["ankiConnect"], "cache": cache})

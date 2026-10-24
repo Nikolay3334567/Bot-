@@ -1,8 +1,9 @@
 // Service worker: translation (Google Translate, no key), Gemini, AnkiConnect.
 importScripts('defaults.js');
+try { importScripts('lib/lame.min.js'); } catch (_) {} // MP3 encoder (kept off the page's main thread)
 
 const MODEL = 'YT Anki Miner';
-const FIELDS = ['Sentence', 'Translation', 'Word', 'WordMeaning', 'Audio', 'Image', 'Source'];
+const FIELDS = ['Sentence', 'Translation', 'Word', 'WordMeaning', 'Audio', 'Image', 'Source', 'AudioAI'];
 
 const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTime = (s) => {
@@ -82,18 +83,21 @@ async function cloudTranslate(texts, tl, sl) {
 }
 
 const ttsCache = new Map();
-async function cloudTts(text, voice, rate) {
+async function cloudTts(text, voice, rate, noCache) {
   const { key } = await cloudCfg();
   const ck = voice + '|' + rate + '|' + text.toLowerCase();
-  if (ttsCache.has(ck)) return ttsCache.get(ck);
-  const stored = (await chrome.storage.local.get('ttsCache')).ttsCache || {};
-  if (stored[ck]) { ttsCache.set(ck, stored[ck]); return stored[ck]; }
+  const stored = noCache ? {} : ((await chrome.storage.local.get('ttsCache')).ttsCache || {});
+  if (!noCache) {
+    if (ttsCache.has(ck)) return ttsCache.get(ck);
+    if (stored[ck]) { ttsCache.set(ck, stored[ck]); return stored[ck]; }
+  }
   const lang = String(voice).split('-').slice(0, 2).join('-') || 'en-US';
   const j = await cloudFetch('https://texttospeech.googleapis.com/v1/text:synthesize?key=' + encodeURIComponent(key), {
     input: { text }, voice: { languageCode: lang, name: voice }, audioConfig: { audioEncoding: 'MP3', speakingRate: rate || 1 },
   }, 'Cloud Text-to-Speech');
   if (!j.audioContent) throw new Error('Cloud Text-to-Speech: пустой ответ');
   await usageAdd('tts', text.length);
+  if (noCache) return j.audioContent;
   ttsCache.set(ck, j.audioContent);
   const keys = Object.keys(stored);
   if (keys.length > 400) for (const k of keys.slice(0, keys.length - 399)) delete stored[k];
@@ -364,6 +368,24 @@ ${text}`;
   return { lines: asLines(parseJsonLoose(out)) };
 }
 
+// Shortest self-contained excerpt of a long sentence that still contains the target word (for a flash card).
+async function aiTrim({ sentence, word, max, tl, model }) {
+  const lang = LANGS[tl] || tl;
+  const prompt = `Flash-card trimming. The sentence below is too long for a language-learning card.
+Pick ONE contiguous excerpt of the sentence that:
+- has at most ${max} words,
+- is grammatically complete and makes sense on its own (ideally a full clause),
+- ${word ? `contains the target "${word}"` : 'keeps the most important part'},
+- copies the words EXACTLY as written, in the original order (no paraphrasing, no added or removed words).
+Also translate the excerpt into ${lang}. Return JSON: {"s": excerpt, "t": translation}.
+
+Sentence: ${sentence}`;
+  const out = await llm({ model: model || (await aiConfig()).aiFastModel, prompt, json: true, temperature: 0.1,
+    schema: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' } }, required: ['s', 't'] } });
+  const j = parseJsonLoose(out);
+  return { s: String(j.s || ''), t: String(j.t || '') };
+}
+
 // "03:07.4", "1:02:03", "187.4" or 187.4 -> seconds
 const parseTs = (v) => {
   if (typeof v === 'number') return v;
@@ -474,17 +496,104 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // ---------- AnkiConnect ----------
 
-async function anki(action, params = {}) {
-  const { ankiUrl } = await chrome.storage.sync.get({ ankiUrl: 'http://127.0.0.1:8765' });
-  let r;
-  try {
-    r = await fetch(ankiUrl, { method: 'POST', body: JSON.stringify({ action, version: 6, params }) });
-  } catch (_) {
-    throw new Error('Нет связи с Anki. Откройте Anki и проверьте, что установлен AnkiConnect.');
+// Resilient AnkiConnect client. Works with old and new AnkiConnect releases:
+//  • tries the configured URL, 127.0.0.1 and localhost (a stray "localhost → ::1" never breaks it),
+//  • asks Anki for permission (requestPermission) when the extension origin is not whitelisted,
+//  • sends the optional API key, retries while the collection is busy,
+//  • falls back to the local launcher, which relays the call without an Origin header (no CORS rules apply).
+let ankiRoute = null; // the route that worked last time
+
+const ANKI_BUSY = /collection is not available|not ready|busy|database is locked|profile/i;
+
+async function ankiRoutes() {
+  const c = await chrome.storage.sync.get({ ankiUrl: 'http://127.0.0.1:8765', helperUrl: 'http://127.0.0.1:8766' });
+  const list = [];
+  for (const u of [c.ankiUrl, 'http://127.0.0.1:8765', 'http://localhost:8765']) {
+    const url = String(u || '').trim().replace(/\/+$/, '');
+    if (url && !list.some((r) => r.url === url)) list.push({ kind: 'direct', url });
   }
-  const j = await r.json();
-  if (j.error) throw new Error('Anki: ' + j.error);
-  return j.result;
+  const proxy = String(c.helperUrl || '').trim().replace(/\/+$/, '');
+  if (proxy) list.push({ kind: 'proxy', url: proxy + '/anki', port: (/:(\d+)\/?$/.exec(c.ankiUrl || '') || [])[1] || '8765' });
+  if (ankiRoute) {
+    const i = list.findIndex((r) => r.url === ankiRoute);
+    if (i > 0) list.unshift(list.splice(i, 1)[0]);
+  }
+  return list;
+}
+
+class AnkiHttpError extends Error { constructor(status, text) { super(`HTTP ${status}`); this.status = status; this.text = text; } }
+
+async function ankiPost(route, body, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const headers = route.kind === 'proxy' ? { 'X-YTAM': '1', 'X-Anki-Port': route.port } : {};
+    const r = await fetch(route.url, { method: 'POST', body, headers, signal: ctl.signal, cache: 'no-store' });
+    if (!r.ok) throw new AnkiHttpError(r.status, await r.text().catch(() => ''));
+    return await r.json();
+  } finally { clearTimeout(timer); }
+}
+
+async function anki(action, params = {}, opts = {}) {
+  const { ankiKey } = await chrome.storage.local.get({ ankiKey: '' });
+  const timeoutMs = opts.timeout || (action === 'storeMediaFile' ? 60000 : 15000);
+  const body = JSON.stringify({ action, version: 6, params, ...(ankiKey ? { key: ankiKey } : {}) });
+  let lastErr = null, reached = false;
+  for (const route of await ankiRoutes()) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      let j;
+      try {
+        j = await ankiPost(route, body, timeoutMs);
+      } catch (e) {
+        lastErr = e;
+        if (e instanceof AnkiHttpError) {
+          reached = true;
+          // 403: AnkiConnect refuses this origin — ask for permission once, then retry; else try the next route.
+          if (e.status === 403 && action !== 'requestPermission' && attempt === 0 && route.kind === 'direct') {
+            try {
+              const p = await ankiPost(route, JSON.stringify({ action: 'requestPermission', version: 6, params: {} }), 60000);
+              if (p && p.result && p.result.permission === 'granted') continue;
+            } catch (_) {}
+          }
+        }
+        break; // network error / refused → next route
+      }
+      reached = true;
+      const err = j && typeof j === 'object' && 'error' in j ? j.error : null;
+      if (err) {
+        if (/valid api key|api key/i.test(err)) throw new Error('Anki: нужен ключ AnkiConnect — впишите его в настройках (вкладка Anki → «Ключ AnkiConnect»)');
+        if (ANKI_BUSY.test(err) && attempt < 3) { await sleep(700 * (attempt + 1)); continue; }
+        throw new Error('Anki: ' + err);
+      }
+      ankiRoute = route.url;
+      return j && typeof j === 'object' && 'result' in j ? j.result : j; // very old AnkiConnect returns the bare result
+    }
+  }
+  if (reached && lastErr instanceof AnkiHttpError) {
+    const origin = chrome.runtime.getURL('').replace(/\/$/, '');
+    throw new Error(`Anki отклонил запрос (HTTP ${lastErr.status}). В Anki: Инструменты → Дополнения → AnkiConnect → Config → в "webCorsOriginList" добавьте "${origin}" (или "*"), перезапустите Anki. Либо запустите лончер — он обходит это ограничение.`);
+  }
+  throw new Error('Нет связи с Anki. Откройте Anki и проверьте, что установлен AnkiConnect (код 2055492159).');
+}
+
+// Step-by-step connection report for the settings screen.
+async function ankiDiagnose() {
+  const out = [];
+  const routes = await ankiRoutes();
+  const { ankiKey } = await chrome.storage.local.get({ ankiKey: '' });
+  let ok = false, version = null, decks = [];
+  for (const route of routes) {
+    try {
+      const j = await ankiPost(route, JSON.stringify({ action: 'version', version: 6, params: {}, ...(ankiKey ? { key: ankiKey } : {}) }), 6000);
+      const err = j && j.error;
+      out.push(`${route.kind === 'proxy' ? 'через лончер' : route.url}: ${err ? 'ошибка — ' + err : 'ответ получен, версия API ' + j.result}`);
+      if (!err) { ok = true; version = j.result; ankiRoute = route.url; break; }
+    } catch (e) {
+      out.push(`${route.kind === 'proxy' ? 'через лончер' : route.url}: ${e instanceof AnkiHttpError ? 'HTTP ' + e.status + (e.status === 403 ? ' (источник не разрешён в webCorsOriginList)' : '') : 'нет ответа'}`);
+    }
+  }
+  if (ok) { try { decks = await anki('deckNames'); } catch (e) { out.push('deckNames: ' + e.message); ok = false; } }
+  return { ok, version, decks, steps: out, origin: chrome.runtime.getURL('').replace(/\/$/, '') };
 }
 
 const CSS = `.card{font-family:Arial,sans-serif;font-size:22px;text-align:center;color:#1d1d1f;background:#fafafa}
@@ -502,7 +611,7 @@ const CSS = `.card{font-family:Arial,sans-serif;font-size:22px;text-align:center
 const FRONT = `<div class="img">{{Image}}</div>
 <div class="sentence">{{Sentence}}</div>
 {{#Word}}<div class="word">{{Word}}</div>{{/Word}}
-{{Audio}}`;
+{{Audio}}{{AudioAI}}`;
 
 const BACK = `{{FrontSide}}
 <hr id="answer">
@@ -523,6 +632,11 @@ async function ensureModel() {
       cardTemplates: [{ Name: 'YouTube', Front: FRONT, Back: BACK }],
     });
   } else {
+    // Older versions of the note type lack newer fields (AudioAI): add them.
+    try {
+      const have = await anki('modelFieldNames', { modelName: MODEL });
+      for (const f of FIELDS) if (!have.includes(f)) await anki('modelFieldAdd', { modelName: MODEL, fieldName: f });
+    } catch (_) {}
     // Keep the note type in sync with the current templates.
     try {
       await anki('updateModelTemplates', { model: { name: MODEL, templates: { YouTube: { Front: FRONT, Back: BACK } } } });
@@ -533,35 +647,43 @@ async function ensureModel() {
 }
 
 async function addCard(c) {  // writes one note to Anki (throws when Anki is unreachable)
+  for (let attempt = 0; ; attempt++) {
+    try { return await addCardOnce(c); } catch (e) {
+      // The note type / deck was removed or changed in Anki while we were running: rebuild and retry once.
+      if (attempt === 0 && /model|note type|deck|field/i.test(e.message) && !/Нет связи/.test(e.message)) { modelReady = false; continue; }
+      throw e;
+    }
+  }
+}
+
+const deckMade = new Set();
+async function addCardOnce(c) {
   await ensureModel();
-  await anki('createDeck', { deck: c.deck });
+  if (!deckMade.has(c.deck)) { await anki('createDeck', { deck: c.deck }); deckMade.add(c.deck); }
   const base = `ytam_${c.videoId}_${Math.round(c.start * 1000)}_${Date.now().toString(36)}`;
-  let audio = '', image = '';
-  if (c.audio) {
-    const fn = await anki('storeMediaFile', { filename: base + '.mp3', data: c.audio });
-    audio = `[sound:${fn || base + '.mp3'}]`;
-  }
-  if (c.image) {
-    const fn = await anki('storeMediaFile', { filename: base + '.jpg', data: c.image });
-    image = `<img src="${fn || base + '.jpg'}">`;
-  }
+  const store = async (name, data) => `${await anki('storeMediaFile', { filename: name, data }) || name}`;
+  let audio = '', audioAI = '', image = '';
+  if (c.audio) audio = `[sound:${await store(base + '.mp3', c.audio)}]`;
+  if (c.audioAI) audioAI = `[sound:${await store(base + '_ai.mp3', c.audioAI)}]`;
+  if (c.image) image = `<img src="${await store(base + '.jpg', c.image)}">`;
   const link = `https://youtu.be/${c.videoId}?t=${Math.floor(c.start)}`;
+  const fields = {
+    Sentence: c.sentenceHtml,
+    Translation: esc(c.translation),
+    Word: esc(c.word),
+    WordMeaning: esc(c.wordMeaning),
+    Audio: audio,
+    AudioAI: audioAI,
+    Image: image,
+    Source: `<a href="${link}">▶ Смотреть на YouTube · ${fmtTime(c.start)}</a><div class="title">${esc(c.title)}</div>`,
+  };
+  // Only fields the note type really has (the user may have edited it).
+  try {
+    const have = await anki('modelFieldNames', { modelName: MODEL });
+    if (Array.isArray(have) && have.length) for (const k of Object.keys(fields)) if (!have.includes(k)) delete fields[k];
+  } catch (_) {}
   return anki('addNote', {
-    note: {
-      deckName: c.deck,
-      modelName: MODEL,
-      fields: {
-        Sentence: c.sentenceHtml,
-        Translation: esc(c.translation),
-        Word: esc(c.word),
-        WordMeaning: esc(c.wordMeaning),
-        Audio: audio,
-        Image: image,
-        Source: `<a href="${link}">▶ Смотреть на YouTube · ${fmtTime(c.start)}</a><div class="title">${esc(c.title)}</div>`,
-      },
-      options: { allowDuplicate: true },
-      tags: ['youtube', 'yt-anki-miner'],
-    },
+    note: { deckName: c.deck, modelName: MODEL, fields, options: { allowDuplicate: true }, tags: ['youtube', 'yt-anki-miner'] },
   });
 }
 
@@ -654,6 +776,50 @@ async function ankiProgress() {
   return words;
 }
 
+// Whole-deck scan: every note of the deck (also those added from elsewhere) → word → progress.
+// `own` = ids of notes made by this extension (tag yt-anki-miner), `other` = count of foreign notes.
+async function ankiDeck(deck) {
+  const decks = await anki('deckNames');
+  const q = String(deck || '').replace(/"/g, '');
+  if (!q || !decks.includes(q)) return { ok: false, words: {} };
+  const ownSet = new Set(await anki('findNotes', { query: 'tag:yt-anki-miner' }));
+  const noteIds = await anki('findNotes', { query: `deck:"${q}"` });
+  const words = {};
+  for (let i = 0; i < noteIds.length; i += 400) {
+    const infos = await anki('notesInfo', { notes: noteIds.slice(i, i + 400) });
+    const byCard = new Map();
+    for (const n of infos) {
+      const fields = Object.entries(n.fields || {});
+      if (!fields.length) continue;
+      // Our note type has "Word"; foreign ones: field "Word"/"Front"/"Expression" or simply the first field.
+      const pick = fields.find(([k]) => /^(word|front|expression|term)$/i.test(k)) || fields.sort((a, b) => a[1].order - b[1].order)[0];
+      const w = unHtml(String(pick[1].value || '').replace(/\[sound:[^\]]*\]/g, ''));
+      if (!w || w.length > 60 || w.split(/\s+/).length > 5 || /[\n<]/.test(w)) continue;
+      const e = (words[w] = words[w] || { ivl: 0, reps: 0, own: [], other: 0 });
+      if (ownSet.has(n.noteId)) e.own.push(n.noteId); else e.other++;
+      for (const c of n.cards || []) byCard.set(c, w);
+    }
+    const cards = [...byCard.keys()];
+    if (!cards.length) continue;
+    for (const c of await anki('cardsInfo', { cards })) {
+      const w = byCard.get(c.cardId);
+      if (!w) continue;
+      words[w].ivl = Math.max(words[w].ivl, c.interval > 0 ? c.interval : 0);
+      words[w].reps = Math.max(words[w].reps, c.reps || 0);
+    }
+  }
+  return { ok: true, words, ownTotal: ownSet.size };
+}
+
+// Only notes made by the extension may ever be deleted (the user's own cards are protected).
+async function deleteOwnNotes(ids) {
+  if (!ids || !ids.length) return 0;
+  const infos = await anki('notesInfo', { notes: ids });
+  const ours = infos.filter((n) => n && (n.tags || []).includes('yt-anki-miner')).map((n) => n.noteId);
+  if (ours.length) await anki('deleteNotes', { notes: ours });
+  return ours.length;
+}
+
 // ---------- Local yt-dlp helper (helper/ytam_helper.py) ----------
 
 async function helperFetch(base, path) {
@@ -684,8 +850,37 @@ async function helperPcm({ url, v, start, end, rate, wait = 20 }) {
 
 // ---------- Messaging ----------
 
+// PCM (Int16 LE, base64) → MP3 (base64). Runs here so the video page never stalls while a card is made.
+function encodeMp3Bg({ pcm, rate, kbps }) {
+  if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('lamejs unavailable');
+  const bin = atob(pcm);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const samples = new Int16Array(bytes.buffer, 0, bytes.length >> 1);
+  const enc = new lamejs.Mp3Encoder(1, rate, kbps || 96);
+  const parts = [];
+  for (let i = 0; i < samples.length; i += 1152) {
+    const out = enc.encodeBuffer(samples.subarray(i, i + 1152));
+    if (out.length) parts.push(out);
+  }
+  const end = enc.flush();
+  if (end.length) parts.push(end);
+  const mp3 = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let o = 0;
+  for (const p of parts) { mp3.set(new Uint8Array(p.buffer, p.byteOffset, p.length), o); o += p.length; }
+  return { b64: bytesToB64(mp3) };
+}
+
 async function handle(msg) {
   switch (msg.type) {
+    case 'encodeMp3': return encodeMp3Bg(msg);
+    case 'cardVoice': {
+      const c = await cloudCfg();
+      const text = String(msg.text || '').slice(0, 600);
+      if (!(await cloudOk('tts', text.length))) throw new Error('нет ключа Google Cloud, озвучка выключена или достигнут предел');
+      return { b64: await cloudTts(text, msg.voice || c.ttsVoice, c.ttsRate, true) };
+    }
+    case 'aiTrim': return aiTrim(msg);
     case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
     case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
     case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl);
@@ -701,12 +896,14 @@ async function handle(msg) {
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);
     case 'ankiProgress': return ankiProgress();
-    case 'deleteNotes': return anki('deleteNotes', { notes: msg.ids });
+    case 'deleteNotes': return deleteOwnNotes(msg.ids);
+    case 'ankiDeck': return ankiDeck(msg.deck);
     case 'ankiStatus': {
-      const version = await anki('version');
-      const decks = await anki('deckNames');
-      return { version, decks };
+      const d = await ankiDiagnose();
+      if (!d.ok) throw new Error(d.steps.join(' · ') + (d.steps.some((x) => /403/.test(x)) ? ` — добавьте "${d.origin}" в webCorsOriginList AnkiConnect или запустите лончер` : ''));
+      return { version: d.version, decks: d.decks, steps: d.steps };
     }
+    case 'ankiDiagnose': return ankiDiagnose();
     case 'openOptions': return chrome.runtime.openOptionsPage();
     default: throw new Error('Unknown message ' + msg.type);
   }

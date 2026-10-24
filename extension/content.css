@@ -394,3 +394,11 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 .ytam-tip.passive { pointer-events: none; }
 .ytam-tip-xsave.ind { cursor: default; pointer-events: none; opacity: .5; }
 .ytam-tip-xsave.ind.on { opacity: 1; }
+
+.ytam-sbody { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ytam-ssrc { font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ytam-sdel.locked { cursor: help; opacity: .7; padding: 0 6px; }
+.ytam-sbody .ytam-stext { align-self: flex-start; }
+
+.ytam-wstat.o { color: #bbb; }
+.ytam-wgroup[hidden], .ytam-wg-words .ytam-w[hidden] { display: none !important; }

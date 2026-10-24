@@ -21,6 +21,8 @@
     shown: -1,
     lastAutoPause: -1,
     lastHoverPause: -1,
+    wt: null,
+    wtToken: 0,
     lineRect: null,
     token: 0,
     captured: new Map(), // videoId -> { url, body } of the player's own subtitle request
@@ -157,26 +159,51 @@
     document.querySelectorAll(sel).forEach(styleSpan);
   }
 
-  async function setWordStatus(w, st, silent) {
+  async function setWordStatus(w, st, silent, src) {
     const prev = S.vocab[w];
     if (st) S.vocab[w] = st; else delete S.vocab[w];
     if (w.includes(' ')) { renderList(); renderOverlay(); } else recolor(w);
-    if (st === 1 && prev !== 1) logSaved({ k: w, t: w.includes(' ') ? 'x' : 'w', text: w });
+    if (st === 1 && prev !== 1) logSaved(src ? { k: w, t: w.includes(' ') ? 'x' : 'w', text: w, ...src } : { k: w, t: w.includes(' ') ? 'x' : 'w', text: w, src: 'ext', title: S.title || '', vid: S.videoId || '' });
     if (prev === 1 && st !== 1) { if (silent) updateSaved((saved) => saved.filter((e) => e.k !== w)); else leftLearning(w, st); }
-    // Writes are serialized and always carry the in-memory state: rapid right-clicks used to race
-    // (stale read → stale write → storage listener flipped the word back).
-    vocabWrites++;
-    vocabChain = vocabChain.then(async () => {
-      try {
-        const { vocab = {} } = await chrome.storage.local.get('vocab');
-        if (S.vocab[w]) vocab[w] = S.vocab[w]; else delete vocab[w];
-        await chrome.storage.local.set({ vocab });
-      } catch (_) {}
-      vocabWrites--;
-    });
+    // Persistence is batched: a burst of toggles becomes ONE read-modify-write of the stored vocabulary,
+    // and it never blocks painting (the colour change above already happened).
+    vocabPatch.set(w, S.vocab[w] || 0);
+    scheduleVocabFlush();
     refreshSideTabs();
   }
-  let vocabChain = Promise.resolve(), vocabWrites = 0;
+
+  const vocabPatch = new Map();
+  let vocabTimer = 0, vocabChain = Promise.resolve(), vocabWrites = 0;
+  function scheduleVocabFlush() {
+    if (vocabTimer) return;
+    vocabWrites++;
+    vocabTimer = setTimeout(() => {
+      vocabTimer = 0;
+      const patch = [...vocabPatch];
+      vocabPatch.clear();
+      vocabChain = vocabChain.then(async () => {
+        try {
+          const { vocab = {} } = await chrome.storage.local.get('vocab');
+          for (const [k, st] of patch) { if (st) vocab[k] = st; else delete vocab[k]; }
+          await chrome.storage.local.set({ vocab });
+        } catch (_) {}
+      }).finally(() => { vocabWrites--; });
+    }, 250);
+  }
+
+  function flushVocabNow() {
+    if (!vocabTimer) return;
+    clearTimeout(vocabTimer);
+    vocabTimer = 0;
+    const patch = [...vocabPatch];
+    vocabPatch.clear();
+    chrome.storage.local.get('vocab').then(({ vocab = {} }) => {
+      for (const [k, st] of patch) { if (st) vocab[k] = st; else delete vocab[k]; }
+      return chrome.storage.local.set({ vocab });
+    }).catch(() => {}).finally(() => { vocabWrites = Math.max(0, vocabWrites - 1); });
+  }
+  window.addEventListener('pagehide', flushVocabNow);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) flushVocabNow(); });
 
   // Right / middle click (LR): learning ↔ known; anything else → learning.
   function toggleStatus(w, i, meaning) {
@@ -189,12 +216,29 @@
   // ---------- saved items & Anki sync ----------
   // chrome.storage.local.saved: [{ k, t: 'w'|'x'|'p', text, ts, ids: [noteId] }]
 
-  async function updateSaved(fn) {
-    const { saved = [] } = await chrome.storage.local.get('saved');
-    const out = fn(saved) || saved;
-    await chrome.storage.local.set({ saved: out.slice(0, 3000) });
-    S.savedList = out;
-    refreshSideTabs();
+  // Saved-list edits are batched too: every call in the same tick shares one read-modify-write.
+  let savedQueue = [], savedRunning = false;
+  function updateSaved(fn) {
+    return new Promise((resolve) => {
+      savedQueue.push({ fn, resolve });
+      if (!savedRunning) { savedRunning = true; setTimeout(runSavedQueue, 0); }
+    });
+  }
+
+  async function runSavedQueue() {
+    const batch = savedQueue;
+    savedQueue = [];
+    try {
+      let { saved = [] } = await chrome.storage.local.get('saved');
+      for (const { fn } of batch) { try { saved = fn(saved) || saved; } catch (e) { console.warn('[ytam] saved', e); } }
+      saved = saved.slice(0, 5000);
+      S.savedList = saved;
+      await chrome.storage.local.set({ saved });
+      refreshSideTabs();
+    } catch (_) {}
+    batch.forEach((b) => b.resolve());
+    savedRunning = false;
+    if (savedQueue.length) { savedRunning = true; setTimeout(runSavedQueue, 0); }
   }
 
   function logSaved(entry) {
@@ -224,12 +268,15 @@
   }
 
   async function scheduleAnkiDelete(k, st) {
-    const { saved = [], ankiDel = [] } = await chrome.storage.local.get(['saved', 'ankiDel']);
-    const e = saved.find((x) => x.k === k);
-    ankiDel.push({ k, st, ids: e ? e.ids || [] : [], due: Date.now() + X.ankiDeleteSec * 1000 });
-    await chrome.storage.local.set({ ankiDel, saved: saved.filter((x) => x.k !== k) });
-    S.savedList = saved.filter((x) => x.k !== k);
-    refreshSideTabs();
+    let ids = [];
+    await updateSaved((saved) => {
+      const e = saved.find((x) => x.k === k);
+      ids = e ? e.ids || [] : [];
+      return saved.filter((x) => x.k !== k);
+    });
+    const { ankiDel = [] } = await chrome.storage.local.get('ankiDel');
+    ankiDel.push({ k, st, ids, due: Date.now() + X.ankiDeleteSec * 1000 });
+    await chrome.storage.local.set({ ankiDel });
   }
 
   async function processAnkiDeletes() {
@@ -276,18 +323,54 @@
 
   async function syncAnki() {
     if (!settings.ankiSync) return;
-    let words;
-    try { words = await bg({ type: 'ankiProgress' }); } catch (_) { return; } // Anki closed: silently skip
+    const deckSync = settings.ankiDeckSync !== false;
+    let words, scan = null;
+    try {
+      if (deckSync) {
+        scan = await bg({ type: 'ankiDeck', deck: settings.deck || DEFAULTS.deck });
+        words = scan.ok ? scan.words : await bg({ type: 'ankiProgress' });
+        if (scan.ok) for (const info of Object.values(words)) info.notes = info.own;
+      } else words = await bg({ type: 'ankiProgress' });
+    } catch (_) { return; } // Anki closed: silently skip
     S.progress = {};
     const noteIds = {};
     for (const [w, info] of Object.entries(words)) {
       S.progress[w] = info.ivl;
-      noteIds[w] = info.notes;
+      noteIds[w] = info.notes || [];
     }
-    // Remember note ids (so the card can be deleted later) for words we track.
-    await updateSaved((saved) => {
-      for (const e of saved) if (noteIds[e.k]) e.ids = [...new Set([...(e.ids || []), ...noteIds[e.k]])];
-    });
+    if (scan && scan.ok) {
+      // The deck is authoritative: new words come in, vanished ones go out.
+      const now = Date.now();
+      const incoming = Object.entries(words).filter(([w]) => !S.vocab[w]);
+      const gone = new Set();
+      await updateSaved((saved) => {
+        const by = new Map(saved.map((e) => [e.k, e]));
+        for (const [w, info] of incoming) {
+          const own = info.own.length > 0;
+          S.vocab[w] = 1;
+          const entry = { k: w, t: w.includes(' ') ? 'x' : 'w', text: w, ids: [...info.own], ts: now, src: own ? 'ext' : 'deck', title: own ? 'Anki (карточка расширения)' : 'Колода Anki' };
+          if (!by.has(w)) saved.unshift(entry);
+        }
+        for (const e of saved) {
+          const info = words[e.k];
+          if (info && info.own.length) e.ids = [...new Set([...(e.ids || []), ...info.own])];
+          if (info && !info.own.length && !e.src) e.src = 'deck';
+          // Our note vanished from the deck → forget the word (not for fresh entries still in the outbox).
+          if (e.t !== 'p' && e.ids && e.ids.length && now - (e.ts || 0) > 120000 && !(info && info.own.length)) gone.add(e.k);
+        }
+        return saved.filter((e) => !gone.has(e.k));
+      });
+      if (incoming.length || gone.size) {
+        for (const k of gone) if (S.vocab[k] === 1) delete S.vocab[k];
+        try { await chrome.storage.local.set({ vocab: { ...S.vocab } }); } catch (_) {}
+        if (incoming.length + gone.size > 20) { renderList(); renderOverlay(); }
+      }
+    } else {
+      // Remember note ids (so the card can be deleted later) for words we track.
+      await updateSaved((saved) => {
+        for (const e of saved) if (noteIds[e.k]) e.ids = [...new Set([...(e.ids || []), ...noteIds[e.k]])];
+      });
+    }
     if (settings.ankiAutoKnown) {
       for (const [w, ivl] of Object.entries(S.progress)) {
         if (S.vocab[w] === 1 && ivl >= settings.ankiMatureDays) await setWordStatus(w, 2, true);
@@ -433,23 +516,58 @@
   }
 
   // Rule-based grouping of words into phrases.
+  // Regex "ends with one of these marks" (optionally followed by a closing quote/bracket).
+  const markCache = new Map();
+  function markRe(chars, fallback) {
+    const key = chars + '|' + fallback;
+    if (!markCache.has(key)) {
+      const src = String(chars || '').replace(/\s+/g, '') || fallback;
+      markCache.set(key, new RegExp('[' + src.replace(/[\\\]\[^-]/g, '\\$&') + ']["\')\\]»”]?$'));
+    }
+    return markCache.get(key);
+  }
+
   function segment(words, maxWords) {
+    const hard = markRe(settings.segHard, '.!?…');
+    const soft = markRe(settings.segSoft, ',;:—');
+    const softAt = Math.max(2, Math.round(maxWords * Math.min(100, Math.max(10, +settings.softRatio || 60)) / 100));
+    const maxChars = +settings.maxChars || 0;
     const cues = [];
-    let cur = [];
+    let cur = [], chars = 0;
     const flush = () => {
       if (!cur.length) return;
       cues.push({ start: cur[0].start, end: cur[cur.length - 1].end, text: cur.map((w) => w.text).join(' ') });
       cur = [];
+      chars = 0;
     };
     words.forEach((w, i) => {
       const next = words[i + 1];
       cur.push(w);
-      const sentenceEnd = /[.!?…]["')\]]?$/.test(w.text);
-      const clauseEnd = /[,;:—]$/.test(w.text);
+      chars += w.text.length + 1;
+      const sentenceEnd = hard.test(w.text);
+      const clauseEnd = soft.test(w.text);
       const gap = next ? next.start - w.end : Infinity;
-      if (!next || sentenceEnd || gap > X.segGap || cur.length >= maxWords || (clauseEnd && cur.length >= maxWords * X.clauseRatio)) flush();
+      if (!next || sentenceEnd || gap > X.segGap || cur.length >= maxWords || (maxChars && chars >= maxChars) || (clauseEnd && cur.length >= softAt)) flush();
     });
-    return cues;
+    return mergeShort(cues, maxWords, maxChars);
+  }
+
+  // Fragments shorter than minWords are glued to a neighbour when the pause is small and the result is not too long.
+  function mergeShort(cues, maxWords, maxChars) {
+    const min = +settings.minWords || 0;
+    if (min <= 1 || cues.length < 2) return cues;
+    const n = (c) => c.text.split(/\s+/).length;
+    const out = [];
+    for (const c of cues) {
+      const prev = out[out.length - 1];
+      const joinable = (a, b) => b.start - a.end <= X.segGap * 1.5 && n(a) + n(b) <= maxWords + 2 && (!maxChars || a.text.length + b.text.length + 1 <= maxChars)
+        && !markRe(settings.segHard, '.!?…').test(a.text);
+      if (prev && (n(c) < min || n(prev) < min) && joinable(prev, c)) {
+        prev.end = c.end;
+        prev.text += ' ' + c.text;
+      } else out.push({ ...c });
+    }
+    return out;
   }
 
   const normTok = (t) => t.toLowerCase().replace(/’/g, "'").replace(/[^\p{L}\p{N}']/gu, '');
@@ -1352,60 +1470,116 @@
     return `Ранг ${from} – ${from + size - 1}`;
   }
 
+  // Words tab: built once per track (in small slices, so a long video never freezes the page),
+  // afterwards only counters and the filter are refreshed — colours are updated by recolor().
   function renderWordsTab() {
+    const wt = S.wt;
+    if (!wt || wt.cues !== S.cues || !wt.root.isConnected) buildWordsTab(); else updateWordsTab();
+  }
+
+  const wGroup = (w) => S.vocab[w] === 1 ? 'l' : isKnown(w) ? 'k' : wordLevel(w).includes('ytam-rare') ? 'r' : 'o';
+
+  function buildWordsTab() {
+    const token = ++S.wtToken;
     const counts = new Map();
-    for (const c of S.cues) for (const t of tokensOf(c.text)) if (/\p{L}/u.test(t) && t.length > 0) counts.set(t, (counts.get(t) || 0) + 1);
+    for (const c of S.cues) for (const t of tokensOf(c.text)) if (/\p{L}/u.test(t)) counts.set(t, 1);
     const words = [...counts.keys()].sort((a, b) => rankOf(a) - rankOf(b) || a.localeCompare(b));
-    let known = 0, learning = 0, skip = 0;
-    for (const w of words) {
-      if (S.vocab[w] === 1) learning++;
-      else if (isKnown(w)) known++;
-      else if (wordLevel(w).includes('ytam-rare')) skip++;
-    }
-    const groups = new Map();
+    const byBucket = new Map();
     for (const w of words) {
       const b = bucketOf(rankOf(w));
-      if (!groups.has(b)) groups.set(b, []);
-      groups.get(b).push(w);
+      if (!byBucket.has(b)) byBucket.set(b, []);
+      byBucket.get(b).push(w);
     }
     const filt = S.wordFilter || (S.wordFilter = new Set());
-    const grpOf = (w) => S.vocab[w] === 1 ? 'l' : isKnown(w) ? 'k' : wordLevel(w).includes('ytam-rare') ? 'r' : 'o';
-    const stat = (icon, n, cls) => {
-      const s = h('span', { class: 'ytam-wstat ' + cls + (filt.has(cls) ? ' on' : ''), title: 'Фильтр (можно несколько)' });
-      s.innerHTML = ICON[icon]; s.append(' ' + n);
-      s.addEventListener('click', () => { filt.has(cls) ? filt.delete(cls) : filt.add(cls); renderWordsTab(); });
-      return s;
+    const chip = (icon, cls) => {
+      const el = h('span', { class: 'ytam-wstat ' + cls, title: 'Фильтр (можно несколько)' });
+      el.addEventListener('click', () => { filt.has(cls) ? filt.delete(cls) : filt.add(cls); updateWordsTab(); });
+      el.innerHTML = icon ? ICON[icon] : '';
+      const n = h('span');
+      el.append(' ', n);
+      return { el, n };
     };
-    const other = words.length - known - learning - skip;
-    const shown = (ws) => filt.size ? ws.filter((w) => filt.has(grpOf(w))) : ws;
-    ui.wordsPane.replaceChildren(
+    const chips = { k: chip('check', 'k'), l: chip('book', 'l'), r: chip('ban', 'r'), o: chip('', 'o') };
+    chips.o.el.prepend('др.');
+    const total = h('span', { class: 'ytam-wstat t' });
+    const groups = [...byBucket].map(([title, ws]) => {
+      const wordsEl = h('div', { class: 'ytam-wg-words' });
+      const el = h('div', { class: 'ytam-wgroup' }, h('div', { class: 'ytam-wg-title', text: title }), wordsEl);
+      return { el, wordsEl, ws, spans: [] };
+    });
+    const root = h('div', { class: 'ytam-wroot' },
       h('div', { class: 'ytam-whint', text: 'Слова этого видео по частоте · клик по значку — фильтр группы · ПКМ — отметить' }),
-      h('div', { class: 'ytam-wstats' }, stat('check', known, 'k'), stat('book', learning, 'l'), stat('ban', skip, 'r'),
-        h('span', { class: 'ytam-wstat t' + (filt.has('o') ? ' on' : ''), text: 'др. ' + other, onclick: () => { filt.has('o') ? filt.delete('o') : filt.add('o'); renderWordsTab(); } })),
-      ...[...groups].map(([title, ws]) => [title, shown(ws)]).filter(([, ws]) => ws.length).map(([title, ws]) => h('div', { class: 'ytam-wgroup' },
-        h('div', { class: 'ytam-wg-title', text: title }),
-        h('div', { class: 'ytam-wg-words' }, ws.map((w) => {
-          const s = h('span', { 'data-w': w, 'data-ti': '-1', text: w });
-          styleSpan(s);
-          return s;
-        })))));
+      h('div', { class: 'ytam-wstats' }, chips.k.el, chips.l.el, chips.r.el, chips.o.el, total),
+      ...groups.map((g) => g.el));
+    ui.wordsPane.replaceChildren(root);
+    S.wt = { cues: S.cues, root, words, groups, chips, total, token };
+
+    // Fill the groups in slices of ~250 words.
+    let gi = 0, wi = 0;
+    const slice = () => {
+      if (S.wt.token !== token || !root.isConnected) return;
+      let n = 0;
+      while (gi < groups.length && n < 250) {
+        const g = groups[gi];
+        if (wi >= g.ws.length) { gi++; wi = 0; continue; }
+        const w = g.ws[wi++];
+        const sp = h('span', { 'data-w': w, 'data-ti': '-1', text: w });
+        styleSpan(sp);
+        if (filt.size && !filt.has(wGroup(w))) sp.hidden = true;
+        g.spans.push(sp);
+        g.wordsEl.append(sp);
+        n++;
+      }
+      if (gi < groups.length) setTimeout(slice, 0); else updateWordsTab();
+    };
+    updateWordsTab();
+    slice();
+  }
+
+  function updateWordsTab() {
+    const wt = S.wt;
+    if (!wt || !wt.root.isConnected) return;
+    const filt = S.wordFilter;
+    const cnt = { k: 0, l: 0, r: 0, o: 0 };
+    for (const g of wt.groups) {
+      let vis = 0;
+      for (const w of g.ws) cnt[wGroup(w)]++;
+      for (const sp of g.spans) {
+        const show = !filt.size || filt.has(wGroup(sp.dataset.w));
+        if (sp.hidden === show) sp.hidden = !show;
+        if (show) vis++;
+      }
+      g.el.hidden = filt.size > 0 && g.spans.length > 0 && vis === 0;
+    }
+    for (const k of Object.keys(wt.chips)) {
+      wt.chips[k].n.textContent = String(cnt[k]);
+      wt.chips[k].el.classList.toggle('on', filt.has(k));
+    }
+    wt.total.textContent = '/ ' + wt.words.length;
   }
 
   function renderSavedTab() {
     const items = (S.savedList || []).filter((e) => e.t === 'p' || S.vocab[e.k] === 1);
+    const mine = (e) => e.src !== 'deck';
     ui.savedPane.replaceChildren(
-      h('div', { class: 'ytam-whint', text: `Сохранено: ${items.length} · 🗑 — убрать из списка` + (settings.ankiDeleteOnRemove ? ` (карточка удалится из Anki через ${X.ankiDeleteSec} с)` : ' (карточка в Anki остаётся)') }),
+      h('div', { class: 'ytam-whint', text: `Сохранено: ${items.length} · 🗑 — убрать вместе с карточкой Anki (через ${X.ankiDeleteSec} с)` }),
       ...items.slice(0, 400).map((e) => {
-        const del = svgBtn('ytam-sdel', 'trash', 'Убрать', () => {
-          if (e.t === 'p') {
-            scheduleAnkiDelete(e.k);
-            const c = S.cues.find((x) => `p:${S.videoId}:${x.start.toFixed(1)}` === e.k);
-            if (c) { S.saved.delete(savedKey(c)); markRow(c, 'ytam-saved', false); }
-          } else setWordStatus(e.k, 0);
-        });
+        const del = mine(e)
+          ? svgBtn('ytam-sdel', 'trash', 'Убрать из списка и удалить карточку из Anki', async () => {
+            await scheduleAnkiDelete(e.k); // explicit removal: the card goes too (only notes made by the extension)
+            if (e.t === 'p') {
+              const c = S.cues.find((x) => `p:${S.videoId}:${x.start.toFixed(1)}` === e.k);
+              if (c) { S.saved.delete(savedKey(c)); markRow(c, 'ytam-saved', false); }
+            } else setWordStatus(e.k, 0, true); // back to its level colour (known / recommended / rare)
+            toast(`Убрано: ${e.text.slice(0, 40)}`);
+          })
+          : h('span', { class: 'ytam-sdel locked', title: 'Карточка добавлена не расширением — удалить можно только в самом Anki', text: '🔒' });
+        const from = e.src === 'deck' ? 'колода Anki' : (e.title || (e.vid ? 'youtu.be/' + e.vid : 'расширение'));
         return h('div', { class: 'ytam-sitem' },
           h('span', { class: 'ytam-badge ' + e.t, text: e.t === 'p' ? 'p' : e.t === 'x' ? 'x' : 'w' }),
-          h('span', { class: 'ytam-stext' + (e.t === 'p' ? '' : ' ytam-learning'), text: e.text }),
+          h('div', { class: 'ytam-sbody' },
+            h('span', { class: 'ytam-stext' + (e.t === 'p' ? '' : ' ytam-learning'), text: e.text }),
+            h('div', { class: 'ytam-ssrc', title: from, text: (e.src === 'deck' ? '📚 ' : '▶ ') + from })),
           del);
       }));
   }
@@ -1428,7 +1602,7 @@
   function renderDevTab() {
     if (ui.devPane.dataset.built) { syncDev(); return; }
     ui.devPane.dataset.built = '1';
-    const info = h('div', { class: 'ytam-dev-info', text: 'Меняйте значения — применяются сразу. «▶ Клип» — прослушать, как будет звучать карточка текущей фразы.' });
+    const info = h('div', { class: 'ytam-dev-info', text: 'Версия ' + chrome.runtime.getManifest().version + '. Меняйте значения — применяются сразу. «▶ Клип» — прослушать, как будет звучать карточка текущей фразы.' });
     const btn = (text, onclick, title) => h('button', { class: 'ytam-dbtn', text, onclick, title });
     const top = h('div', { class: 'ytam-dev-top' },
       btn('▶ Клип текущей фразы', () => testClip(info)),
@@ -1473,7 +1647,7 @@
       if (!ext || ext.cov < 0.05) { info.textContent = 'Нет звука: фраза ещё не звучала, а помощник yt-dlp не запущен.'; return; }
       const pcm = trimClip(ext, cue.start + item.shift, cue.end + item.shift);
       const last = trimClip.last;
-      const b64 = encodeMp3(pcm, ext.rate);
+      const b64 = await encodeMp3Async(pcm, ext.rate);
       new Audio('data:audio/mpeg;base64,' + b64).play();
       const f = (t) => t.toFixed(2);
       info.textContent = `Источник: ${ext.src} · фраза YouTube ${f(cue.start)}–${f(cue.end)} · клип ${f(last.start)}–${f(last.end)} ` +
@@ -2199,6 +2373,16 @@
     return btoa(s);
   }
 
+  // MP3 in the background script (no jank); the in-page encoder is only a fallback.
+  async function encodeMp3Async(pcm, rate) {
+    try {
+      const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const r = await bg({ type: 'encodeMp3', pcm: toBase64(bytes), rate, kbps: X.mp3Kbps });
+      if (r && r.b64) return r.b64;
+    } catch (_) {}
+    return encodeMp3(pcm, rate);
+  }
+
   function encodeMp3(pcm, rate) {
     const enc = new lamejs.Mp3Encoder(1, rate, X.mp3Kbps);
     const parts = [];
@@ -2214,6 +2398,7 @@
     return toBase64(out);
   }
 
+  // The frame is grabbed at once (a cheap downscaled copy); JPEG compression happens later, off the click path.
   function snapshot(v) {
     try {
       if (!v || !v.videoWidth) return null;
@@ -2222,10 +2407,23 @@
       c.width = Math.round(v.videoWidth * scale);
       c.height = Math.round(v.videoHeight * scale);
       c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-      return c.toDataURL('image/jpeg', X.jpegQuality).split(',')[1];
+      return c;
     } catch (_) {
       return null;
     }
+  }
+
+  function canvasToB64(c) {
+    if (!c) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      c.toBlob((blob) => {
+        if (!blob) return resolve(null);
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(',')[1] || null);
+        r.onerror = () => resolve(null);
+        r.readAsDataURL(blob);
+      }, 'image/jpeg', X.jpegQuality);
+    });
   }
 
   // ---------- audio source: yt-dlp helper (clean) or in-page capture (fallback) ----------
@@ -2302,7 +2500,7 @@
     if (!cue) return;
     const key = wordInfo ? norm(wordInfo.word) : `p:${S.videoId}:${cue.start.toFixed(1)}`;
     if (S.pending.some((p) => p.key === key && p.cue.start === cue.start)) return;
-    if (!wordInfo) logSaved({ k: key, t: 'p', text: cue.text });
+    if (!wordInfo) logSaved({ k: key, t: 'p', text: cue.text, src: 'ext', title: S.title || '', vid: S.videoId || '' });
     const v = getVideo();
     const near = v && v.currentTime > cue.start - 1 && v.currentTime < cue.end + 1.5;
     S.pending.push({
@@ -2336,7 +2534,7 @@
     for (const item of [...S.pending]) {
       const age = Date.now() - item.queuedAt;
       // With the yt-dlp launcher the audio does not depend on playback: ready at once.
-      let ready = force || !settings.includeAudio || helperUsable(item.videoId);
+      let ready = force || !settings.includeAudio || settings.cardVoiceMode === 'only' || helperUsable(item.videoId);
       if (!ready) {
         // Capture path: the phrase itself must have been heard. Its tail is waited for only while
         // playback runs; on pause (hover, popup) we go with what we have after a moment.
@@ -2358,17 +2556,136 @@
     }
   }
 
+  // ---------- card text: long phrases are trimmed in the background ----------
+
+  // Start/end time of every whitespace token of the cue, taken from the timed caption words.
+  function cueTokenTimes(cue, videoId) {
+    const toks = cue.text.split(/\s+/).filter(Boolean);
+    if (videoId !== S.videoId || !S.words || !S.words.length || !toks.length) return null;
+    const lo = cue.start - 0.6, hi = cue.end + 0.6;
+    const ws = S.words.filter((w) => w.end >= lo && w.start <= hi);
+    const W = ws.map((w) => normTok(w.text));
+    const times = new Array(toks.length).fill(null);
+    let q = 0, hits = 0;
+    toks.forEach((t, i) => {
+      const nt = normTok(t);
+      if (!nt) return;
+      for (let j = q; j < Math.min(W.length, q + 5); j++) {
+        if (W[j] === nt) { times[i] = [ws[j].start, ws[j].end]; q = j + 1; hits++; break; }
+      }
+    });
+    if (hits < toks.length * 0.6) return null; // timings do not fit this text: do not guess
+    // Unmatched tokens: spread evenly between their known neighbours.
+    for (let i = 0; i < toks.length; i++) {
+      if (times[i]) continue;
+      let j = i;
+      while (j < toks.length && !times[j]) j++;
+      const t0 = i > 0 ? times[i - 1][1] : cue.start;
+      const t1 = j < toks.length ? times[j][0] : cue.end;
+      const step = (t1 - t0) / (j - i);
+      for (let k = i; k < j; k++) times[k] = [t0 + step * (k - i), t0 + step * (k - i + 1)];
+      i = j;
+    }
+    return { toks, times };
+  }
+
+  // Position of the target word / phrase inside the cue tokens.
+  function targetRange(toks, text) {
+    const want = String(text || '').split(/\s+/).map(normTok).filter(Boolean);
+    if (!want.length) return null;
+    const T = toks.map(normTok);
+    for (let i = 0; i + want.length <= T.length; i++) {
+      if (want.every((w, k) => T[i + k] === w)) return { a: i, b: i + want.length - 1 };
+    }
+    return null;
+  }
+
+  // Best window of at most `max` tokens that contains the target and starts/ends at natural boundaries.
+  function trimRules(toks, tgt, max) {
+    const n = toks.length;
+    if (n <= max) return { a: 0, b: n - 1 };
+    const hard = markRe(settings.segHard, '.!?…'), soft = markRe(settings.segSoft, ',;:—');
+    const endQ = (i) => (i >= n - 1 || hard.test(toks[i]) ? 3 : soft.test(toks[i]) ? 2 : 0);
+    const startQ = (i) => (i <= 0 || hard.test(toks[i - 1]) ? 3 : soft.test(toks[i - 1]) ? 2 : 0);
+    const t0 = tgt ? tgt.a : 0, t1 = tgt ? tgt.b : 0;
+    let best = null;
+    for (let a = Math.max(0, t1 - max + 1); a <= t0 && a < n; a++) {
+      for (let b = Math.max(t1, a + Math.min(3, max) - 1); b < n && b - a + 1 <= max; b++) {
+        const mid = tgt ? Math.abs((a + b) / 2 - (t0 + t1) / 2) / max : 0;
+        const score = startQ(a) * 3 + endQ(b) * 3 + (b - a + 1) / max * 2 - mid;
+        if (!best || score > best.score) best = { a, b, score };
+      }
+    }
+    return best ? { a: best.a, b: best.b } : { a: 0, b: Math.min(n, max) - 1 };
+  }
+
+  // The phrase that goes into the card: possibly a shorter excerpt (never blocks playback: runs while you watch).
+  async function trimForCard(item) {
+    const full = { start: item.cue.start, end: item.cue.end, text: item.cue.text, trimmed: false };
+    const max = +settings.cardMaxWords || 0;
+    const mode = settings.cardTrim;
+    if (mode === 'off' || !max) return full;
+    const info = cueTokenTimes(item.cue, item.videoId);
+    if (!info || info.toks.length <= max) return full;
+    const { toks, times } = info;
+    const tgt = targetRange(toks, item.hl || item.word);
+    let range = null, tr = null;
+    if (mode === 'ai') {
+      try {
+        const r = await bg({ type: 'aiTrim', sentence: item.cue.text, word: item.hl || item.word || '', max, tl: settings.targetLang, model: settings.aiFastModel });
+        const ex = String(r.s || '').split(/\s+/).map(normTok).filter(Boolean);
+        const T = toks.map(normTok);
+        for (let i = 0; ex.length && i + ex.length <= T.length; i++) {
+          if (ex.every((w, k) => T[i + k] === w)) { range = { a: i, b: i + ex.length - 1 }; break; }
+        }
+        if (range && (range.b - range.a + 1 > max + 2 || (tgt && (tgt.a < range.a || tgt.b > range.b)))) range = null; // must stay short and keep the word
+        if (range) tr = r.t || null;
+      } catch (_) { /* no key / offline → rules */ }
+    }
+    if (!range) range = trimRules(toks, tgt, max);
+    if (range.a === 0 && range.b === toks.length - 1) return full;
+    return { start: times[range.a][0], end: Math.max(times[range.b][1], times[range.a][0] + 0.3), text: toks.slice(range.a, range.b + 1).join(' '), trimmed: true, t: tr };
+  }
+
+  // Which cards get the AI voice: "ratio" is exact (accumulator), voices rotate round the list.
+  async function voiceTurn() {
+    const mode = settings.cardVoiceMode;
+    if (!mode || mode === 'off') return null;
+    const st = await chrome.storage.local.get({ voiceAcc: 0, voiceN: 0 });
+    let use = mode === 'only' || mode === 'both', acc = st.voiceAcc;
+    if (mode === 'ratio') {
+      acc += Math.min(100, Math.max(0, +settings.cardVoiceRatio || 0));
+      use = acc >= 100;
+      if (use) acc -= 100;
+    }
+    if (!use) { await chrome.storage.local.set({ voiceAcc: acc }); return null; }
+    const voices = String(settings.cardVoices || settings.ttsVoice || '').split(/[,\n]/).map((v) => v.trim()).filter(Boolean);
+    const voice = voices.length ? voices[st.voiceN % voices.length] : settings.ttsVoice;
+    await chrome.storage.local.set({ voiceAcc: acc, voiceN: st.voiceN + 1 });
+    return { voice, into: mode !== 'both' };
+  }
+
   async function finalizeCard(item) {
     const { cue } = item;
     try {
-      let audio = null;
-      if (settings.includeAudio) {
-        const ext = await clipAudio(item);
-        if (ext && coreCoverage(ext, cue.start + item.shift, cue.end + item.shift) >= Math.min(X.minCov, 0.9)) audio = encodeMp3(trimClip(ext, cue.start + item.shift, cue.end + item.shift), ext.rate);
+      const card = await trimForCard(item);              // shorter excerpt for long phrases (or the whole phrase)
+      const part = card.trimmed ? { ...item, cue: { start: card.start, end: card.end, text: card.text } } : item;
+      const turn = await voiceTurn();
+      let voice = null;
+      if (turn) {
+        try { voice = (await bg({ type: 'cardVoice', text: card.text, voice: turn.voice })).b64; }
+        catch (e) { toast('Голос ИИ недоступен: ' + e.message, 'warn', 4000); }
       }
-      let translation = item.translation;
+      let audio = null, audioAI = null;
+      if (voice && turn.into) audio = voice; else if (voice) audioAI = voice;
+      if (settings.includeAudio && !audio) {
+        const ext = await clipAudio(part);
+        const cs = part.cue.start + item.shift, ce = part.cue.end + item.shift;
+        if (ext && coreCoverage(ext, cs, ce) >= Math.min(X.minCov, 0.9)) audio = await encodeMp3Async(trimClip(ext, cs, ce), ext.rate);
+      }
+      let translation = card.trimmed ? card.t : item.translation;
       if (translation == null) {
-        try { translation = (await bg({ type: 'translateLines', lines: [cue.text], tl: settings.targetLang }))[0]; } catch (_) { translation = ''; }
+        try { translation = (await bg({ type: 'translateLines', lines: [card.text], tl: settings.targetLang }))[0]; } catch (_) { translation = ''; }
       }
       let meaning = item.meaning;
       if (item.word && item.expr && !meaning) {
@@ -2388,13 +2705,14 @@
           deck: settings.deck || DEFAULTS.deck,
           videoId: item.videoId,
           title: item.title,
-          start: cue.start,
-          sentenceHtml: highlight(cue.text, item.hl || item.word),
+          start: card.start,
+          sentenceHtml: highlight(card.text, item.hl || item.word),
           translation,
           word: item.word,
           wordMeaning: meaning,
           audio,
-          image: item.image,
+          audioAI,
+          image: await canvasToB64(item.image),
         },
       });
       if (res.queued) {
@@ -2433,6 +2751,7 @@
     if (!S.videoId) return;
     const v = getVideo();
     if (!v) return;
+    if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastHoverPause = -1; }); }
     tapEnsure(v);
     if (++pendingTick % 5 === 0) processPending(false);
     if (!ui) return;
@@ -2441,7 +2760,7 @@
     const t = v.currentTime - X.subShift;
     const a = cueIndexAt(t);
     updateHud(v, t, a);
-    if (a !== S.active) { setActiveRow(a); S.active = a; prefetchAround(a); }
+    if (a !== S.active) { setActiveRow(a); S.active = a; S.lastHoverPause = -1; prefetchAround(a); }
     const c = S.cues[a];
     const next = S.cues[a + 1];
     const endT = c ? Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly) : 0;
@@ -2659,7 +2978,7 @@
     onNavigate();
   });
 
-  const RELOAD_KEYS = ['aiMode', 'aiProvider', 'aiBaseUrl', 'aiModel', 'maxWords', 'targetLang'];
+  const RELOAD_KEYS = ['aiMode', 'aiProvider', 'aiBaseUrl', 'aiModel', 'maxWords', 'minWords', 'maxChars', 'softRatio', 'segHard', 'segSoft', 'targetLang'];
   const RERENDER_KEYS = ['vocabSize', 'suggestedRatio', 'hlKnown', 'hlLearning', 'hlLearnText', 'hlNext', 'hlRare', 'builtinExpr'];
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {

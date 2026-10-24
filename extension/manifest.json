@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "6.3.0",
+  "version": "7.0.0",
+  "version_name": "7.0 — устойчивый Anki, быстрые статусы",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",

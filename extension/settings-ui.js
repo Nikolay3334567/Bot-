@@ -22,6 +22,9 @@
     });
   }
 
+  const verEl = document.getElementById('ver');
+  if (verEl) verEl.textContent = 'v' + chrome.runtime.getManifest().version;
+
   self.ytamCheckAnki = (statusEl, datalist) => {
     statusEl.className = '';
     statusEl.textContent = '…';
