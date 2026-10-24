@@ -507,15 +507,20 @@ const ANKI_BUSY = /collection is not available|not ready|busy|database is locked
 
 async function ankiRoutes() {
   const c = await chrome.storage.sync.get({ ankiUrl: 'http://127.0.0.1:8765', helperUrl: 'http://127.0.0.1:8766' });
-  const list = [];
-  for (const u of [c.ankiUrl, 'http://127.0.0.1:8765', 'http://localhost:8765']) {
-    const url = String(u || '').trim().replace(/\/+$/, '');
-    if (url && !list.some((r) => r.url === url)) list.push({ kind: 'direct', url });
-  }
+  const { ankiRouteOk } = await chrome.storage.local.get({ ankiRouteOk: '' });
+  const direct = [];
+  const add = (u) => { u = String(u || '').trim().replace(/\/+$/, ''); if (u && !direct.includes(u)) direct.push(u); };
+  // The configured address first, then the usual alternatives (AnkiConnect may have been moved off 8765,
+  // e.g. when Windows reserves that port: "WinError 10013").
+  add(c.ankiUrl);
+  for (const p of [8765, 18765, 28765]) add(`http://127.0.0.1:${p}`);
+  add('http://localhost:8765');
+  const list = direct.map((url) => ({ kind: 'direct', url }));
   const proxy = String(c.helperUrl || '').trim().replace(/\/+$/, '');
-  if (proxy) list.push({ kind: 'proxy', url: proxy + '/anki', port: (/:(\d+)\/?$/.exec(c.ankiUrl || '') || [])[1] || '8765' });
-  if (ankiRoute) {
-    const i = list.findIndex((r) => r.url === ankiRoute);
+  if (proxy) list.push({ kind: 'proxy', url: proxy + '/anki', port: (/:(\d+)\/?$/.exec(c.ankiUrl || '') || [])[1] || '' });
+  const first = ankiRoute || ankiRouteOk;
+  if (first) {
+    const i = list.findIndex((r) => r.url === first);
     if (i > 0) list.unshift(list.splice(i, 1)[0]);
   }
   return list;
@@ -527,7 +532,7 @@ async function ankiPost(route, body, timeoutMs) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const headers = route.kind === 'proxy' ? { 'X-YTAM': '1', 'X-Anki-Port': route.port } : {};
+    const headers = route.kind === 'proxy' ? { 'X-YTAM': '1', ...(route.port && route.port !== '8765' ? { 'X-Anki-Port': route.port } : {}) } : {};
     const r = await fetch(route.url, { method: 'POST', body, headers, signal: ctl.signal, cache: 'no-store' });
     if (!r.ok) throw new AnkiHttpError(r.status, await r.text().catch(() => ''));
     return await r.json();
@@ -539,11 +544,13 @@ async function anki(action, params = {}, opts = {}) {
   const timeoutMs = opts.timeout || (action === 'storeMediaFile' ? 60000 : 15000);
   const body = JSON.stringify({ action, version: 6, params, ...(ankiKey ? { key: ankiKey } : {}) });
   let lastErr = null, reached = false;
-  for (const route of await ankiRoutes()) {
+  const routes = await ankiRoutes();
+  for (let ri = 0; ri < routes.length; ri++) {
+    const route = routes[ri];
     for (let attempt = 0; attempt < 4; attempt++) {
       let j;
       try {
-        j = await ankiPost(route, body, timeoutMs);
+        j = await ankiPost(route, body, ri === 0 ? timeoutMs : Math.min(timeoutMs, 4000));
       } catch (e) {
         lastErr = e;
         if (e instanceof AnkiHttpError) {
@@ -565,7 +572,7 @@ async function anki(action, params = {}, opts = {}) {
         if (ANKI_BUSY.test(err) && attempt < 3) { await sleep(700 * (attempt + 1)); continue; }
         throw new Error('Anki: ' + err);
       }
-      ankiRoute = route.url;
+      if (ankiRoute !== route.url) { ankiRoute = route.url; chrome.storage.local.set({ ankiRouteOk: route.url }).catch(() => {}); }
       return j && typeof j === 'object' && 'result' in j ? j.result : j; // very old AnkiConnect returns the bare result
     }
   }
@@ -573,7 +580,7 @@ async function anki(action, params = {}, opts = {}) {
     const origin = chrome.runtime.getURL('').replace(/\/$/, '');
     throw new Error(`Anki отклонил запрос (HTTP ${lastErr.status}). В Anki: Инструменты → Дополнения → AnkiConnect → Config → в "webCorsOriginList" добавьте "${origin}" (или "*"), перезапустите Anki. Либо запустите лончер — он обходит это ограничение.`);
   }
-  throw new Error('Нет связи с Anki. Откройте Anki и проверьте, что установлен AnkiConnect (код 2055492159).');
+  throw new Error('Нет связи с Anki. Откройте Anki и проверьте, что установлен AnkiConnect (код 2055492159). Если при запуске Anki появляется окно «WinError 10013» — запустите лончер и на его странице нажмите «Исправить порт AnkiConnect».');
 }
 
 // Step-by-step connection report for the settings screen.
@@ -895,6 +902,7 @@ async function handle(msg) {
     case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);
+    case 'helperProgress': return (await helperFetch(msg.url, `/progress?v=${encodeURIComponent(msg.v)}&t=${Math.round((msg.t || 0) * 10) / 10}&title=${encodeURIComponent(String(msg.title || '').slice(0, 150))}`)).json();
     case 'ankiProgress': return ankiProgress();
     case 'deleteNotes': return deleteOwnNotes(msg.ids);
     case 'ankiDeck': return ankiDeck(msg.deck);

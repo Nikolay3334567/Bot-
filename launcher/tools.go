@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -144,8 +145,11 @@ func ensureYtdlp() (string, error) {
 }
 
 func ensureFfmpeg() (string, error) {
-	if p := findTool(cfg.FfmpegPath, "ffmpeg"); p != "" {
-		return p, nil
+	for _, p := range findTools(cfg.FfmpegPath, "ffmpeg") { // a broken / half-downloaded ffmpeg.exe is skipped
+		if toolVersionRun(p, "-version") != "?" {
+			return p, nil
+		}
+		logf("ffmpeg %s не запускается — пропускаю", p)
 	}
 	if !cfg.AutoDownload {
 		return "", errors.New("ffmpeg не найден. Положите ffmpeg.exe рядом с лончером (или в папку bin) либо включите autoDownload")
@@ -205,10 +209,30 @@ func unzipFile(zipPath, suffix, dest string) error {
 	return errors.New("в архиве нет " + suffix)
 }
 
+var (
+	verCache = map[string]string{}
+	verMu    sync.Mutex
+)
+
+// toolVersion runs `tool --version` once per path (the status page polls every 2 s).
 func toolVersion(path string, arg string) string {
 	if path == "" {
 		return ""
 	}
+	verMu.Lock()
+	v, ok := verCache[path+arg]
+	verMu.Unlock()
+	if ok && v != "?" {
+		return v
+	}
+	v = toolVersionRun(path, arg)
+	verMu.Lock()
+	verCache[path+arg] = v
+	verMu.Unlock()
+	return v
+}
+
+func toolVersionRun(path string, arg string) string {
 	cmd := exec.Command(path, arg)
 	hide(cmd)
 	out, err := cmd.Output()
@@ -250,16 +274,25 @@ func findAnki() string {
 	return ""
 }
 
+// ankiConnectUp asks AnkiConnect for its version on the configured port (and the usual alternatives).
 func ankiConnectUp() (bool, string) {
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
-	resp, err := client.Post("http://127.0.0.1:8765", "application/json", strings.NewReader(`{"action":"version","version":6}`))
-	if err != nil {
-		return false, ""
+	client := &http.Client{Timeout: 1200 * time.Millisecond}
+	for _, port := range ankiPorts() {
+		resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d", port), "application/json", strings.NewReader(`{"action":"version","version":6}`))
+		if err != nil {
+			continue
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			ankiLive = port
+			return true, string(b)
+		}
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return true, string(b)
+	return false, ""
 }
+
+var ankiLive int // the port AnkiConnect answered on last time
 
 func startAnki() error {
 	if up, _ := ankiConnectUp(); up {

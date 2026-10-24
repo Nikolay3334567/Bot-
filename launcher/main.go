@@ -31,19 +31,25 @@ import (
 var assets embed.FS
 
 type Config struct {
-	Port         int      `json:"port"`
-	LaunchAnki   bool     `json:"launchAnki"`
-	AnkiPath     string   `json:"ankiPath"`
-	AutoDownload bool     `json:"autoDownload"`
-	YtdlpPath    string   `json:"ytdlpPath"`
-	FfmpegPath   string   `json:"ffmpegPath"`
-	YtdlpArgs    []string `json:"ytdlpArgs"`
-	KeepFiles    int      `json:"keepFiles"`
-	OpenStatus   bool     `json:"openStatusPage"`
+	Port          int      `json:"port"`
+	LaunchAnki    bool     `json:"launchAnki"`
+	AnkiPath      string   `json:"ankiPath"`
+	AutoDownload  bool     `json:"autoDownload"`
+	YtdlpPath     string   `json:"ytdlpPath"`
+	FfmpegPath    string   `json:"ffmpegPath"`
+	YtdlpArgs     []string `json:"ytdlpArgs"`
+	KeepFiles     int      `json:"keepFiles"`
+	OpenStatus    bool     `json:"openStatusPage"`
+	AnkiPort      int      `json:"ankiPort"`
+	OpenChrome    bool     `json:"openChrome"`
+	ChromePath    string   `json:"chromePath"`
+	ChromeProfile string   `json:"chromeProfile"`
+	ChromeMode    string   `json:"chromeMode"` // last | home | custom
+	ChromeURL     string   `json:"chromeUrl"`
 }
 
 var (
-	cfg     = Config{Port: 8766, LaunchAnki: true, AutoDownload: true, KeepFiles: 40, OpenStatus: true}
+	cfg     = Config{Port: 8766, LaunchAnki: true, AutoDownload: true, KeepFiles: 40, OpenStatus: true, AnkiPort: 8765, ChromeMode: "last"}
 	appDir  string
 	cache   string
 	logMu   sync.Mutex
@@ -314,7 +320,8 @@ func status() map[string]any {
 		"ok": true, "os": runtime.GOOS + "/" + runtime.GOARCH,
 		"ytdlp": yt, "ytdlpVersion": toolVersion(yt, "--version"),
 		"ffmpeg": ff, "ffmpegVersion": toolVersion(ff, "-version"),
-		"ankiConnect": up, "ankiPath": findAnki(),
+		"ankiConnect": up, "ankiPath": findAnki(), "ankiPort": cfg.AnkiPort, "ankiLivePort": ankiLive,
+		"chrome": chromeExe(), "last": lastCopy(),
 		"autostart": autostartEnabled(), "config": cfg, "cache": cache, "cacheMB": size / 1024 / 1024,
 		"jobs": active, "log": lines,
 	}
@@ -352,6 +359,41 @@ func api(w http.ResponseWriter, r *http.Request) {
 			out, err := cmd.CombinedOutput()
 			logf("yt-dlp -U: %s (%v)", strings.TrimSpace(string(out)), err)
 		}()
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	case "chrome-profiles":
+		writeJSON(w, 200, map[string]any{"profiles": chromeProfiles(), "current": chromeProfileDir(), "chrome": chromeExe(), "target": chromeTarget()})
+	case "open-chrome":
+		if err := openChrome(); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	case "shortcut":
+		p, err := createShortcut()
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]string{"ok": "1", "path": p})
+	case "port-diag":
+		res := []map[string]any{}
+		for _, p := range ankiPorts() {
+			res = append(res, portDiag(p))
+		}
+		writeJSON(w, 200, map[string]any{"ports": res, "meta": ankiMetaPath()})
+	case "fix-anki-port":
+		port, _ := strconv.Atoi(r.URL.Query().Get("port"))
+		p, err := fixAnkiPort(port)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "port": p})
+	case "restart-anki":
+		if err := restartAnki(); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case "start-anki":
 		if err := startAnki(); err != nil {
@@ -394,6 +436,14 @@ func api(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func portStrings(p []int) []string {
+	out := make([]string, len(p))
+	for i, n := range p {
+		out[i] = strconv.Itoa(n)
+	}
+	return out
+}
+
 func handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -419,17 +469,29 @@ func handler() http.Handler {
 			return
 		}
 		port := r.Header.Get("X-Anki-Port")
-		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			port = "8765"
+		if n, err := strconv.Atoi(port); err != nil || n < 1024 || n > 65535 {
+			port = strconv.Itoa(cfg.AnkiPort)
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 128<<20))
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
-		req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port, bytes.NewReader(body))
-		resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
-		if err != nil {
+		// The requested port first, then the one that last answered, then the usual alternatives.
+		var resp *http.Response
+		tried := map[string]bool{}
+		for _, p := range append([]string{port, strconv.Itoa(ankiLive)}, portStrings(ankiPorts())...) {
+			if p == "0" || tried[p] {
+				continue
+			}
+			tried[p] = true
+			req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+p, bytes.NewReader(body))
+			resp, err = (&http.Client{Timeout: 90 * time.Second}).Do(req)
+			if err == nil {
+				break
+			}
+		}
+		if resp == nil || err != nil {
 			writeJSON(w, 502, map[string]string{"error": "Anki не отвечает: " + err.Error()})
 			return
 		}
@@ -438,9 +500,20 @@ func handler() http.Handler {
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 	})
+	// The extension reports where the user is: the launcher can reopen exactly that video later.
+	mux.HandleFunc("/progress", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		t, _ := strconv.ParseFloat(q.Get("t"), 64)
+		title := q.Get("title")
+		if len(title) > 200 {
+			title = title[:200]
+		}
+		recordLast(q.Get("v"), t, title)
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	})
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		s := status()
-		writeJSON(w, 200, map[string]any{"ok": true, "ytdlp": s["ytdlpVersion"], "ffmpeg": s["ffmpeg"] != "", "ankiConnect": s["ankiConnect"], "cache": cache})
+		writeJSON(w, 200, map[string]any{"ok": true, "ytdlp": s["ytdlpVersion"], "ffmpeg": s["ffmpeg"] != "", "ankiConnect": s["ankiConnect"], "ankiPort": s["ankiLivePort"], "cache": cache})
 	})
 	mux.HandleFunc("/prepare", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("v")
@@ -510,11 +583,13 @@ func main() {
 	if v := os.Getenv("YTAM_DIR"); v != "" {
 		appDir = v
 	}
-	background := false
+	background, openFlag := false, false
 	for _, a := range os.Args[1:] {
 		switch a {
 		case "--background":
 			background = true
+		case "--open":
+			openFlag = true
 		case "--install-autostart":
 			fmt.Println("autostart:", setAutostart(true))
 			return
@@ -524,6 +599,7 @@ func main() {
 		}
 	}
 	loadConfig()
+	loadLast()
 	cache = filepath.Join(appDir, "cache")
 	os.MkdirAll(cache, 0o755)
 	logFile, _ = os.OpenFile(filepath.Join(appDir, "launcher.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -531,7 +607,15 @@ func main() {
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		// Already running: just show its status page.
+		// Already running: ask it to open Chrome (shortcut / option), otherwise show its status page.
+		if openFlag || (cfg.OpenChrome && !background) {
+			req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/api/open-chrome", nil)
+			req.Header.Set("X-YTAM", "1")
+			if resp, e := (&http.Client{Timeout: 5 * time.Second}).Do(req); e == nil {
+				resp.Body.Close()
+				return
+			}
+		}
 		openBrowser("http://" + addr + "/")
 		return
 	}
@@ -553,7 +637,16 @@ func main() {
 			}
 		}()
 	}
-	if cfg.OpenStatus && !background {
+	toChrome := openFlag || (cfg.OpenChrome && !background)
+	if toChrome {
+		go func() {
+			time.Sleep(1200 * time.Millisecond) // Anki is already starting
+			if err := openChrome(); err != nil {
+				logf("Chrome: %v", err)
+				openBrowser("http://" + addr + "/")
+			}
+		}()
+	} else if cfg.OpenStatus && !background {
 		go func() { time.Sleep(600 * time.Millisecond); openBrowser("http://" + addr + "/") }()
 	}
 	if err := http.Serve(ln, handler()); err != nil {

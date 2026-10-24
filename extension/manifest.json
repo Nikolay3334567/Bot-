@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "7.0.0",
-  "version_name": "7.0 — устойчивый Anki, быстрые статусы",
+  "version": "7.1.0",
+  "version_name": "7.1 — пауза на конце фразы по каждому кадру, Chrome по ярлыку, порт AnkiConnect",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -12,11 +12,9 @@
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://translate.googleapis.com/*",
-    "http://127.0.0.1:8765/*",
-    "http://localhost:8765/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
     "https://generativelanguage.googleapis.com/*",
-    "http://127.0.0.1:8766/*",
-    "http://localhost:8766/*",
     "https://translation.googleapis.com/*",
     "https://texttospeech.googleapis.com/*"
   ],

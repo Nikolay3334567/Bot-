@@ -38,6 +38,8 @@
       <button id="quit" class="danger">Выключить лончер</button>
     </div>
   </div>
+  <div class="card" id="ankibox" style="display:none"></div>
+  <div class="card" id="chrome"></div>
   <div class="card" id="settings"></div>
   <div class="card" id="jobs"></div>
   <div class="card"><b>Журнал</b><pre id="log"></pre></div>
@@ -48,6 +50,54 @@ const post = (path, body) => fetch(path, { method: 'POST', headers: { 'X-YTAM': 
 const row = (name, ok, text, small) => `<div class="row"><div>${name}<small>${small || ''}</small></div><div class="${ok ? 'ok' : 'bad'}">${text}</div></div>`;
 let cfg = null;
 
+
+let ankiDiagAt = 0;
+async function ankiBox(s) {
+  const box = $('ankibox');
+  if (s.ankiConnect) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  if (Date.now() - ankiDiagAt < 8000 && box.innerHTML) return;
+  ankiDiagAt = Date.now();
+  let d; try { d = await (await fetch('/api/port-diag')).json(); } catch (_) { return; }
+  const main = d.ports[0];
+  const msg = { blocked: 'Windows не разрешает программам слушать порт ' + main.port + (main.excluded ? ' (он в зарезервированном диапазоне ' + main.excluded + ')' : '') + ' — это ошибка «WinError 10013» в окне AnkiConnect.',
+    busy: 'Порт ' + main.port + ' занят другой программой (возможно, вторая копия Anki).',
+    free: 'Порт ' + main.port + ' свободен, но AnkiConnect не отвечает: запустите Anki или установите дополнение (код 2055492159).',
+    error: 'Порт ' + main.port + ': ' + (main.error || 'ошибка') }[main.state] || '';
+  const bad = main.state === 'blocked' || main.state === 'busy';
+  box.innerHTML = '<b>AnkiConnect не отвечает</b><p style="margin:6px 0">' + msg + '</p>' +
+    (bad ? '<p style="margin:6px 0;color:var(--mute)">Решение: перенести AnkiConnect на другой порт. Лончер сам впишет его в настройки дополнения, а расширение найдёт его автоматически.</p>' +
+      '<div class="btns"><button id="fixPort">Исправить порт AnkiConnect</button><button id="restartAnki" class="sec">Перезапустить Anki</button></div>' :
+      '<div class="btns"><button id="restartAnki" class="sec">Запустить / перезапустить Anki</button></div>');
+  if ($('fixPort')) $('fixPort').onclick = async () => { const r = await post('/api/fix-anki-port'); if (r.error) return alert(r.error); alert('Готово: порт ' + r.port + '. Теперь перезапустите Anki (кнопка рядом).'); ankiDiagAt = 0; refresh(); };
+  if ($('restartAnki')) $('restartAnki').onclick = async () => { if (!confirm('Anki будет закрыт и запущен снова. Продолжить?')) return; const r = await post('/api/restart-anki'); if (r.error) alert(r.error); ankiDiagAt = 0; setTimeout(refresh, 3000); };
+}
+
+let chromeBuilt = false;
+async function chromeBox(s) {
+  const c = s.config, l = s.last || {};
+  if (!chromeBuilt) {
+    chromeBuilt = true;
+    let p = { profiles: [], current: '' };
+    try { p = await (await fetch('/api/chrome-profiles')).json(); } catch (_) {}
+    const opts = p.profiles.map((x) => `<option value="${x.dir}" ${x.dir === (c.chromeProfile || p.current) ? 'selected' : ''}>${x.name}${x.email ? ' — ' + x.email : ''} (${x.dir})</option>`).join('') || '<option value="">Default</option>';
+    $('chrome').innerHTML = '<b>Chrome: мой профиль + YouTube + последнее видео</b>' +
+      '<div id="chromeInfo" style="color:var(--mute);margin:4px 0 8px"></div>' +
+      `<label class="chk"><input type="checkbox" id="c_chrome" ${c.openChrome ? 'checked' : ''}> Открывать Chrome при запуске лончера (в том числе по ярлыку)</label>` +
+      `<div class="row"><div>Профиль Chrome<small>с расширением и вашим входом в YouTube</small></div><select id="c_prof">${opts}</select></div>` +
+      `<div class="row"><div>Что открывать</div><select id="c_mode"><option value="last" ${c.chromeMode === 'last' ? 'selected' : ''}>Последнее видео (с того же места)</option><option value="home" ${c.chromeMode === 'home' ? 'selected' : ''}>Главная YouTube</option><option value="custom" ${c.chromeMode === 'custom' ? 'selected' : ''}>Свой адрес…</option></select></div>` +
+      `<div class="row" id="c_url_row" style="${c.chromeMode === 'custom' ? '' : 'display:none'}"><input id="c_url" style="width:100%;padding:6px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)" value="${c.chromeUrl || ''}" placeholder="https://www.youtube.com/playlist?list=…"></div>` +
+      '<div class="btns"><button id="openChrome">Открыть Chrome сейчас</button><button id="mkLnk" class="sec">Создать ярлык на рабочем столе</button></div>';
+    const save2 = async () => { cfg.openChrome = $('c_chrome').checked; cfg.chromeProfile = $('c_prof').value; cfg.chromeMode = $('c_mode').value; cfg.chromeUrl = $('c_url').value.trim(); $('c_url_row').style.display = cfg.chromeMode === 'custom' ? '' : 'none'; await post('/api/config', cfg); };
+    for (const id of ['c_chrome', 'c_prof', 'c_mode']) $(id).onchange = save2;
+    $('c_url').onchange = save2;
+    $('openChrome').onclick = async () => { const r = await post('/api/open-chrome'); if (r.error) alert(r.error); };
+    $('mkLnk').onclick = async () => { const r = await post('/api/shortcut'); alert(r.error ? r.error : 'Ярлык создан: ' + r.path + '\nДвойной щелчок запускает лончер, Anki и Chrome с вашим профилем.'); };
+  }
+  $('chromeInfo').textContent = (s.chrome ? 'Chrome: ' + s.chrome : 'Chrome не найден — укажите путь в config.json (chromePath)') +
+    ' · ' + (l.id ? 'последнее видео: ' + (l.title || l.id) + ' (' + Math.floor(l.t / 60) + ':' + String(Math.floor(l.t % 60)).padStart(2, '0') + ')' : 'последнее видео появится, когда вы посмотрите что-нибудь с расширением');
+}
+
 async function refresh() {
   let s;
   try { s = await (await fetch('/api/status')).json(); } catch (_) { $('status').innerHTML = '<span class="bad">Лончер остановлен</span>'; return; }
@@ -56,7 +106,7 @@ async function refresh() {
     row('Лончер', true, 'работает', s.os + ' · кэш ' + s.cacheMB + ' МБ') +
     row('yt-dlp', !!s.ytdlp, s.ytdlp ? s.ytdlpVersion : 'не найден', s.ytdlp || 'Нажмите «Скачать yt-dlp и ffmpeg» или положите yt-dlp.exe рядом с лончером') +
     row('ffmpeg', !!s.ffmpeg, s.ffmpeg ? 'найден' : 'не найден', s.ffmpeg || '') +
-    row('Anki + AnkiConnect', s.ankiConnect, s.ankiConnect ? 'на связи' : 'не отвечает', s.ankiConnect ? '' : (s.ankiPath ? 'Anki: ' + s.ankiPath + ' — нажмите «Запустить Anki»' : 'Установите дополнение AnkiConnect (код 2055492159) и запустите Anki')) +
+    row('Anki + AnkiConnect', s.ankiConnect, s.ankiConnect ? 'на связи' : 'не отвечает', s.ankiConnect ? 'порт ' + (s.ankiLivePort || s.ankiPort) : (s.ankiPath ? 'Anki: ' + s.ankiPath + ' — нажмите «Запустить Anki»' : 'Установите дополнение AnkiConnect (код 2055492159) и запустите Anki')) +
     row('Автозапуск с Windows', s.autostart, s.autostart ? 'включён' : 'выключен', '') ;
   const c = s.config;
   if (!$('settings').dataset.built) { $('settings').dataset.built = '1'; $('settings').innerHTML = '<b>Настройки</b>' +
@@ -70,6 +120,7 @@ async function refresh() {
   } else if ($('c_auto')) $('c_auto').checked = s.autostart;
   $('jobs').innerHTML = '<b>Загрузки аудио</b>' + (s.jobs && s.jobs.length ? s.jobs.map((j) =>
     `<div class="row"><div>${j.id}<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><small>${j.error || ''}</small></div><div class="${j.state === 'error' ? 'bad' : j.state === 'ready' ? 'ok' : ''}">${j.state === 'downloading' ? Math.round(j.progress * 100) + '%' : j.state}</div></div>`).join('') : '<div class="row"><div style="color:var(--mute)">Пока пусто — откройте видео на YouTube</div></div>');
+  ankiBox(s); chromeBox(s);
   $('log').textContent = (s.log || []).join('\n');
 }
 async function save() {

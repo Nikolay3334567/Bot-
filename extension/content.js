@@ -2746,47 +2746,101 @@
     if (play) v.play();
   }
 
+  // ---------- stopping at the end of a phrase (AP and "pause when hovering") ----------
+  // Checked on EVERY video frame (requestVideoFrameCallback) and again by the tick loop, so a back-to-back phrase
+  // boundary can never slip through between two checks. The stop is placed X.endLead before the next phrase
+  // begins at the latest, i.e. always before the active phrase changes.
+
+  function endTimes(a) {
+    const c = S.cues[a], next = S.cues[a + 1];
+    const v = getVideo();
+    const limit = next ? next.start - X.endLead * Math.max(1, (v && v.playbackRate) || 1) : Infinity; // faster playback → bigger margin
+    const endT = Math.min(Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly), limit);
+    return { endT, hardT: Math.min(endT + X.endWaitMax, limit) };
+  }
+
+  const hoverStopOn = () => settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit;
+
+  function endGuard(v, t, a) {
+    if (v.paused || a < 0 || !S.cues[a]) return false;
+    const wantAp = settings.autoPause && S.lastAutoPause !== a;
+    const wantHover = hoverStopOn() && S.lastHoverPause !== a;
+    if (!wantAp && !wantHover) return false;
+    const { endT, hardT } = endTimes(a);
+    // Reached the end, and the speech has actually stopped (or the wait budget is spent).
+    const atEnd = t >= endT && (t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
+    if (!atEnd) return false;
+    let stop = false;
+    if (wantAp) { S.lastAutoPause = a; stop = true; }
+    if (wantHover && hoverActive()) { S.lastHoverPause = a; S.hoverPaused = true; stop = true; } // once per phrase
+    if (!stop) return false;
+    S.holdCue = a;
+    v.pause();
+    return true;
+  }
+
+  function armFrameLoop(v) {
+    if (S.vfcFor === v || !v.requestVideoFrameCallback) return;
+    S.vfcFor = v;
+    const cb = (_now, meta) => {
+      if (S.vfcFor !== v) return;
+      try {
+        if (!v.paused && S.cues.length) {
+          const t = (meta && meta.mediaTime != null ? meta.mediaTime : v.currentTime) - X.subShift;
+          endGuard(v, t, cueIndexAt(t));
+        }
+      } catch (_) { /* keep the loop alive */ }
+      v.requestVideoFrameCallback(cb);
+    };
+    v.requestVideoFrameCallback(cb);
+  }
+
+  function rescueMissedEnd(v, prev, a) {
+    if (v.paused || Date.now() - (S.lastSeekAt || 0) < 700) return false;
+    const pc = S.cues[prev];
+    if (!pc || v.currentTime - X.subShift - pc.end > 1.2) return false; // far past it: a jump, not a miss
+    const wantAp = settings.autoPause && S.lastAutoPause !== prev;
+    const wantHover = hoverStopOn() && S.lastHoverPause !== prev && hoverActive();
+    if (!wantAp && !wantHover) return false;
+    if (wantAp) S.lastAutoPause = prev;
+    if (wantHover) { S.lastHoverPause = prev; S.hoverPaused = true; }
+    const next = S.cues[prev + 1];
+    S.holdCue = prev;
+    v.pause();
+    S.ownSeek = true; // this seek must not re-arm the stop for the same phrase
+    v.currentTime = Math.max(pc.start, Math.min(pc.end, next ? next.start : Infinity) - 0.05) + X.subShift;
+    return true;
+  }
+
   let pendingTick = 0;
   function tick() {
     if (!S.videoId) return;
     const v = getVideo();
     if (!v) return;
-    if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastHoverPause = -1; }); }
+    if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastSeekAt = Date.now(); if (S.ownSeek) { S.ownSeek = false; return; } S.lastHoverPause = -1; }); }
     tapEnsure(v);
     if (++pendingTick % 5 === 0) processPending(false);
     if (!ui) return;
     mountOverlay();
     if (!S.cues.length) return;
     const t = v.currentTime - X.subShift;
-    const a = cueIndexAt(t);
+    let a = cueIndexAt(t);
+    armFrameLoop(v);
+    // Safety net: if the end of the previous phrase slipped by between two checks (stalled tab, long task),
+    // go back to it and stop there instead of silently running into the next phrase.
+    if (a !== S.active && S.active >= 0 && a > S.active && a - S.active <= 2 && rescueMissedEnd(v, S.active, a)) a = S.active;
     updateHud(v, t, a);
     if (a !== S.active) { setActiveRow(a); S.active = a; S.lastHoverPause = -1; prefetchAround(a); }
     const c = S.cues[a];
-    const next = S.cues[a + 1];
-    const endT = c ? Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly) : 0;
     // Stop at the real end of the speech: after YouTube's end, wait (a little) for actual silence.
-    const hardT = c ? Math.min(endT + X.endWaitMax, next ? next.start - 0.02 : Infinity) : 0;
+    const hardT = c ? endTimes(a).hardT : 0;
     const speaking = !!Tap.src && Tap.reliable && Tap.quietMs < X.endQuietMs;
     if (!v.paused || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
     const shown = c && (t <= c.end + X.showTail || (!v.paused && speaking && t <= hardT) || S.holdCue === a) ? a : -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
-    if (c && !v.paused) {
-      const atEnd = t >= endT && (t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
-      if (settings.autoPause && atEnd && S.lastAutoPause !== a) {
-        S.lastAutoPause = a;
-        S.holdCue = a;
-        v.pause();
-      }
-      // Hover mode 'end': the pointer is on the subtitles/tooltip — stop when the phrase has finished.
-      if (settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit && S.lastHoverPause !== a && atEnd && hoverActive()) {
-        S.lastHoverPause = a; // once per phrase: pressing play again lets it run on to the next phrase end
-        S.holdCue = a;
-        v.pause();
-        S.hoverPaused = true;
-      }
-    }
+    if (c && !v.paused) endGuard(v, t, a);
 
     // Resume once the pointer has really left (enter/leave events can be lost when the line re-renders).
     if (S.hoverPaused) {
@@ -2822,6 +2876,18 @@
     if (tipEl && tipEl.isConnected && tipEl.matches(':hover')) return true;
     return inRect(S.lineRect, 2);
   }
+  // Tell the launcher where we are (last video + second), at most every 10 s and only while it matters.
+  let reportedAt = 0, reportedKey = '';
+  setInterval(() => {
+    if (!settings.reportLast || !S.videoId || document.hidden) return;
+    const v = getVideo();
+    if (!v || !v.currentTime) return;
+    const key = S.videoId + ':' + Math.floor(v.currentTime / 5);
+    if (key === reportedKey || Date.now() - reportedAt < 9000) return;
+    reportedKey = key; reportedAt = Date.now();
+    bg({ type: 'helperProgress', url: settings.helperUrl, v: S.videoId, t: v.currentTime, title: S.title || document.title.replace(/ - YouTube$/, '') }).catch(() => {});
+  }, 10000);
+
   (function loop() { try { tick(); } catch (e) { console.warn('[ytam]', e); } setTimeout(loop, X.tickMs); })();
 
   document.addEventListener('pointerdown', () => {
