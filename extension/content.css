@@ -402,3 +402,15 @@ html.ytam-dragging, html.ytam-dragging * { cursor: grabbing !important; user-sel
 
 .ytam-wstat.o { color: #bbb; }
 .ytam-wgroup[hidden], .ytam-wg-words .ytam-w[hidden] { display: none !important; }
+
+/* ---------- phrase selection ---------- */
+.ytam-w.ytam-w-range { background: rgba(255, 170, 60, .5); border-radius: 3px; color: #fff; }
+.ytam-selbox { --arrow-x: 50%; position: fixed; z-index: 2147483646; box-sizing: border-box; width: max-content; min-width: 200px; max-width: 360px; padding: 10px 12px; border-radius: 12px; background: #00639e; color: #fff; box-shadow: 0 6px 22px rgba(0, 0, 0, .5); font: 14px/1.35 var(--ytam-font); }
+.ytam-selbox::after { content: ''; position: absolute; left: var(--arrow-x); width: 12px; height: 12px; background: #00639e; transform: translateX(-50%) rotate(45deg); bottom: -6px; pointer-events: none; }
+.ytam-selbox.below::after { bottom: auto; top: -6px; }
+.ytam-sel-text { font-weight: 600; opacity: .95; margin-bottom: 4px; }
+.ytam-sel-tr { color: #d6ecff; margin-bottom: 8px; min-height: 1.3em; }
+.ytam-sel-btns { display: flex; gap: 6px; align-items: center; }
+.ytam-sel-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border: 1px solid rgba(255, 255, 255, .35); border-radius: 8px; background: rgba(255, 255, 255, .1); color: #fff; font: inherit; cursor: pointer; }
+.ytam-sel-btn:hover { background: rgba(255, 255, 255, .22); }
+.ytam-sel-btn.main { background: #f0a030; border-color: #f0a030; color: #1b1b1b; font-weight: 600; }

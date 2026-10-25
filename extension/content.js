@@ -162,7 +162,7 @@
   async function setWordStatus(w, st, silent, src) {
     const prev = S.vocab[w];
     if (st) S.vocab[w] = st; else delete S.vocab[w];
-    if (w.includes(' ')) { renderList(); renderOverlay(); } else recolor(w);
+    if (w.includes(' ')) { phraseKeys = null; S.cues.forEach((c) => { delete c._expr; }); renderList(); renderOverlay(); } else recolor(w);
     if (st === 1 && prev !== 1) logSaved(src ? { k: w, t: w.includes(' ') ? 'x' : 'w', text: w, ...src } : { k: w, t: w.includes(' ') ? 'x' : 'w', text: w, src: 'ext', title: S.title || '', vid: S.videoId || '' });
     if (prev === 1 && st !== 1) { if (silent) updateSaved((saved) => saved.filter((e) => e.k !== w)); else leftLearning(w, st); }
     // Persistence is batched: a burst of toggles becomes ONE read-modify-write of the stored vocabulary,
@@ -249,11 +249,11 @@
     });
   }
 
-  function addNoteId(k, id) {
+  function addNoteId(k, id, mix) {
     if (!id) return;
     return updateSaved((saved) => {
       const e = saved.find((x) => x.k === k);
-      if (e) e.ids = [...new Set([...(e.ids || []), id])];
+      if (e) { e.ids = [...new Set([...(e.ids || []), id])]; if (mix) e.mix = mix; }
       else saved.unshift({ k, t: k.startsWith('p:') ? 'p' : 'w', text: k, ts: Date.now(), ids: [id] });
       return saved;
     });
@@ -432,6 +432,9 @@
     return null;
   }
 
+  let phraseKeys = null;
+  const userPhraseKeys = () => phraseKeys || (phraseKeys = Object.keys(S.vocab).filter((k) => k.includes(' ')));
+
   function cueExpr(c) {
     if (c._expr) return c._expr;
     const toks = tokensOf(c.text);
@@ -459,6 +462,12 @@
           if (idx && idx[0] === i) add(e.p, '', idx);
         }
       });
+    }
+    // Phrases the user selected and saved by hand (any vocabulary key with a space that is not built in).
+    for (const key of userPhraseKeys()) {
+      const pat = tokensOf(key);
+      const idx = findSeq(toks, pat);
+      if (idx && !out.some((o) => o.key === key)) add(key, '', idx);
     }
     // Longest expressions first.
     out.sort((a, b) => b.idx.length - a.idx.length);
@@ -1063,6 +1072,7 @@
       const w = e.target.closest('.ytam-w');
       if (!w || !root.contains(w)) return;
       S.hoverWord = { el: w, i: cueOf(w) };
+      if (sel.on) { selSweep(w, cueOf(w)); return; }
       if (settings.hoverTranslate && !pop) showTip(w, cueOf(w));
     });
     root.addEventListener('mouseout', (e) => {
@@ -1088,6 +1098,125 @@
     root.addEventListener('contextmenu', (e) => statusClick(e, true));
     root.addEventListener('auxclick', (e) => { if (e.button === 1) statusClick(e, false); });
   }
+
+  // ---------- phrase selection: hold the key and sweep the pointer over words ----------
+  // Release the key → a small box with the translation and "save" (card with audio, like any expression).
+
+  const sel = { on: false, anchor: null, last: null, cue: -1 };
+  let selBox = null;
+
+  const isSelKey = (e) => {
+    const k = settings.selectKey || 'Alt';
+    return k.startsWith('Key') ? e.code === k : e.key === k;
+  };
+
+  function selSpans() {
+    if (!sel.anchor || !sel.last || sel.anchor.parentElement !== sel.last.parentElement) return [];
+    const all = [...sel.anchor.parentElement.querySelectorAll('.ytam-w')];
+    let a = all.indexOf(sel.anchor), b = all.indexOf(sel.last);
+    if (a < 0 || b < 0) return [];
+    if (a > b) [a, b] = [b, a];
+    return all.slice(a, b + 1);
+  }
+
+  function selPaint() {
+    document.querySelectorAll('.ytam-w-range').forEach((x) => x.classList.remove('ytam-w-range'));
+    selSpans().forEach((x) => x.classList.add('ytam-w-range'));
+  }
+
+  function selSweep(w, cue) {
+    if (+w.dataset.ti < 0) return; // the word list has no sentence to cut a phrase from
+    if (!sel.anchor) {
+      sel.anchor = w;
+      sel.cue = cue;
+      const v = getVideo();
+      if (v && !v.paused) { v.pause(); S.hoverPaused = true; } // freeze the picture while choosing
+      hideTip();
+    } else if (w.parentElement !== sel.anchor.parentElement) return;
+    sel.last = w;
+    selPaint();
+  }
+
+  function selStart() {
+    if (sel.on || !S.cues.length) return;
+    sel.on = true;
+    sel.anchor = sel.last = null;
+    if (S.hoverWord && S.hoverWord.el.isConnected) selSweep(S.hoverWord.el, S.hoverWord.i);
+  }
+
+  function selEnd() {
+    if (!sel.on) return;
+    sel.on = false;
+    const spans = selSpans();
+    if (spans.length < 2) { selClear(); scheduleResume(); return; }
+    openSelBox(spans, sel.cue);
+  }
+
+  function selClear() {
+    sel.anchor = sel.last = null;
+    document.querySelectorAll('.ytam-w-range').forEach((x) => x.classList.remove('ytam-w-range'));
+  }
+
+  function closeSelBox() {
+    if (!selBox) return;
+    selBox.el.remove();
+    selBox = null;
+    selClear();
+    scheduleResume();
+  }
+
+  function openSelBox(spans, cueIdx) {
+    closeSelBox();
+    const c = S.cues[cueIdx];
+    if (!c) return selClear();
+    const toks = [...c.text.matchAll(new RegExp(TOKEN_RE.source, 'gu'))];
+    const a = toks[+spans[0].dataset.ti], b = toks[+spans[spans.length - 1].dataset.ti];
+    if (!a || !b) return selClear();
+    const surf = c.text.slice(a.index, b.index + b[0].length);   // as written (with commas): used to bold it in the card
+    const key = tokensOf(surf).join(' ');                        // vocabulary key
+    const trEl = h('div', { class: 'ytam-sel-tr', text: S.wordTr.get(key) || '…' });
+    const saved = S.vocab[key] === 1;
+    const doSave = () => {
+      if (S.vocab[key] !== 1) {
+        const e = { key, p: key, surf, t: S.wordTr.get(key) || '' };
+        saveExpr(e, cueIdx);
+        toast('Фраза сохранена: ' + surf.slice(0, 50));
+      }
+      closeSelBox();
+    };
+    const save = svgBtn('ytam-sel-btn main', saved ? 'bookClock' : 'book', saved ? 'Уже сохранено' : 'Сохранить в Anki (Enter)', doSave);
+    save.append(' ', saved ? 'Сохранено' : 'В Anki');
+    const el = h('div', { class: 'ytam-selbox' },
+      h('div', { class: 'ytam-sel-text', text: surf }), trEl,
+      h('div', { class: 'ytam-sel-btns' }, save,
+        h('button', { class: 'ytam-sel-btn', text: '🔊', title: 'Произнести', onclick: () => speak(surf) }),
+        h('button', { class: 'ytam-sel-btn', text: '⧉', title: 'Копировать', onclick: () => navigator.clipboard.writeText(surf).then(() => toast('Скопировано')).catch(() => {}) }),
+        h('button', { class: 'ytam-sel-btn', text: '✕', title: 'Закрыть (Esc)', onclick: closeSelBox })));
+    for (const type of ['mousedown', 'click', 'contextmenu', 'keydown']) el.addEventListener(type, (ev) => ev.stopPropagation());
+    layer().append(el);
+    selBox = { el, key, doSave };
+    anchorTo(el, spans[0], X.popGap, X.popAboveMin);
+    if (!S.wordTr.get(key)) {
+      bg({ type: 'translateWords', words: [key], tl: settings.targetLang, prio: 1 }).then((r) => {
+        const t = r[key];
+        if (t) { S.wordTr.set(key, t); if (selBox && selBox.key === key) { trEl.textContent = t; anchorTo(selBox.el, spans[0], X.popGap, X.popAboveMin); } }
+        else trEl.textContent = '—';
+      }).catch(() => { trEl.textContent = '—'; });
+    }
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.repeat) { if (sel.on && isSelKey(e)) e.preventDefault(); return; }
+    if (selBox && e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); selBox.doSave(); return; }
+    if (selBox && e.key === 'Escape') { e.stopPropagation(); closeSelBox(); return; }
+    if (!isSelKey(e)) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (e.key === 'Alt') e.preventDefault(); // keep Chrome from grabbing the menu
+    selStart();
+  }, true);
+  document.addEventListener('keyup', (e) => { if (isSelKey(e)) { if (e.key === 'Alt') e.preventDefault(); selEnd(); } }, true);
+  window.addEventListener('blur', () => { if (sel.on) { sel.on = false; selClear(); } });
 
   const STAR = '☆', STAR_ON = '★';
 
@@ -1202,7 +1331,7 @@
   function scheduleResume() {
     clearTimeout(S.resumeTimer);
     S.resumeTimer = setTimeout(() => {
-      if (pop || (ui && ui.ovLine.matches(':hover')) || (tipEl && tipEl.matches(':hover'))) return;
+      if (pop || selBox || sel.on || (ui && ui.ovLine.matches(':hover')) || (tipEl && tipEl.matches(':hover'))) return;
       resumeAfterHover();
     }, X.resumeMs);
   }
@@ -1558,6 +1687,8 @@
     wt.total.textContent = '/ ' + wt.words.length;
   }
 
+  const mixLabel = (m) => (m ? ` · ${m.v === 'ai' ? '🔊 голос ИИ' : m.v === 'both' ? '🔊 видео + ИИ' : '🔊 из видео'}${m.t ? ' · ✂ обрезано' : ''}` : '');
+
   function renderSavedTab() {
     const items = (S.savedList || []).filter((e) => e.t === 'p' || S.vocab[e.k] === 1);
     const mine = (e) => e.src !== 'deck';
@@ -1579,7 +1710,7 @@
           h('span', { class: 'ytam-badge ' + e.t, text: e.t === 'p' ? 'p' : e.t === 'x' ? 'x' : 'w' }),
           h('div', { class: 'ytam-sbody' },
             h('span', { class: 'ytam-stext' + (e.t === 'p' ? '' : ' ytam-learning'), text: e.text }),
-            h('div', { class: 'ytam-ssrc', title: from, text: (e.src === 'deck' ? '📚 ' : '▶ ') + from })),
+            h('div', { class: 'ytam-ssrc', title: from, text: (e.src === 'deck' ? '📚 ' : '▶ ') + from + mixLabel(e.mix) })),
           del);
       }));
   }
@@ -2627,6 +2758,7 @@
     if (mode === 'off' || !max) return full;
     const info = cueTokenTimes(item.cue, item.videoId);
     if (!info || info.toks.length <= max) return full;
+    if (!(await mixTurn('trim', settings.cardTrimRatio))) return full; // this long phrase stays as in the video
     const { toks, times } = info;
     const tgt = targetRange(toks, item.hl || item.word);
     let range = null, tr = null;
@@ -2647,21 +2779,28 @@
     return { start: times[range.a][0], end: Math.max(times[range.b][1], times[range.a][0] + 0.3), text: toks.slice(range.a, range.b + 1).join(' '), trimmed: true, t: tr };
   }
 
-  // Which cards get the AI voice: "ratio" is exact (accumulator), voices rotate round the list.
+  // Exact mixing of "original" and "AI" cards: an accumulator, not a dice roll (50% means every second card).
+  async function mixTurn(name, pct) {
+    const k = 'mix_' + name;
+    const st = await chrome.storage.local.get({ [k]: 0 });
+    let acc = st[k] + Math.min(100, Math.max(0, +pct || 0));
+    const hit = acc >= 100;
+    if (hit) acc -= 100;
+    await chrome.storage.local.set({ [k]: acc });
+    return hit;
+  }
+
+  // Which cards get the AI voice; voices rotate round the list.
   async function voiceTurn() {
     const mode = settings.cardVoiceMode;
     if (!mode || mode === 'off') return null;
-    const st = await chrome.storage.local.get({ voiceAcc: 0, voiceN: 0 });
-    let use = mode === 'only' || mode === 'both', acc = st.voiceAcc;
-    if (mode === 'ratio') {
-      acc += Math.min(100, Math.max(0, +settings.cardVoiceRatio || 0));
-      use = acc >= 100;
-      if (use) acc -= 100;
-    }
-    if (!use) { await chrome.storage.local.set({ voiceAcc: acc }); return null; }
+    let use = mode === 'only' || mode === 'both';
+    if (mode === 'ratio') use = await mixTurn('voice', settings.cardVoiceRatio);
+    if (!use) return null;
+    const st = await chrome.storage.local.get({ voiceN: 0 });
     const voices = String(settings.cardVoices || settings.ttsVoice || '').split(/[,\n]/).map((v) => v.trim()).filter(Boolean);
     const voice = voices.length ? voices[st.voiceN % voices.length] : settings.ttsVoice;
-    await chrome.storage.local.set({ voiceAcc: acc, voiceN: st.voiceN + 1 });
+    await chrome.storage.local.set({ voiceN: st.voiceN + 1 });
     return { voice, into: mode !== 'both' };
   }
 
@@ -2718,7 +2857,7 @@
       if (res.queued) {
         toast(`⏳ Anki не отвечает — карточка сохранена в очереди (${res.count}). Откройте Anki или нажмите ⟳`, 'warn', 6000);
       } else {
-        await addNoteId(item.key, res.noteId);
+        await addNoteId(item.key, res.noteId, { v: voice ? (turn.into ? 'ai' : 'both') : 'clip', t: !!card.trimmed });
       }
       // Status changed while the card was being made → remove it again.
       if (!item.key.startsWith('p:') && S.vocab[item.key] !== 1) leftLearning(item.key, S.vocab[item.key]);
@@ -2845,7 +2984,7 @@
     // Resume once the pointer has really left (enter/leave events can be lost when the line re-renders).
     if (S.hoverPaused) {
       if (!v.paused) S.hoverPaused = false;
-      else if (pop || hoverActive() || S.posEdit) S.hoverGone = 0;
+      else if (pop || selBox || sel.on || hoverActive() || S.posEdit) S.hoverGone = 0;
       else if (!S.hoverGone) S.hoverGone = Date.now();
       else if (Date.now() - S.hoverGone >= X.resumeMs) { S.hoverGone = 0; resumeAfterHover(); }
     }
@@ -3057,6 +3196,7 @@
         const diff = [...keys].filter((k) => nv[k] !== S.vocab[k]);
         S.vocab = nv;
         if (!diff.length) return; // our own change, already applied
+        if (diff.some((k) => k.includes(' '))) { phraseKeys = null; S.cues.forEach((c) => { delete c._expr; }); }
         if (diff.length > 20 || diff.some((k) => k.includes(' '))) { renderList(); renderOverlay(); } else diff.forEach(recolor);
       }
       return;

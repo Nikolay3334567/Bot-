@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "7.1.0",
-  "version_name": "7.1 — пауза на конце фразы по каждому кадру, Chrome по ярлыку, порт AnkiConnect",
+  "version": "7.2.0",
+  "version_name": "7.2 — выделение фразы клавишей, соотношение оригинал и ИИ",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
