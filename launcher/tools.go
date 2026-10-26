@@ -80,16 +80,50 @@ func findTools(explicit string, names ...string) []string {
 	return out
 }
 
+// explicitDl: the user pressed a download button, so downloading is allowed even if autoDownload is off.
+var explicitDl bool
+
+// dlHook receives (bytes done, bytes total) while a download runs (used by the status page).
+var dlHook func(done, total int64)
+
+type progressReader struct {
+	r           io.Reader
+	done, total int64
+	last        time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.done += int64(n)
+	if dlHook != nil && (time.Since(p.last) > 150*time.Millisecond || err != nil) {
+		p.last = time.Now()
+		dlHook(p.done, p.total)
+	}
+	return n, err
+}
+
 func download(url, dest string) error {
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 20 * time.Minute}
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 3; attempt++ { // a flaky connection should not need a second click
+		resp, err = client.Get(url)
+		if err == nil && resp.StatusCode == 200 {
+			break
+		}
+		if err == nil {
+			err = fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
+			resp.Body.Close()
+			if resp.StatusCode == 404 {
+				break
+			}
+		}
+		time.Sleep(time.Duration(attempt+1) * 800 * time.Millisecond)
+	}
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
-	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
@@ -98,24 +132,51 @@ func download(url, dest string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
+	n, err := io.Copy(f, &progressReader{r: resp.Body, total: resp.ContentLength})
+	f.Close()
+	if err == nil && resp.ContentLength > 0 && n != resp.ContentLength {
+		err = fmt.Errorf("скачано %d из %d байт", n, resp.ContentLength)
+	}
+	if err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	f.Close()
+	os.Remove(dest) // a running old copy cannot be replaced on Windows, but a stopped one can
 	return os.Rename(tmp, dest)
 }
 
-func ensureYtdlp() (string, error) {
+func ensureYtdlp() (string, error) { return ensureYtdlpF(false) }
+
+func workingYtdlp() string {
+	for _, p := range findTools(cfg.YtdlpPath, "yt-dlp") {
+		if toolWorks(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+func workingFfmpeg() string {
+	for _, p := range findTools(cfg.FfmpegPath, "ffmpeg") {
+		if toolVersionRun(p, "-version") != "?" {
+			return p
+		}
+	}
+	return ""
+}
+
+func ensureYtdlpF(force bool) (string, error) {
 	// Every yt-dlp* file found is test-run (--version); a build for the wrong CPU/Windows is skipped.
 	for _, p := range findTools(cfg.YtdlpPath, "yt-dlp") {
+		if force {
+			break
+		}
 		if toolWorks(p) {
 			return p, nil
 		}
 		logf("yt-dlp %s не запускается на этом ПК — пропускаю", p)
 	}
-	if !cfg.AutoDownload {
+	if !cfg.AutoDownload && !explicitDl {
 		return "", errors.New("yt-dlp не найден. Положите yt-dlp.exe рядом с лончером (или в папку bin) либо включите autoDownload")
 	}
 	var assets []string
@@ -144,14 +205,19 @@ func ensureYtdlp() (string, error) {
 	return "", fmt.Errorf("не удалось скачать yt-dlp: %v", last)
 }
 
-func ensureFfmpeg() (string, error) {
+func ensureFfmpeg() (string, error) { return ensureFfmpegF(false) }
+
+func ensureFfmpegF(force bool) (string, error) {
 	for _, p := range findTools(cfg.FfmpegPath, "ffmpeg") { // a broken / half-downloaded ffmpeg.exe is skipped
+		if force {
+			break
+		}
 		if toolVersionRun(p, "-version") != "?" {
 			return p, nil
 		}
 		logf("ffmpeg %s не запускается — пропускаю", p)
 	}
-	if !cfg.AutoDownload {
+	if !cfg.AutoDownload && !explicitDl {
 		return "", errors.New("ffmpeg не найден. Положите ffmpeg.exe рядом с лончером (или в папку bin) либо включите autoDownload")
 	}
 	if runtime.GOOS != "windows" {

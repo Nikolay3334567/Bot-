@@ -323,7 +323,7 @@ func status() map[string]any {
 		"ankiConnect": up, "ankiPath": findAnki(), "ankiPort": cfg.AnkiPort, "ankiLivePort": ankiLive,
 		"chrome": chromeExe(), "last": lastCopy(),
 		"autostart": autostartEnabled(), "config": cfg, "cache": cache, "cacheMB": size / 1024 / 1024,
-		"jobs": active, "log": lines,
+		"jobs": active, "log": lines, "tasks": tasksCopy(),
 	}
 }
 
@@ -337,29 +337,12 @@ func api(w http.ResponseWriter, r *http.Request) {
 	case "status":
 		writeJSON(w, 200, status())
 	case "install":
-		go func() {
-			if _, err := ensureYtdlp(); err != nil {
-				logf("✗ %v", err)
-			}
-			if _, err := ensureFfmpeg(); err != nil {
-				logf("✗ %v", err)
-			}
-		}()
-		writeJSON(w, 200, map[string]bool{"ok": true})
+		force := r.URL.Query().Get("force") == "1"
+		started := runTask("install", func(t *task) error { return installTools(t, force) })
+		writeJSON(w, 200, map[string]any{"ok": true, "started": started})
 	case "update-ytdlp":
-		go func() {
-			yt := findTool(cfg.YtdlpPath, "yt-dlp")
-			if yt == "" {
-				logf("yt-dlp не найден")
-				return
-			}
-			logf("обновляю yt-dlp …")
-			cmd := exec.Command(yt, "-U")
-			hide(cmd)
-			out, err := cmd.CombinedOutput()
-			logf("yt-dlp -U: %s (%v)", strings.TrimSpace(string(out)), err)
-		}()
-		writeJSON(w, 200, map[string]bool{"ok": true})
+		started := runTask("update", updateYtdlp)
+		writeJSON(w, 200, map[string]any{"ok": true, "started": started})
 	case "chrome-profiles":
 		writeJSON(w, 200, map[string]any{"profiles": chromeProfiles(), "current": chromeProfileDir(), "chrome": chromeExe(), "target": chromeTarget()})
 	case "open-chrome":

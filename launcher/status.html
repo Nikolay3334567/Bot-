@@ -21,6 +21,13 @@
   pre { margin:0; max-height:240px; overflow:auto; font:12px/1.45 ui-monospace,Consolas,monospace; color:var(--mute); white-space:pre-wrap; }
   .bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; margin-top:4px; } .bar i { display:block; height:100%; background:var(--acc); }
   label.chk { display:flex; align-items:center; gap:8px; padding:5px 0; }
+  button:disabled { opacity:.65; cursor:progress; }
+  .spin { display:inline-block; width:.9em; height:.9em; border:2px solid rgba(255,255,255,.45); border-top-color:#fff; border-radius:50%; animation:sp .7s linear infinite; vertical-align:-.12em; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  #toast { position:fixed; right:16px; top:16px; max-width:440px; padding:12px 16px; border-radius:10px; background:#1f6f3a; color:#fff; box-shadow:0 6px 24px rgba(0,0,0,.4); z-index:9; display:none; white-space:pre-wrap; }
+  #toast.bad { background:#b3261e; }
+  .task { padding:8px 0; border-bottom:1px solid var(--line); } .task:last-child { border-bottom:0; }
+  .task .m { word-break:break-word; } .task.err .m { color:var(--bad); } .task.ok .m { color:var(--ok); }
 </style>
 </head>
 <body>
@@ -28,15 +35,18 @@
   <h1>YT → Anki — лончер</h1>
   <p class="sub">Окно можно закрыть: лончер продолжит работать в фоне. Закройте его кнопкой «Выключить лончер».</p>
 
+  <div id="toast"></div>
   <div class="card" id="status"></div>
   <div class="card">
     <div class="btns">
       <button id="startAnki">Запустить Anki</button>
-      <button id="install" class="sec">Скачать yt-dlp и ffmpeg</button>
+      <button id="install" class="sec">Проверить / скачать yt-dlp и ffmpeg</button>
+      <button id="reinstall" class="sec" title="Скачать оба заново, даже если они уже есть">Скачать заново</button>
       <button id="update" class="sec">Обновить yt-dlp</button>
       <button id="clear" class="sec">Очистить кэш</button>
       <button id="quit" class="danger">Выключить лончер</button>
     </div>
+    <div id="tasks"></div>
   </div>
   <div class="card" id="ankibox" style="display:none"></div>
   <div class="card" id="chrome"></div>
@@ -69,8 +79,8 @@ async function ankiBox(s) {
     (bad ? '<p style="margin:6px 0;color:var(--mute)">Решение: перенести AnkiConnect на другой порт. Лончер сам впишет его в настройки дополнения, а расширение найдёт его автоматически.</p>' +
       '<div class="btns"><button id="fixPort">Исправить порт AnkiConnect</button><button id="restartAnki" class="sec">Перезапустить Anki</button></div>' :
       '<div class="btns"><button id="restartAnki" class="sec">Запустить / перезапустить Anki</button></div>');
-  if ($('fixPort')) $('fixPort').onclick = async () => { const r = await post('/api/fix-anki-port'); if (r.error) return alert(r.error); alert('Готово: порт ' + r.port + '. Теперь перезапустите Anki (кнопка рядом).'); ankiDiagAt = 0; refresh(); };
-  if ($('restartAnki')) $('restartAnki').onclick = async () => { if (!confirm('Anki будет закрыт и запущен снова. Продолжить?')) return; const r = await post('/api/restart-anki'); if (r.error) alert(r.error); ankiDiagAt = 0; setTimeout(refresh, 3000); };
+  if ($('fixPort')) $('fixPort').onclick = () => act($('fixPort'), 'Исправляю порт…', async () => { const r = await post('/api/fix-anki-port'); if (r.error) throw new Error(r.error); toast('✓ Порт ' + r.port + ' записан в настройки AnkiConnect. Теперь перезапустите Anki (кнопка рядом).'); ankiDiagAt = 0; refresh(); });
+  if ($('restartAnki')) $('restartAnki').onclick = () => { if (confirm('Anki будет закрыт и запущен снова. Продолжить?')) act($('restartAnki'), 'Перезапускаю Anki…', async () => { const r = await post('/api/restart-anki'); if (r.error) throw new Error(r.error); ankiDiagAt = 0; toast('✓ Anki перезапускается'); setTimeout(refresh, 3000); }); };
 }
 
 let chromeBuilt = false;
@@ -91,8 +101,8 @@ async function chromeBox(s) {
     const save2 = async () => { cfg.openChrome = $('c_chrome').checked; cfg.chromeProfile = $('c_prof').value; cfg.chromeMode = $('c_mode').value; cfg.chromeUrl = $('c_url').value.trim(); $('c_url_row').style.display = cfg.chromeMode === 'custom' ? '' : 'none'; await post('/api/config', cfg); };
     for (const id of ['c_chrome', 'c_prof', 'c_mode']) $(id).onchange = save2;
     $('c_url').onchange = save2;
-    $('openChrome').onclick = async () => { const r = await post('/api/open-chrome'); if (r.error) alert(r.error); };
-    $('mkLnk').onclick = async () => { const r = await post('/api/shortcut'); alert(r.error ? r.error : 'Ярлык создан: ' + r.path + '\nДвойной щелчок запускает лончер, Anki и Chrome с вашим профилем.'); };
+    $('openChrome').onclick = () => act($('openChrome'), 'Открываю Chrome…', async () => { const r = await post('/api/open-chrome'); if (r.error) throw new Error(r.error); await new Promise((x) => setTimeout(x, 900)); toast('✓ Chrome открывается с вашим профилем'); });
+    $('mkLnk').onclick = () => act($('mkLnk'), 'Создаю ярлык…', async () => { const r = await post('/api/shortcut'); if (r.error) throw new Error(r.error); toast('✓ Ярлык создан: ' + r.path + '\nДвойной щелчок запускает лончер, Anki и Chrome с вашим профилем.'); });
   }
   $('chromeInfo').textContent = (s.chrome ? 'Chrome: ' + s.chrome : 'Chrome не найден — укажите путь в config.json (chromePath)') +
     ' · ' + (l.id ? 'последнее видео: ' + (l.title || l.id) + ' (' + Math.floor(l.t / 60) + ':' + String(Math.floor(l.t % 60)).padStart(2, '0') + ')' : 'последнее видео появится, когда вы посмотрите что-нибудь с расширением');
@@ -116,23 +126,59 @@ async function refresh() {
     `<label class="chk"><input type="checkbox" id="c_auto" ${s.autostart ? 'checked' : ''}> Запускать лончер при входе в Windows</label>` +
     '<small style="color:var(--mute)">Остальное — в config.json рядом с лончером (пути к yt-dlp/ffmpeg/Anki, аргументы yt-dlp, размер кэша).</small>';
   for (const id of ['c_anki', 'c_dl', 'c_open']) $(id).onchange = save;
-  $('c_auto').onchange = async () => { const r = await post('/api/autostart?on=' + ($('c_auto').checked ? 1 : 0)); if (r.error) alert(r.error); refresh(); };
+  $('c_auto').onchange = async () => { const r = await post('/api/autostart?on=' + ($('c_auto').checked ? 1 : 0)); if (r.error) toast(r.error, true); else toast($('c_auto').checked ? '✓ Автозапуск включён' : '✓ Автозапуск выключен'); refresh(); };
   } else if ($('c_auto')) $('c_auto').checked = s.autostart;
   $('jobs').innerHTML = '<b>Загрузки аудио</b>' + (s.jobs && s.jobs.length ? s.jobs.map((j) =>
     `<div class="row"><div>${j.id}<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><small>${j.error || ''}</small></div><div class="${j.state === 'error' ? 'bad' : j.state === 'ready' ? 'ok' : ''}">${j.state === 'downloading' ? Math.round(j.progress * 100) + '%' : j.state}</div></div>`).join('') : '<div class="row"><div style="color:var(--mute)">Пока пусто — откройте видео на YouTube</div></div>');
   ankiBox(s); chromeBox(s);
+  $('tasks').innerHTML = Object.values(s.tasks || {}).sort((x, y) => y.at - x.at).slice(0, 3).map((t) => `<div class="task ${t.state === 'error' ? 'err' : t.state === 'done' ? 'ok' : ''}"><b>${{ install: 'Установка yt-dlp / ffmpeg', update: 'Обновление yt-dlp' }[t.name] || t.name}</b> — ${t.state === 'running' ? '⏳' : t.state === 'done' ? '✓' : '✗'}<div class="m">${t.msg}</div>${t.state === 'running' && t.progress >= 0 ? `<div class="bar"><i style="width:${Math.round(t.progress * 100)}%"></i></div>` : ''}</div>`).join('');
+  S_busy = Object.values(s.tasks || {}).some((t) => t.state === 'running');
   $('log').textContent = (s.log || []).join('\n');
 }
 async function save() {
   cfg.launchAnki = $('c_anki').checked; cfg.autoDownload = $('c_dl').checked; cfg.openStatusPage = $('c_open').checked;
   await post('/api/config', cfg);
 }
-$('startAnki').onclick = async () => { const r = await post('/api/start-anki'); if (r.error) alert(r.error); setTimeout(refresh, 1500); };
-$('install').onclick = async () => { await post('/api/install'); setTimeout(refresh, 800); };
-$('update').onclick = async () => { await post('/api/update-ytdlp'); setTimeout(refresh, 800); };
-$('clear').onclick = async () => { if (confirm('Удалить скачанное аудио?')) { await post('/api/clear-cache'); refresh(); } };
-$('quit').onclick = async () => { if (confirm('Выключить лончер? Звук карточек вернётся к записи с видео.')) { await post('/api/quit'); setTimeout(refresh, 600); } };
-refresh(); setInterval(refresh, 2000);
+
+let toastTimer = 0;
+function toast(msg, bad) {
+  const t = $('toast');
+  t.textContent = msg; t.className = bad ? 'bad' : ''; t.style.display = 'block';
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.style.display = 'none'; }, bad ? 12000 : 7000);
+}
+// A button press is always visible: it turns into "⏳ …" and stays disabled until the work is finished.
+async function act(btn, busy, fn) {
+  if (btn.disabled) return;
+  const old = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> ' + busy;
+  try { await fn(btn); } catch (e) { toast(String(e.message || e), true); }
+  btn.disabled = false; btn.innerHTML = old;
+}
+async function waitTask(name, btn) {
+  for (let i = 0; i < 4000; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    let s; try { s = await (await fetch('/api/status')).json(); } catch (_) { continue; }
+    const t = (s.tasks || {})[name];
+    if (!t) continue;
+    if (btn && t.state === 'running') btn.innerHTML = '<span class="spin"></span> ' + t.msg.slice(0, 60);
+    if (t.state !== 'running') { refresh(); if (t.state === 'error') throw new Error(t.msg); return t.msg; }
+  }
+  throw new Error('Слишком долго — смотрите журнал ниже');
+}
+const runTaskBtn = (id, label, path, name) => { $(id).onclick = () => act($(id), label, async (btn) => { const r = await post(path); if (r.started === false) toast('Уже выполняется…'); toast('✓ ' + await waitTask(name, btn)); }); };
+runTaskBtn('install', 'Проверяю…', '/api/install', 'install');
+runTaskBtn('reinstall', 'Скачиваю…', '/api/install?force=1', 'install');
+runTaskBtn('update', 'Обновляю…', '/api/update-ytdlp', 'update');
+$('startAnki').onclick = () => act($('startAnki'), 'Запускаю Anki…', async () => {
+  const r = await post('/api/start-anki');
+  if (r.error) throw new Error(r.error);
+  for (let i = 0; i < 40; i++) { await new Promise((x) => setTimeout(x, 500)); const s = await (await fetch('/api/status')).json(); if (s.ankiConnect) { refresh(); return toast('✓ Anki запущен, AnkiConnect на связи'); } }
+  toast('Anki запускается, но AnkiConnect пока не отвечает. Если Anki уже открыт — посмотрите блок «AnkiConnect» выше.', true);
+});
+$('clear').onclick = () => { if (confirm('Удалить скачанное аудио?')) act($('clear'), 'Очищаю…', async () => { await post('/api/clear-cache'); await refresh(); toast('✓ Кэш очищен'); }); };
+$('quit').onclick = async () => { if (confirm('Выключить лончер? Звук карточек вернётся к записи с видео.')) { await post('/api/quit'); toast('Лончер выключен'); setTimeout(refresh, 600); } };
+let S_busy = false;
+(function loop() { refresh().finally(() => setTimeout(loop, S_busy ? 600 : 2000)); })();
 </script>
 </body>
 </html>

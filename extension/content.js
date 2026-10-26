@@ -1278,7 +1278,7 @@
       h('div', { class: 'ytam-subbar' }, select, h('label', { class: 'ytam-toggle' }, trToggle, 'Перевод')),
       status, prog, list, wordsPane, savedPane, devPane,
       h('div', { class: 'ytam-foot' },
-        h('kbd', { text: 'A' }), h('kbd', { text: 'S' }), h('kbd', { text: 'D' }), ' фразы · ',
+        h('kbd', { text: 'W' }), ' пауза · ', h('kbd', { text: 'A' }), h('kbd', { text: 'S' }), h('kbd', { text: 'D' }), ' фразы · ',
         h('kbd', { text: 'Q' }), ' автопауза · ', h('kbd', { text: 'R' }), ' ☆ фраза · ПКМ — знаю/изучаю'));
     collapse.addEventListener('click', () => {
       panel.classList.toggle('ytam-collapsed');
@@ -1889,7 +1889,7 @@
           h('div', { class: 'ytam-modal-left' },
             h('div', { class: 'ytam-m-title', text: 'Горячие клавиши' }),
             keyRow('Предыдущая', 'A'), keyRow('Повтор', 'S'), keyRow('Следующая', 'D'), keyRow('Пауза', 'Space'),
-            keyRow('Автопауза', 'Q'), keyRow('Сохранить фразу', 'R'), keyRow('Копировать фразу', 'Ctrl + C'),
+            keyRow('Пауза / воспроизведение', 'W'), keyRow('Автопауза', 'Q'), keyRow('Сохранить фразу', 'R'), keyRow('Копировать фразу', 'Ctrl + C'),
             keyRow('Словарь', 'Клик'), keyRow('Отметить слово', 'ПКМ'), keyRow('Статус при наведении', '1 / 2 / 3 / 0'),
             h('button', { class: 'ytam-m-link', text: 'Мой словарь и импорт →', onclick: () => bg({ type: 'openOptions' }) })),
           form),
@@ -2927,14 +2927,34 @@
 
   // ---------- playback control ----------
 
+  // Jump to a phrase (A / S / D, list click). The phrase is pinned on screen at once: the run-up to its start
+  // belongs to the PREVIOUS phrase in the timeline, and without the pin that one would flash for a moment.
   function seekCue(i, play) {
     const v = getVideo();
     const c = S.cues[i];
     if (!v || !c) return;
     S.lastAutoPause = -1;
     S.lastHoverPause = -1;
+    S.lastSeekAt = Date.now();
+    S.ownSeek = Date.now();                 // our own seek: do not treat it as the user's rewind
+    S.pin = { i, at: Date.now() };
+    S.holdCue = -1;
+    S.goneCue = -1;
+    S.hoverPaused = false;
     v.currentTime = Math.max(0, c.start + X.subShift - X.seekLead);
     if (play) v.play();
+    try { tick(); } catch (_) { /* painted on the next tick anyway */ }
+  }
+
+  // The phrase "owning" time t: the pinned one during the run-up to its start, otherwise by time.
+  function activeAt(t) {
+    const p = S.pin;
+    if (p) {
+      const c = S.cues[p.i];
+      if (c && t < c.start + 0.03 && t > c.start - 2 && Date.now() - p.at < 3000) return p.i;
+      S.pin = null;
+    }
+    return cueIndexAt(t);
   }
 
   // ---------- stopping at the end of a phrase (AP and "pause when hovering") ----------
@@ -2978,7 +2998,7 @@
       try {
         if (!v.paused && S.cues.length) {
           const t = (meta && meta.mediaTime != null ? meta.mediaTime : v.currentTime) - X.subShift;
-          endGuard(v, t, cueIndexAt(t));
+          endGuard(v, t, activeAt(t));
         }
       } catch (_) { /* keep the loop alive */ }
       v.requestVideoFrameCallback(cb);
@@ -2998,7 +3018,7 @@
     const next = S.cues[prev + 1];
     S.holdCue = prev;
     v.pause();
-    S.ownSeek = true; // this seek must not re-arm the stop for the same phrase
+    S.ownSeek = Date.now(); // this seek must not re-arm the stop for the same phrase
     v.currentTime = Math.max(pc.start, Math.min(pc.end, next ? next.start : Infinity) - 0.05) + X.subShift;
     return true;
   }
@@ -3008,14 +3028,14 @@
     if (!S.videoId) return;
     const v = getVideo();
     if (!v) return;
-    if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastSeekAt = Date.now(); if (S.ownSeek) { S.ownSeek = false; return; } S.lastHoverPause = -1; }); }
+    if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastSeekAt = Date.now(); if (S.ownSeek && Date.now() - S.ownSeek < 800) { S.ownSeek = 0; return; } S.lastHoverPause = -1; }); }
     tapEnsure(v);
     if (++pendingTick % 5 === 0) processPending(false);
     if (!ui) return;
     mountOverlay();
     if (!S.cues.length) return;
     const t = v.currentTime - X.subShift;
-    let a = cueIndexAt(t);
+    let a = activeAt(t);
     armFrameLoop(v);
     // Safety net: if the end of the previous phrase slipped by between two checks (stalled tab, long task),
     // go back to it and stop there instead of silently running into the next phrase.
@@ -3032,7 +3052,7 @@
     const speakingEff = !v.paused && nowMs - (S.spokeAt || 0) < X.speakHoldMs;
     if (!v.paused || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
-    let shown = c && (t <= c.end + X.showTail || (speakingEff && t <= hardT) || S.holdCue === a) ? a : -1;
+    let shown = c && (t <= c.end + (+settings.tailSec >= 0 ? +settings.tailSec : 2.5) || (speakingEff && t <= hardT) || S.holdCue === a) ? a : -1;
     // A phrase that has left the screen never comes back until playback returns before its start (no blinking).
     if (c && t < c.start) S.goneCue = -1;
     if (shown === -1 && S.shown === a && a >= 0) S.goneCue = a;
@@ -3132,6 +3152,12 @@
     }
 
     const actions = {
+      // W: stop / play (like Language Reactor). A / D: previous / next phrase, S: repeat this one.
+      KeyW: () => {
+        const v = getVideo();
+        if (!v) return;
+        if (v.paused) { S.hoverPaused = false; v.play(); } else { v.pause(); }
+      },
       KeyA: () => seekCue(Math.max(0, cur - 1), true),
       KeyD: () => seekCue(Math.min(S.cues.length - 1, cur + 1), true),
       KeyS: () => seekCue(cur, true),
@@ -3150,6 +3176,7 @@
     if (!fn) return;
     e.preventDefault();
     e.stopPropagation();
+    if (e.repeat && /^Key[WSQRE]$/.test(e.code)) return; // holding W / S must not flip or restart over and over
     fn();
   }, true);
 

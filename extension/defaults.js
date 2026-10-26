@@ -55,6 +55,7 @@ self.YTAM_DEFAULTS = {
   // Look
   fontFamily: 'default',
   fontSize: 18,
+  tailSec: 2.5,
   fontWeight: 600,
   trScale: 80,
   subBgOpacity: 60,
@@ -128,6 +129,7 @@ self.YTAM_SCHEMA = [
       { k: 'trScale', label: 'Размер перевода', type: 'range', min: 50, max: 110, step: 5, unit: '%' },
       { k: 'subBgOpacity', label: 'Непрозрачность подложки', type: 'range', min: 0, max: 100, step: 5, unit: '%' },
       { k: 'subPos', label: 'Высота субтитров от низа видео', type: 'range', min: 0, max: 70, step: 1, unit: '%', preview: 'pos' },
+      { k: 'tailSec', label: 'Держать фразу на экране после конца', type: 'range', min: 0, max: 6, step: 0.25, unit: 'с', hint: 'Пока не началась следующая: реплика «запечатлевается» на пару секунд, даже если дальше музыка или тишина (в Language Reactor — около 2,5 с)' },
       { k: 'twoLines', label: 'Режим двух строк', type: 'toggle', hint: 'Длинная фраза переносится на две ровные строки' },
       { k: 'showSubControls', label: 'Кнопки у субтитров (▶ ☆)', type: 'toggle' },
       { k: 'showSideControls', label: 'Кнопки по бокам видео (‹ ↻ › AP)', type: 'toggle' },
@@ -286,8 +288,7 @@ self.YTAM_DEV_SCHEMA = [
   },
   {
     title: 'Тайминги субтитров', fields: [
-      { k: 'showTail', label: 'Держать фразу на экране после конца', def: 0.25, min: 0, max: 3, step: 0.05, unit: 'с' },
-      { k: 'seekLead', label: 'Переход к фразе: начать чуть раньше на', def: 0.2, min: 0, max: 1, step: 0.05, unit: 'с', hint: 'Так в записи есть начало фразы' },
+      { k: 'seekLead', label: 'Переход к фразе: начать чуть раньше на', def: 0.1, min: 0, max: 1, step: 0.05, unit: 'с', hint: 'Так в записи есть начало фразы' },
       { k: 'subShift', label: 'Сдвиг всех субтитров', def: 0, min: -2, max: 2, step: 0.05, unit: 'с', hint: '+ = позже' },
       { k: 'endWaitMax', label: 'Пауза в конце фразы: ждать тишины не дольше', def: 1.2, min: 0, max: 3, step: 0.05, unit: 'с', hint: 'YouTube часто заканчивает фразу раньше, чем затихла речь; не режем слова' },
       { k: 'endLead', label: 'Пауза в конце фразы: остановить не позже чем за … до следующей', def: 0.1, min: 0.03, max: 0.4, step: 0.01, unit: 'с', hint: 'Запас, чтобы граница фраз не проскочила между проверками (проверка — каждый кадр видео)' },
