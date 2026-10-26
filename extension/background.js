@@ -517,7 +517,8 @@ async function httpError(r, label) {
 // answers (word explanations, translations, short JSON) we switch that off. Models disagree about the parameter,
 // so the first rejected one is replaced by the next, and the working variant is remembered per model.
 const THINK_LADDER = [{ thinkingBudget: 0 }, { thinkingLevel: 'minimal' }, { thinkingLevel: 'low' }, null];
-const thinkStep = {}; // model → index in THINK_LADDER that works
+const thinkStep = {}; // model → index in THINK_LADDER that works (kept in storage: found once, used forever)
+chrome.storage.local.get({ thinkStep: {} }).then((r) => Object.assign(thinkStep, r.thinkStep)).catch(() => {});
 
 async function geminiFetch(url, body, cfg, model, { think = true } = {}) {
   const useThink = think && cfg.aiThinking !== 'model' && !/gemini-1\./.test(model);
@@ -532,9 +533,12 @@ async function geminiFetch(url, body, cfg, model, { think = true } = {}) {
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
       body: JSON.stringify({ ...body, generationConfig: gc }),
     });
+    // Any 400 while a thinking parameter was sent: that parameter is the suspect ("Request contains an invalid
+    // argument" does not even name it). Take the next step of the ladder; the last step sends none.
     if (r.status === 400 && tc) {
-      const txt = await r.clone().text().catch(() => '');
-      if (/think/i.test(txt)) { thinkStep[model] = Math.min(THINK_LADDER.length - 1, step + 1); continue; }
+      thinkStep[model] = Math.min(THINK_LADDER.length - 1, step + 1);
+      chrome.storage.local.set({ thinkStep }).catch(() => {});
+      continue;
     }
     return r;
   }
@@ -721,7 +725,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const t0 = performance.now();
       let first = 0;
       await streamLlm(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => { if (!first) first = performance.now() - t0; port.postMessage({ delta }); });
-      port.postMessage({ done: true, meta: { model: cfg.aiFastModel, first: Math.round(first), total: Math.round(performance.now() - t0), think: cfg.aiThinking === 'model' ? 'модель решает сама' : 'без размышлений' } });
+      port.postMessage({ done: true, meta: { model: cfg.aiFastModel, first: Math.round(first), total: Math.round(performance.now() - t0), think: cfg.aiThinking === 'model' || !THINK_LADDER[thinkStep[cfg.aiFastModel] || 0] ? 'размышления по умолчанию модели' : 'без размышлений' } });
     } catch (e) {
       try { port.postMessage({ error: e.message || String(e) }); } catch (_) {}
     }
