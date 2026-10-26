@@ -59,6 +59,7 @@ const SRC = {
   wikt: { name: 'Wiktionary', ok: 0, fail: 0, last: '', at: 0 },
   mymem: { name: 'MyMemory', ok: 0, fail: 0, last: '', at: 0 },
   ai: { name: 'ИИ (Gemini)', ok: 0, fail: 0, last: '', at: 0 },
+  ipa: { name: 'Транскрипция (dictionaryapi.dev)', ok: 0, fail: 0, last: '', at: 0 },
 };
 function mark(src, ok, info) {
   const s = SRC[src];
@@ -415,13 +416,35 @@ async function wiktFetchWord(word, tl, depth = 0) {
     try { const sub = await wiktApi({ action: 'parse', page: word + '/translations', prop: 'wikitext' }); text += '\n' + ((sub.parse || {}).wikitext || ''); } catch (_) { /* optional */ }
   }
   const out = parseWikt(text, codes);
+  out.ipa = parseIpa(text);
   if (!out.dict.length && out.lemma && out.lemma.toLowerCase() !== word && depth < 1) {
     const base = await wiktFetchWord(out.lemma.toLowerCase(), tl, depth + 1);
     // "figured" is a verb form: the verb meanings of "figure" go first, not its noun meanings
     if (out.lemmaPos) base.dict.sort((x, y) => (y.pos === out.lemmaPos) - (x.pos === out.lemmaPos));
-    return { ...base, lemma: out.lemma };
+    return { ...base, lemma: out.lemma, ipa: out.ipa };   // (the pronunciation is the word's own, not the lemma's)
   }
   return out;
+}
+
+// IPA written out in the entry ({{IPA|en|/ˈfaɪnəli/}}); the American one when there are several. Entries that use the
+// generated {{en-IPA}} template carry no IPA in their text — those are covered by dictionaryapi.dev.
+function parseIpa(text) {
+  let any = '';
+  for (const ln of text.split('\n')) {
+    const m = /\{\{IPA\|en\|([^}]*)\}\}/.exec(ln);
+    if (!m) continue;
+    const p = cleanIpa(m[1].split('|').map((x) => x.trim()).find((x) => /^[\/\[].+[\/\]]$/.test(x)));
+    if (!p) continue;
+    if (/\{\{a\|[^}]*(US|GenAm|General American)|\bUS\b/i.test(ln)) return p;
+    if (!any) any = p;
+  }
+  return any;
+}
+
+// "/ˈfaɪnəli/" → "ˈfaɪnəli" (the brackets are added where it is shown)
+function cleanIpa(x) {
+  const t = String(x || '').replace(/[\u200b\u200e]/g, '').trim().replace(/^[\/\[(]+|[\/\])]+$/g, '').trim();
+  return t && t.length <= 60 && !/[<>{}|=]/.test(t) ? t : '';
 }
 
 // Cached for good (misses are retried after a week). Never more than 4 requests at once.
@@ -433,7 +456,7 @@ async function wiktVariants(word, tl) {
   wikt.active++;
   try {
     const out = await wiktFetchWord(word, tl);
-    cache[word] = { dict: out.dict.map((g) => ({ pos: g.pos, terms: g.terms.slice(0, 6) })), lemma: out.lemma || '', miss: !out.dict.length, at: Date.now() };
+    cache[word] = { dict: out.dict.map((g) => ({ pos: g.pos, terms: g.terms.slice(0, 6) })), lemma: out.lemma || '', ipa: out.ipa || '', miss: !out.dict.length, at: Date.now() };
     persistCache('wkt:' + tl);
     if (out.dict.length) mark('wikt', true);
     return cache[word];
@@ -524,6 +547,82 @@ async function myMemoryVariants(word, tl) {
   }
   if (terms.length) mark('mymem', true);
   return terms.length ? [{ pos: '', terms }] : [];
+}
+
+// ---- Pronunciation (IPA), shown as [ˈfaɪnəli] in the tooltip and in the word window ----
+// Cached for good (word → text; a number = "none found", retried after a week). Order: what we already have from
+// Wiktionary → dictionaryapi.dev (free, no key; its phonetics come from Wiktionary) → the Wiktionary entry itself.
+const ipaState = { active: 0, queue: [], budget: 150, refill: 0, down: 0 };
+
+async function ipaDictApi(word) {
+  const r = await fetchT('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word), {}, 6000);
+  if (r.status === 404) return '';
+  if (!r.ok) { mark('ipa', false, 'HTTP ' + r.status); if (r.status === 429) ipaState.down = Date.now() + 60000; throw new Error('HTTP ' + r.status); }
+  const j = await r.json();
+  const all = [];
+  for (const e of Array.isArray(j) ? j : []) {
+    for (const p of e.phonetics || []) if (p.text) all.push({ t: p.text, us: /-us\.|\/us\//i.test(p.audio || '') });
+    if (e.phonetic) all.push({ t: e.phonetic, us: false });
+  }
+  const best = all.find((x) => x.us && cleanIpa(x.t)) || all.find((x) => cleanIpa(x.t));
+  const out = best ? cleanIpa(best.t) : '';
+  if (out) mark('ipa', true);
+  return out;
+}
+
+async function ipaOf(word, prio = 0) {
+  word = String(word || '').toLowerCase();
+  if (!/^[a-z][a-z'-]*$/.test(word)) return '';
+  const cache = await getCache('ipa:en');
+  const hit = cache[word];
+  if (typeof hit === 'string') return hit;
+  if (typeof hit === 'number' && Date.now() / 1000 - hit < 7 * 86400) return '';
+  // 1. free by-product of the Wiktionary variants we may already hold
+  for (const k of Object.keys(caches)) {
+    if (k.startsWith('wkt:') && caches[k][word] && caches[k][word].ipa) { cache[word] = caches[k][word].ipa; persistCache('ipa:en'); return cache[word]; }
+  }
+  // 2. dictionaryapi.dev (background warm-up has a small budget so the service is never hammered; hover always goes)
+  if (Date.now() > ipaState.down && (prio >= 1 || ipaState.budget > 0)) {
+    if (Date.now() - ipaState.refill > 300000) { ipaState.budget = 150; ipaState.refill = Date.now(); }
+    while (ipaState.active >= 2) await new Promise((r) => ipaState.queue.push(r));
+    ipaState.active++;
+    try {
+      if (prio < 1) ipaState.budget--;
+      const p = await ipaDictApi(word);
+      if (p) { cache[word] = p; persistCache('ipa:en'); return p; }
+    } catch (_) { /* fall through to Wiktionary */ } finally {
+      ipaState.active--;
+      const next = ipaState.queue.shift();
+      if (next) next();
+    }
+  }
+  // 3. the Wiktionary entry (its own IPA template), only when someone is waiting for it
+  if (prio >= 1) {
+    try {
+      const w = await wiktVariants(word, (await cloudCfg()).targetLang || 'ru');
+      if (w && w.ipa) { cache[word] = w.ipa; persistCache('ipa:en'); return w.ipa; }
+    } catch (_) { /* none */ }
+  }
+  cache[word] = Math.floor(Date.now() / 1000);
+  persistCache('ipa:en');
+  return '';
+}
+
+// Warm-up: the words around the current phrase first (the page sends them in that order), at most two at a time.
+const ipaWarm = { running: false, todo: [] };
+async function warmIpa(words) {
+  const cache = await getCache('ipa:en');
+  const seen = new Set(ipaWarm.todo);
+  for (const w of words) if (!seen.has(w) && !(w in cache) && /^[a-z][a-z'-]*$/.test(w)) ipaWarm.todo.push(w);
+  if (ipaWarm.running) return ipaWarm.todo.length;
+  ipaWarm.running = true;
+  (async () => {
+    try {
+      const pump = async () => { while (ipaWarm.todo.length && ipaState.budget > 0 && Date.now() > ipaState.down) { const w = ipaWarm.todo.shift(); try { await ipaOf(w, 0); } catch (_) { await sleep(300); } await sleep(120); } };
+      await Promise.all([pump(), pump()]);
+    } finally { ipaWarm.running = false; ipaWarm.todo.length = 0; }
+  })();
+  return ipaWarm.todo.length;
 }
 
 // Dictionary variants (several meanings by part of speech): Google's free dictionary, then Microsoft's (Azure with a
@@ -1329,6 +1428,14 @@ async function helperPcm({ url, v, start, end, rate, wait = 20 }) {
   return { b64: bytesToB64(buf), rate };
 }
 
+// Loudness curve of the speech band of the whole video (10 ms per byte), computed by the launcher from the downloaded
+// audio. { pending: true } while the audio is still being downloaded.
+async function helperEnv({ url, v, lo, hi }) {
+  const r = await helperFetch(url, `/env?v=${encodeURIComponent(v)}&lo=${lo | 0}&hi=${hi | 0}`);
+  if (r.status === 202) return { pending: true, ...(await r.json().catch(() => ({}))) };
+  return { b64: bytesToB64(new Uint8Array(await r.arrayBuffer())), hop: +r.headers.get('X-Hop') || 0.01 };
+}
+
 // ---------- Messaging ----------
 
 // PCM (Int16 LE, base64) → MP3 (base64). Runs here so the video page never stalls while a card is made.
@@ -1359,7 +1466,7 @@ async function handle(msg) {
       for (const k of Object.keys(caches)) delete caches[k];
       dirtyCaches.clear(); ttsCache.clear(); ms.token = ''; gq.fails = 0; gq.downUntil = 0;
       const all = await chrome.storage.local.get(null);
-      await chrome.storage.local.remove(Object.keys(all).filter((k) => /^(trc|trs|lkc|wkt):/.test(k)));
+      await chrome.storage.local.remove(Object.keys(all).filter((k) => /^(trc|trs|lkc|wkt|ipa):/.test(k)));
       return true;
     }
     case 'cardVoice': {
@@ -1371,6 +1478,8 @@ async function handle(msg) {
     case 'aiTrim': return aiTrim(msg);
     case 'aiExamples': return aiExamples(msg);
     case 'warmVariants': return warmVariants(msg.words || [], msg.tl);
+    case 'ipa': return ipaOf(msg.word, msg.prio);
+    case 'warmIpa': return warmIpa(msg.words || []);
     case 'offlineStart': return offlineBuild(msg.n, msg.tl);
     case 'offlineStop': { offline.stop = true; await chrome.storage.local.remove('offlineJob'); return true; }
     case 'offlineStatus': return offlineStatus();
@@ -1391,6 +1500,7 @@ async function handle(msg) {
     case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);
+    case 'helperEnv': return helperEnv(msg);
     case 'helperProgress': return (await helperFetch(msg.url, `/progress?v=${encodeURIComponent(msg.v)}&t=${Math.round((msg.t || 0) * 10) / 10}&title=${encodeURIComponent(String(msg.title || '').slice(0, 150))}`)).json();
     case 'ankiProgress': return ankiProgress();
     case 'deleteNotes': return deleteOwnNotes(msg.ids);

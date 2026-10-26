@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "7.6.0",
-  "version_name": "7.6 — буфер перевода: варианты из Wiktionary заранее, офлайн-словарь, короткие пометки",
+  "version": "7.7.0",
+  "version_name": "7.7 — чистый звук: конец фразы по карте речи, транскрипция, громкость озвучки",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -21,7 +21,8 @@
     "https://api-edge.cognitive.microsofttranslator.com/*",
     "https://api.cognitive.microsofttranslator.com/*",
     "https://en.wiktionary.org/*",
-    "https://api.mymemory.translated.net/*"
+    "https://api.mymemory.translated.net/*",
+    "https://api.dictionaryapi.dev/*"
   ],
   "background": {
     "service_worker": "background.js"

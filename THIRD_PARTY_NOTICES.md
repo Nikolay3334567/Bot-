@@ -11,3 +11,8 @@
 
 ## Wiktionary
 Translations shown in the tooltip are read from English Wiktionary (https://en.wiktionary.org) through its public API and cached locally. Wiktionary content is available under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/) and the GNU Free Documentation License; authors are listed in each entry's page history.
+
+## Free Dictionary API (dictionaryapi.dev)
+
+Pronunciations (IPA) shown as `[ˈfaɪnəli]` are fetched at runtime from https://dictionaryapi.dev (free, no key). Its phonetics are
+derived from Wiktionary (CC BY-SA 3.0 / GFDL). Nothing is bundled with the extension; results are cached locally.

@@ -604,6 +604,42 @@ func handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Write(pcm)
 	})
+	// Loudness curve of the speech band, 10 ms per byte (see envelope.go): the extension finds the real end of
+	// every phrase from it in advance. 202 = the audio is still being downloaded, ask again.
+	mux.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		id := q.Get("v")
+		if !idRe.MatchString(id) {
+			writeJSON(w, 400, map[string]string{"error": "bad video id"})
+			return
+		}
+		lo, _ := strconv.Atoi(q.Get("lo"))
+		hi, _ := strconv.Atoi(q.Get("hi"))
+		if lo < 50 || lo > 1000 {
+			lo = 250
+		}
+		if hi < 1500 || hi > 7000 {
+			hi = 4500
+		}
+		j := prepare(id)
+		if j.State == "error" {
+			writeJSON(w, 503, map[string]string{"error": j.Error})
+			return
+		}
+		if j.State != "ready" {
+			writeJSON(w, 202, map[string]any{"state": j.State, "progress": j.Progress})
+			return
+		}
+		b, err := envelope(id, j.file, lo, hi)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Hop", "0.01")
+		w.Write(b)
+	})
 	mux.HandleFunc("/api/", api)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !hostOK(r) {

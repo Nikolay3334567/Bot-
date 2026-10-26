@@ -51,10 +51,15 @@
   const DCms = () => +document.documentElement.dataset.ytamDc || 0;    // 0 = off
   const isMainVideo = (v) => v && v.tagName === 'VIDEO' && /html5-main-video/.test(v.className);
   const quiet = (v, x) => { document.documentElement.dataset.ytamQ = String(nowAbs() + 150); v.volume = Math.max(0, Math.min(1, x)); };
+  // Follows the clock, not a step count: a late timer jumps to where the volume should be by now (no dragged-out gap).
   const ramp = (v, to, ms) => new Promise((res) => {
-    const from = v.volume, steps = Math.max(1, Math.round(ms / 5));
-    let i = 0;
-    const t = setInterval(() => { i++; quiet(v, from + (to - from) * Math.min(1, i / steps)); if (i >= steps) { clearInterval(t); res(); } }, 5);
+    const from = v.volume, t0 = performance.now();
+    document.documentElement.dataset.ytamQ = String(nowAbs() + ms + 200);
+    const t = setInterval(() => {
+      const k = Math.min(1, (performance.now() - t0) / Math.max(1, ms));
+      v.volume = Math.max(0, Math.min(1, from + (to - from) * k));
+      if (k >= 1) { clearInterval(t); res(); }
+    }, 4);
   });
   const nativePause = HTMLMediaElement.prototype.pause;
   const nativePlay = HTMLMediaElement.prototype.play;

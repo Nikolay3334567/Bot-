@@ -1062,6 +1062,7 @@
     const batches = [];
     for (let i = 0, step = 60; i < list.length; i += step, step = 300) batches.push(list.slice(i, i + step));
     bg({ type: 'warmVariants', words: ordered.filter((w) => !w.includes(' ')), tl }).catch(() => {});
+    if (settings.showIpaTip || settings.showIpaPop) bg({ type: 'warmIpa', words: ordered.filter((w) => !w.includes(' ')).slice(0, 400) }).catch(() => {});
     for (const part of batches) {
       if (token !== S.token || tl !== settings.targetLang) return;
       try {
@@ -1446,6 +1447,7 @@
     ui.list.scrollTop = top;
     if (ui.rows[S.active]) ui.rows[S.active].classList.add('ytam-active');
     refreshSideTabs();
+    tipRebind();
   }
 
   function updateRowTr(i) {
@@ -1495,6 +1497,7 @@
     ui.ovTr.textContent = S.trans[S.shown] || (settings.showTranslation && S.trans[S.shown] == null ? '…' : '');
     if (S.trans[S.shown] == null) ensureCueTr(S.shown);
     renderOverlayStar();
+    tipRebind();
   }
 
   const FONT_STACK = 'Roboto, "Segoe UI", "Helvetica Neue", Arial, sans-serif';
@@ -1864,7 +1867,8 @@
       `запись в памяти ${Math.round(buf)} с · проходов ${Tap.pass}`,
       `помощник: ${S.helper.state}${S.helper.state === 'downloading' ? ' ' + Math.round(S.helper.progress * 100) + '%' : ''}`,
       `ждут аудио: ${S.pending.length} · словарь в очереди: ${dictQueue.length}`,
-      `речь/фон: ${Tap.reliable ? 'ясно' : 'неясно'} (перепад ${Tap.contrast.toFixed(0)} дБ) · тишина ${Math.round(Tap.quietMs)} мс`,
+      `карта речи: ${Speech.state === 'ready' ? 'готова' : Speech.state === 'wait' ? 'считается…' : Speech.state === 'failed' ? 'не вышло (слушаем видео)' : 'нет'}${Speech.env && c ? (speechThrFor(c).reliable ? ' · речь ясна' : ' · речь на фоне неясна') : ''}${c && Speech.env ? ' · конец ' + endTimes(a).endT.toFixed(2) : ''}`,
+      `речь/фон (живой захват): ${Tap.src ? (Tap.reliable ? 'ясно' : 'неясно') + ` (перепад ${Tap.contrast.toFixed(0)} дБ) · тишина ${Math.round(Tap.quietMs)} мс` : 'выключен'}`,
     ].join('\n');
   }
 
@@ -2058,6 +2062,17 @@
     el.style.maxHeight = (above ? r.top - gap - 8 : innerHeight - r.bottom - gap - 8) + 'px';
   }
 
+  // ---------- pronunciation (IPA) ----------
+  // Asked from the background once per word (cached for good there); warmed up for the video's words like the translations.
+  const ipaMap = new Map();      // word → "ˈfaɪnəli" | '' (none known)
+  const ipaPending = new Set();
+  const ipaText = (w) => { const p = ipaMap.get(w); return p ? '[' + p + ']' : ''; };
+  function ensureIpa(w, again) {
+    if (ipaMap.has(w) || ipaPending.has(w) || !/^[a-z][a-z'-]*$/.test(w)) return;
+    ipaPending.add(w);
+    bg({ type: 'ipa', word: w, prio: 1 }).then((p) => { ipaMap.set(w, p || ''); if (p && again) again(); }).catch(() => {}).finally(() => ipaPending.delete(w));
+  }
+
   // ---------- hover tooltip (LR style) ----------
 
   let tipEl = null, tipFor = null, tipHideTimer = 0;
@@ -2071,8 +2086,21 @@
     }, X.tipHideMs);
   }
 
+  // Some actions (saving an expression) repaint the whole line: the word under the tooltip is replaced by a new
+  // element. The tooltip follows its word to the new element instead of being left anchored to a removed one
+  // (that threw it into the corner of the page, the pointer was no longer on it and it closed).
+  let tipKey = null;
+  function tipRebind() {
+    if (!tipFor || tipFor.isConnected || !tipKey || !ui) return;
+    // (a different phrase on the line is a different word, not this one repainted)
+    const sc = tipKey.ov ? (S.shown === tipKey.i ? ui.ovText : null) : ui.rows[tipKey.i];
+    const el = sc && [...sc.querySelectorAll('.ytam-w')].find((s) => s.dataset.w === tipKey.w && s.dataset.ti === tipKey.ti);
+    if (el) showTip(el, tipKey.i);
+  }
+
   function hideTip() {
     tipFor = null;
+    tipKey = null;
     if (!tipEl) return;
     tipEl.classList.remove('show');
     const el = tipEl;
@@ -2118,6 +2146,7 @@
     const same = tipFor && tipFor !== span && !tipFor.isConnected && tipFor.dataset.w === span.dataset.w && tipFor.dataset.ti === span.dataset.ti;
     const moved = (+settings.tipAnim > 0) && wasShown && !same && tipFor !== span && tipEl.classList.contains('show');
     tipFor = span;
+    tipKey = { w, ti: span.dataset.ti, i, ov: !!(ui && ui.overlay.contains(span)) };
     const exprs = exprsAt(i, +span.dataset.ti).slice(0, 2);
     const n = Math.max(1, +settings.tipVariants || 3);
 
@@ -2134,6 +2163,7 @@
         kids.push(h('div', { class: 'ytam-tip-head' }, h('span', { text: e.surf || e.p }), save), varsEl(exprTr(e) ? [exprTr(e)] : []));
       }
       if (exprs.length) kids.push(h('div', { class: 'ytam-tip-head' }, h('span', { text: span.textContent })));
+      if (settings.showIpaTip) { const t = ipaText(w); if (t) kids.push(h('div', { class: 'ytam-tip-ipa', text: t })); }
       kids.push(varsEl(vars));
       { const sl = srcLine(w); if (sl) kids.push(sl); }
       if (settings.showStageButtons) {
@@ -2149,7 +2179,7 @@
           })));
       }
       tipEl.replaceChildren(...kids);
-      anchorTo(tipEl, span, X.tipGap, 160);
+      if (span.isConnected) anchorTo(tipEl, span, X.tipGap, 160); // (a removed word has no position: stay where we are)
     };
 
     layer().append(tipEl);
@@ -2172,6 +2202,7 @@
     }
     getDictHi(w, (S.cues[i] || {}).text).then(fill);
     onDictFull(w, fill);
+    if (settings.showIpaTip) ensureIpa(w, fill);
     for (const e of exprs) {
       if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
     }
@@ -2285,6 +2316,10 @@
 
     const dictBox = h('div', { class: 'ytam-pop-dict' });
     const trEl = h('div', { class: 'ytam-pop-tr' });
+    const ipaEl = h('span', { class: 'ytam-pop-ipa' });
+    const showIpa = () => { ipaEl.textContent = settings.showIpaPop ? ipaText(w) : ''; };
+    showIpa();
+    if (settings.showIpaPop && !w.includes(' ')) ensureIpa(w, showIpa);
     const fillDict = () => {
       const d = dict.get(w);
       trEl.textContent = variants(w).slice(0, 3).join(', ') || '…';
@@ -2323,7 +2358,7 @@
       ...(rankEl ? [rankEl] : []),
       h('div', { class: 'ytam-pop-head' },
         pill,
-        h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }), trEl),
+        h('div', { class: 'ytam-pop-title' }, h('div', { class: 'ytam-pop-word', text: word }, ipaEl), trEl),
         h('button', { class: 'ytam-x', title: 'Произнести', text: '🔊', onclick: () => speak(word) }),
         h('button', { class: 'ytam-x', title: 'Закрыть', text: '✕', onclick: closePop })),
       exprs.length ? h('div', { class: 'ytam-pop-exprs' }, exprEls.map(({ e, tr }) => h('div', {},
@@ -2361,11 +2396,13 @@
   }
 
   let speakAudio = null;
+  const ttsVol = () => Math.max(0, Math.min(1, (settings.ttsVolume == null ? 70 : +settings.ttsVolume) / 100));
   function speakBrowser(text) {
     try {
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = 'en-US';
+      u.volume = ttsVol();
       speechSynthesis.speak(u);
     } catch (_) {}
   }
@@ -2376,6 +2413,7 @@
     bg({ type: 'speakCloud', text }).then((r) => {
       try { if (speakAudio) speakAudio.pause(); } catch (_) {}
       speakAudio = new Audio('data:audio/mpeg;base64,' + r.b64);
+      speakAudio.volume = ttsVol();
       speakAudio.play().catch(() => speakBrowser(text));
     }).catch(() => { if (settings.ttsProvider !== 'cloud') speakBrowser(text); });
   }
@@ -2432,6 +2470,81 @@
     return { thr, floorL, peakL, contrast, reliable: contrast >= X.vadMinContrast };
   }
 
+  // ---------- speech map: where each phrase REALLY ends, computed in advance ----------
+  // With the launcher the audio of the video is downloaded anyway. It turns it into a loudness curve of the
+  // speech band (10 ms per byte, see launcher/envelope.go) once; here the end of the speech of every phrase is read
+  // from that curve BEFORE playback gets there. Nothing is listened to in the playing video: no capture, no extra
+  // audio graph, no per-block work on the page — the video and its sound stay untouched.
+
+  const Speech = { env: null, hop: 0.01, id: null, thr: new WeakMap(), state: 'off' };
+
+  async function loadSpeechMap(videoId, token) {
+    Speech.env = null; Speech.id = videoId; Speech.thr = new WeakMap(); Speech.state = 'off';
+    if (!+X.speechMap || !settings.includeAudio || settings.audioSource === 'capture') return;
+    Speech.state = 'wait';
+    for (let i = 0; i < 400; i++) {
+      if (token !== S.token) return;
+      let r;
+      try { r = await bg({ type: 'helperEnv', url: settings.helperUrl, v: videoId, lo: X.vadLoHz, hi: X.vadHiHz }); }
+      catch (_) { Speech.state = 'failed'; return; }   // (the live listening takes over again, see tapEnsure)
+      if (token !== S.token) return;
+      if (!r.pending) {
+        const bin = atob(r.b64), env = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) env[k] = bin.charCodeAt(k);
+        Speech.env = env; Speech.hop = r.hop || 0.01; Speech.state = 'ready';
+        return;
+      }
+      await sleep(1500);
+    }
+    Speech.state = 'failed';
+  }
+
+  // The map replaces the live listening to the video — as long as it is wanted and has not failed.
+  const speechMapWanted = () => +X.speechMap && settings.includeAudio && settings.audioSource !== 'capture' && Speech.state !== 'failed';
+
+  // Speech level (dB) at frame k, and the speech/background threshold for the stretch around a phrase.
+  const speechLvl = (k) => Speech.env[Math.max(0, Math.min(Speech.env.length - 1, k))] / 2.5;
+  function speechThrFor(c) {
+    let th = Speech.thr.get(c);
+    if (!th) {
+      const a = Math.max(0, Math.round((c.start - 25) / Speech.hop)), b = Math.min(Speech.env.length, Math.round((c.end + 25) / Speech.hop));
+      const L = new Float32Array(Math.max(1, b - a));
+      for (let k = a; k < b; k++) L[k - a] = Speech.env[k] / 2.5;
+      th = speechThreshold(L);
+      Speech.thr.set(c, th);
+    }
+    return th;
+  }
+
+  const speechMemo = new WeakMap();
+  function speechEndMemo(c, from, limit) {
+    const m = speechMemo.get(c);
+    if (m && m.env === Speech.env && Math.abs(m.from - from) < 0.0005 && Math.abs(m.limit - limit) < 0.0005) return m.val;
+    const val = speechEndAfter(c, from, limit);
+    speechMemo.set(c, { env: Speech.env, from, limit, val });
+    return val;
+  }
+
+  // Where the speech that is running at time `from` stops: the first stretch of X.endQuietMs below the threshold.
+  // `from` itself already quiet → the phrase is over there. Null = the map cannot tell (speech not clearly louder
+  // than the background, or no map): the caller keeps YouTube's timing.
+  function speechEndAfter(c, from, limit) {
+    if (!Speech.env || Speech.id !== S.videoId) return null;
+    const th = speechThrFor(c);
+    if (!th.reliable) return null;
+    const hop = Speech.hop, i0 = Math.round(from / hop), i1 = Math.round(limit / hop);
+    if (i0 < 0 || i1 >= Speech.env.length + 100) return null;
+    let active = false;
+    for (let k = i0 - Math.round(0.06 / hop); k <= i0; k++) if (speechLvl(k) >= th.thr) { active = true; break; }
+    if (!active) return from;
+    const quiet = Math.max(2, Math.round(X.endQuietMs / 1000 / hop));
+    let run = 0;
+    for (let k = i0; k <= i1; k++) {
+      if (speechLvl(k) < th.thr) { if (++run >= quiet) return Math.min(limit, (k - run + 1) * hop + X.speechPad); } else run = 0;
+    }
+    return limit; // the speech runs into the next phrase
+  }
+
   // ---------- background audio capture ----------
   // While the video plays we keep the last few minutes of its sound in memory
   // (tagged with video time). Saving a phrase cuts it from there — playback
@@ -2450,8 +2563,8 @@
 
   function tapEnsure(v) {
     if (!settings.includeAudio || !v) return;
-    // Test option "tapAlways" = 0: with the launcher supplying the audio, the video is not captured at all.
-    if (!+X.tapAlways && helperUsable(S.videoId)) { if (Tap.v) tapStop(); return; }
+    // With the launcher supplying the audio AND the speech map (tapAlways = 0, the default) the video is not touched at all.
+    if (!+X.tapAlways && helperUsable(S.videoId) && speechMapWanted()) { if (Tap.v) tapStop(); return; }
     if (Tap.v !== v) {
       try { Tap.stream = v.captureStream(); } catch (_) { Tap.stream = null; }
       Tap.v = v;
@@ -2461,7 +2574,7 @@
     }
     if (!Tap.stream) return;
     if (!Tap.ctx) {
-      Tap.ctx = new AudioContext();
+      Tap.ctx = new AudioContext({ latencyHint: 'playback' }); // big device buffers: this silent graph must never cost the video's sound a glitch
       Tap.proc = Tap.ctx.createScriptProcessor(4096, 2, 1);
       const mute = Tap.ctx.createGain();
       mute.gain.value = 0;
@@ -2492,7 +2605,10 @@
     const n = inp.length, sr = inp.sampleRate;
     const t1 = v.currentTime + X.tapOffset;
     const t0 = t1 - (n / sr) * v.playbackRate;
-    if (Tap.lastEnd == null || Math.abs(t0 - Tap.lastEnd) > 0.25) { Tap.pass++; Tap.ring = []; Tap.quietMs = 0; }
+    // A jump in video time starts a new recording pass, but the loudness history is kept: the background and speech levels
+    // of this video are still the same. (Clearing it made the live detector blind for ~1.4 s after every seek, and the
+    // stop at the end of a phrase then fell back to YouTube's raw timing and cut the speech.)
+    if (Tap.lastEnd == null || Math.abs(t0 - Tap.lastEnd) > 0.25) { Tap.pass++; Tap.quietMs = 0; }
     Tap.lastEnd = t1;
     const f = sr >= 44100 ? 2 : 1;
     const c0 = inp.getChannelData(0), c1 = inp.numberOfChannels > 1 ? inp.getChannelData(1) : c0;
@@ -2511,10 +2627,10 @@
     for (let i = 0; i < out.length; i++) { const y = bandStep(Tap.band, out[i]); e2 += y * y; }
     const lvl = levelOf(e2 / Math.max(1, out.length));
     Tap.ring.push(lvl);
-    if (Tap.ring.length > 64) Tap.ring.shift();
+    if (Tap.ring.length > 500) Tap.ring.shift(); // ~40 s of history: a long run of speech must not look like "no silence anywhere"
     const th = speechThreshold(Tap.ring);
     Tap.contrast = th.contrast;
-    Tap.reliable = Tap.ring.length >= 16 && th.reliable;
+    Tap.reliable = Tap.ring.length >= 10 && th.reliable;
     Tap.quietMs = lvl < th.thr ? Tap.quietMs + (n / sr) * 1000 : 0;
     Tap.blocks.push({ t0, t1, pass: Tap.pass, rate: sr / f, data: out });
     const maxBlocks = Math.ceil((X.tapMinutes * 60 * sr) / n);
@@ -2733,6 +2849,7 @@
       }
       if (token !== S.token) return;
       S.helper = { state: r.state, progress: r.progress || 0, error: r.error || '' };
+      if (r.state === 'ready') loadSpeechMap(videoId, token);
       if (r.state !== 'downloading') {
         if (r.state === 'error') setStatus('🎵 yt-dlp не смог скачать аудио: ' + r.error.slice(0, 160) + (settings.audioSource === 'helper' ? '' : ' Использую запись с видео.'));
         return;
@@ -3060,11 +3177,17 @@
     document.documentElement.dataset.ytamQ = String(nowAbs() + 150);
     v.volume = Math.max(0, Math.min(1, x));
   }
+  // The ramp follows the CLOCK, not a step count: if the page is busy and a timer fires late, the volume jumps to where
+  // it should be by now instead of dragging the quiet part of the fade out (that would be an audible gap).
   function rampVol(v, to, ms) {
     return new Promise((res) => {
-      const from = v.volume, steps = Math.max(1, Math.round(ms / 5));
-      let i = 0;
-      const t = setInterval(() => { i++; quietVol(v, from + (to - from) * Math.min(1, i / steps)); if (i >= steps) { clearInterval(t); res(); } }, 5);
+      const from = v.volume, t0 = performance.now();
+      document.documentElement.dataset.ytamQ = String(nowAbs() + ms + 200);
+      const t = setInterval(() => {
+        const k = Math.min(1, (performance.now() - t0) / Math.max(1, ms));
+        v.volume = Math.max(0, Math.min(1, from + (to - from) * k));
+        if (k >= 1) { clearInterval(t); res(); }
+      }, 4);
     });
   }
   const fading = new WeakMap();
@@ -3152,7 +3275,11 @@
     const v = getVideo();
     const limit = next ? next.start - X.endLead * Math.max(1, (v && v.playbackRate) || 1) : Infinity; // faster playback → bigger margin
     const endT = Math.min(Math.max(c.start + 0.3, Math.min(c.end + X.endExtra, next ? next.start : Infinity) - X.autoPauseEarly), limit);
-    return { endT, hardT: Math.min(endT + X.endWaitMax, limit) };
+    const hardT = Math.min(endT + X.endWaitMax, limit);
+    // The speech map knows where the voice really stops: the stop is placed there, no listening to the video.
+    const m = Speech.env && +X.speechMap && isFinite(hardT) ? speechEndMemo(c, endT, hardT) : null;
+    if (m != null) { const e = Math.min(Math.max(m, endT), hardT); return { endT: e, hardT: e, mapped: true }; }
+    return { endT, hardT, mapped: false };
   }
 
   const hoverStopOn = () => settings.pauseOnHover && settings.hoverPauseMode === 'end' && !S.posEdit;
@@ -3162,9 +3289,9 @@
     const wantAp = settings.autoPause && S.lastAutoPause !== a;
     const wantHover = hoverStopOn() && S.lastHoverPause !== a;
     if (!wantAp && !wantHover) return false;
-    const { endT, hardT } = endTimes(a);
+    const { endT, hardT, mapped } = endTimes(a);
     // Reached the end, and the speech has actually stopped (or the wait budget is spent).
-    const atEnd = t >= endT && (t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
+    const atEnd = t >= endT && (mapped || t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
     if (!atEnd) return false;
     // Experimental: with music playing, hold the stop until the next beat (but not longer than beatWaitMax).
     if (+X.beatPause && Tap.src && t < hardT && t - endT < X.beatWaitMax) {
@@ -3237,12 +3364,14 @@
     if (a !== S.active) { setActiveRow(a); S.active = a; S.lastHoverPause = -1; prefetchAround(a); }
     const c = S.cues[a];
     // Stop at the real end of the speech: after YouTube's end, wait (a little) for actual silence.
-    const hardT = c ? endTimes(a).hardT : 0;
+    const et = c ? endTimes(a) : null;
+    const hardT = et ? et.hardT : 0;
     const speaking = !!Tap.src && Tap.reliable && Tap.quietMs < X.endQuietMs;
     const nowMs = performance.now();
     if (speaking) S.spokeAt = nowMs;
     // Speech has gaps between words: bridge them, otherwise the subtitle would blink off and on in its tail.
-    const speakingEff = !v.paused && nowMs - (S.spokeAt || 0) < X.speakHoldMs;
+    // (With the speech map the end of the voice is known exactly: the subtitle stays up until then.)
+    const speakingEff = !v.paused && (et && et.mapped ? t < et.endT : nowMs - (S.spokeAt || 0) < X.speakHoldMs);
     if ((!v.paused && !fading.has(v)) || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
     let shown = c && (t <= c.end + (+settings.tailSec >= 0 ? +settings.tailSec : 2.5) || (speakingEff && t <= hardT) || S.holdCue === a) ? a : -1;
@@ -3281,7 +3410,15 @@
   }
   document.addEventListener('mouseleave', () => { ptr.x = ptr.y = -1; });
   // YouTube control bar: shown only while the pointer is in the bottom strip of the player (or is dragging on the bar).
-  let barDown = false, barRaf = 0;
+  let barDown = false, barRaf = 0, plRect = null, plRectAt = 0;
+  // (the player does not move while the pointer does: one layout read per 250 ms instead of one per mouse frame)
+  const playerRect = (pl) => {
+    const n = performance.now();
+    if (!plRect || n - plRectAt > 250) { plRect = pl.getBoundingClientRect(); plRectAt = n; }
+    return plRect;
+  };
+  window.addEventListener('resize', () => { plRect = null; });
+  document.addEventListener('fullscreenchange', () => { plRect = null; });
   function updateBar() {
     barRaf = 0;
     const root = document.documentElement;
@@ -3289,7 +3426,7 @@
     const pl = document.getElementById('movie_player');
     let show = false;
     if (pl && ptr.x >= 0) {
-      const r = pl.getBoundingClientRect();
+      const r = playerRect(pl);
       const inPlayer = ptr.x >= r.left && ptr.x <= r.right && ptr.y >= r.top && ptr.y <= r.bottom;
       const zone = Math.max(24, +settings.barZone || 64);
       show = inPlayer && ptr.y >= r.bottom - zone;
