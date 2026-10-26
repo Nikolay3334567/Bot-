@@ -51,12 +51,17 @@ func findTool(explicit string, names ...string) string {
 
 func findTools(explicit string, names ...string) []string {
 	var out []string
+	dirs := []string{appDir, filepath.Join(appDir, "bin")}
 	if explicit != "" {
-		if _, err := os.Stat(explicit); err == nil {
-			out = append(out, explicit)
+		explicit = strings.Trim(strings.TrimSpace(explicit), `"`)
+		if st, err := os.Stat(explicit); err == nil {
+			if st.IsDir() { // a folder with the tool inside (also its ./bin) is fine too
+				dirs = append([]string{explicit, filepath.Join(explicit, "bin")}, dirs...)
+			} else {
+				out = append(out, explicit)
+			}
 		}
 	}
-	dirs := []string{appDir, filepath.Join(appDir, "bin")}
 	for _, d := range dirs {
 		entries, _ := os.ReadDir(d)
 		for _, e := range entries {
@@ -141,7 +146,14 @@ func download(url, dest string) error {
 		os.Remove(tmp)
 		return err
 	}
-	os.Remove(dest) // a running old copy cannot be replaced on Windows, but a stopped one can
+	// A copy that is running right now cannot be deleted on Windows, but it can be renamed out of the way.
+	if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
+		os.Remove(dest + ".old")
+		if err := os.Rename(dest, dest+".old"); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+	}
 	return os.Rename(tmp, dest)
 }
 

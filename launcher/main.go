@@ -158,16 +158,27 @@ func prepare(id string) *job {
 
 var pctRe = regexp.MustCompile(`(\d+(?:\.\d+)?)%`)
 
-func runDownload(id string, j *job) {
-	defer close(j.done)
-	fail := func(msg string) {
-		j.State, j.Error, j.failedAt = "error", msg, time.Now()
-		logf("✗ %s: %s", id, msg)
+// needsFreshYtdlp: errors that an up-to-date yt-dlp fixes ("The page needs to be reloaded", signature / player changes).
+func needsFreshYtdlp(low string) bool {
+	for _, s := range []string{"page needs to be reloaded", "unable to extract", "nsig", "n challenge", "player response", "http error 403",
+		"requested format is not available", "sign in to confirm", "unable to download", "unsupported url", "no video formats", "only images are available"} {
+		if strings.Contains(low, s) {
+			return true
+		}
 	}
+	return false
+}
+
+func needsJSRuntime(low string) bool {
+	return strings.Contains(low, "javascript runtime") || strings.Contains(low, "n challenge") || strings.Contains(low, "only images are available") ||
+		strings.Contains(low, "js runtime") || strings.Contains(low, "challenge solving")
+}
+
+// ytdlpOnce runs yt-dlp for one video and returns its error text (empty on success).
+func ytdlpOnce(id string, j *job) string {
 	ytdlp, err := ensureYtdlp()
 	if err != nil {
-		fail(err.Error())
-		return
+		return err.Error()
 	}
 	ffmpeg, _ := ensureFfmpeg()
 	args := []string{"-f", "bestaudio[ext=m4a]/bestaudio/best", "-o", filepath.Join(cache, "%(id)s.%(ext)s"),
@@ -175,17 +186,19 @@ func runDownload(id string, j *job) {
 	if ffmpeg != "" {
 		args = append(args, "--ffmpeg-location", ffmpeg)
 	}
+	// Recent yt-dlp needs a JavaScript runtime for YouTube; use ours when we have one.
+	if d := denoPath(); d != "" && ytdlpDate(toolVersion(ytdlp, "--version")).After(time.Date(2025, 10, 31, 0, 0, 0, 0, time.UTC)) {
+		args = append(args, "--js-runtimes", "deno:"+d)
+	}
 	args = append(args, cfg.YtdlpArgs...)
 	args = append(args, "https://www.youtube.com/watch?v="+id)
-	logf("↓ %s", id)
 	cmd := exec.Command(ytdlp, args...)
 	hide(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		fail(err.Error())
-		return
+		return err.Error()
 	}
 	buf := make([]byte, 4096)
 	for {
@@ -209,19 +222,57 @@ func runDownload(id string, j *job) {
 		if i := strings.LastIndex(msg, "ERROR:"); i >= 0 {
 			msg = msg[i:]
 		}
-		if strings.Contains(strings.ToLower(msg), "javascript runtime") || strings.Contains(strings.ToLower(msg), "n challenge") {
-			msg += " — установите Deno (winget install DenoLand.Deno) и перезапустите лончер"
+		return msg
+	}
+	return ""
+}
+
+func runDownload(id string, j *job) {
+	defer close(j.done)
+	fail := func(msg string) {
+		j.State, j.Error, j.failedAt = "error", msg, time.Now()
+		logf("✗ %s: %s", id, msg)
+	}
+	logf("↓ %s", id)
+	// A failure is not the end: an old yt-dlp is replaced by a fresh one, a missing JS runtime is downloaded,
+	// and the video is tried again — the user never has to do this by hand.
+	updated, denoTried := false, false
+	var msg string
+	for try := 0; try < 4; try++ {
+		if msg = ytdlpOnce(id, j); msg == "" {
+			break
 		}
 		low := strings.ToLower(msg)
+		if !updated && (needsFreshYtdlp(low) || ytdlpOutdated(workingYtdlp())) {
+			updated = true
+			j.Progress = 0
+			if autoUpdateYtdlp("ошибка «" + lastLine(msg) + "»") {
+				continue
+			}
+		}
+		if !denoTried && needsJSRuntime(low) {
+			denoTried = true
+			if _, err := ensureDeno(); err == nil {
+				continue
+			} else {
+				logf("✗ %v", err)
+			}
+		}
+		break
+	}
+	if msg != "" {
+		low := strings.ToLower(msg)
 		switch {
+		case needsJSRuntime(low):
+			msg += " — лончер не смог подготовить Deno (JavaScript runtime для yt-dlp): установите его вручную (winget install DenoLand.Deno) и перезапустите лончер"
 		case strings.Contains(low, "not a bot") || strings.Contains(low, "sign in to confirm"):
 			msg += " — YouTube просит подтвердить вход: добавьте в config.json ytdlpArgs [\"--cookies-from-browser\",\"chrome\"] (или edge/firefox) и перезапустите лончер"
 		case strings.Contains(low, "python dll") || strings.Contains(low, "vcruntime") || strings.Contains(low, "api-ms-win"):
-			msg += " — установите Microsoft Visual C++ Redistributable (arm64/x64 по вашему ПК) или скачайте свежий yt-dlp"
-		case strings.Contains(low, "http error 403") || strings.Contains(low, "unable to download") || strings.Contains(low, "requested format"):
-			msg += " — обновите yt-dlp: положите свежий yt-dlp рядом с лончером (yt-dlp -U или новый exe с GitHub), перезапустите"
+			msg += " — установите Microsoft Visual C++ Redistributable (arm64/x64 по вашему ПК)"
 		case strings.Contains(low, "not compatible") || strings.Contains(low, "not a valid win32") || strings.Contains(low, "не является приложением"):
 			msg += " — архитектура yt-dlp не подходит ПК: нужен yt-dlp_win_arm64.exe для ARM или yt-dlp.exe для x64"
+		case needsFreshYtdlp(low):
+			msg += " — лончер уже пробовал обновить yt-dlp; если не помогло, нажмите «Скачать заново» на странице лончера"
 		}
 		fail(msg)
 		return
@@ -500,6 +551,9 @@ func handler() http.Handler {
 	})
 	mux.HandleFunc("/prepare", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("v")
+		if l := lastCopy(); l.ID != id {
+			recordLast(id, 0, "") // opening a video counts as "last video" even before the first progress report
+		}
 		if !idRe.MatchString(id) {
 			writeJSON(w, 400, map[string]string{"error": "bad video id"})
 			return
@@ -612,8 +666,10 @@ func main() {
 	}
 	if cfg.AutoDownload {
 		go func() { // fetch missing tools in the background so the first video is fast
-			if _, err := ensureYtdlp(); err != nil {
+			if p, err := ensureYtdlp(); err != nil {
 				logf("✗ %v", err)
+			} else if ytdlpOutdated(p) {
+				autoUpdateYtdlp("версия старше 45 дней") // an old yt-dlp stops working when YouTube changes
 			}
 			if _, err := ensureFfmpeg(); err != nil {
 				logf("✗ %v", err)

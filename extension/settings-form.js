@@ -202,6 +202,87 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     chrome.storage.onChanged.addListener((ch, area) => { if (area === 'local' && ch.dev) applyDev(ch.dev.newValue); });
   }
 
+
+  // Backup / transfer: all settings (optionally with API keys and the vocabulary) to a file and back.
+  if (!opts.only || opts.only.includes('backup')) {
+    const btn = mk('button', 'ytam-set-tab', 'Перенос');
+    const pane = mk('div', 'ytam-set-pane');
+    pane.append(mk('p', 'ytam-set-note', 'Сохраните настройки в файл и загрузите его в другой копии расширения (или пришлите файл, чтобы я проверил такие же настройки). Версия расширения и дата записываются в файл.'));
+    const chk = (label, checked, danger) => {
+      const l = mk('label', 'ytam-set-chk' + (danger ? ' danger' : ''));
+      const i = mk('input');
+      i.type = 'checkbox';
+      i.checked = checked;
+      l.append(i, document.createTextNode(' ' + label));
+      return { l, i };
+    };
+    const cKeys = chk('Сохранить вместе с API-ключами (Gemini, ИИ, Google Cloud, AnkiConnect)', false, true);
+    const cVocab = chk('Сохранить мой словарь и список «Сохранённые»', true);
+    const cDev = chk('Сохранить параметры разработчика / тестовые функции', true);
+    cKeys.l.title = 'Ключи — это пароли: не отправляйте такой файл никому и не выкладывайте его.';
+    const status = mk('div', 'ytam-set-note');
+    const exportBtn = mk('button', 'ytam-set-reset', '⬇ Экспорт настроек в файл');
+    exportBtn.addEventListener('click', async () => {
+      try {
+        const sync = await chrome.storage.sync.get(null);
+        const settings = {};
+        for (const k of Object.keys(D)) if (k in sync) settings[k] = sync[k];
+        const want = [];
+        if (cDev.i.checked) want.push('dev');
+        if (cKeys.i.checked) want.push(...Object.keys(L));
+        if (cVocab.i.checked) want.push('vocab', 'saved');
+        const loc = want.length ? await chrome.storage.local.get(want) : {};
+        const data = { format: 'ytam-settings', version: chrome.runtime.getManifest().version, at: new Date().toISOString(), settings };
+        if (cDev.i.checked) data.dev = loc.dev || {};
+        if (cKeys.i.checked) { data.keys = {}; for (const k of Object.keys(L)) if (loc[k]) data.keys[k] = loc[k]; }
+        if (cVocab.i.checked) { data.vocab = loc.vocab || {}; data.saved = loc.saved || []; }
+        const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
+        const a = mk('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `ytam-settings-v${data.version}-${data.at.slice(0, 10)}${data.keys ? '-with-keys' : ''}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        status.textContent = `✓ Файл сохранён: ${Object.keys(settings).length} настроек` + (data.keys ? `, ключей: ${Object.keys(data.keys).length}` : ', без ключей') + (data.vocab ? `, слов: ${Object.keys(data.vocab).length}` : '');
+      } catch (e) { status.textContent = 'Ошибка экспорта: ' + e.message; }
+    });
+    const imp = async (text) => {
+      let data;
+      try { data = JSON.parse(text); } catch (e) { status.textContent = 'Это не JSON: ' + e.message; return; }
+      if (!data || data.format !== 'ytam-settings') { status.textContent = 'Это не файл настроек этого расширения.'; return; }
+      const sync = {};
+      for (const k of Object.keys(D)) if (data.settings && k in data.settings) sync[k] = data.settings[k];
+      const loc = {};
+      if (data.dev) loc.dev = data.dev;
+      let nKeys = 0;
+      if (data.keys && cKeys.i.checked) for (const k of Object.keys(L)) if (data.keys[k]) { loc[k] = data.keys[k]; nKeys++; }
+      if (data.vocab && cVocab.i.checked) {
+        const cur = await chrome.storage.local.get({ vocab: {}, saved: [] });
+        loc.vocab = { ...cur.vocab, ...data.vocab };
+        const have = new Set((data.saved || []).map((e) => e.k));
+        loc.saved = [...(data.saved || []), ...cur.saved.filter((e) => !have.has(e.k))];
+      }
+      await chrome.storage.sync.set(sync);
+      if (Object.keys(loc).length) await chrome.storage.local.set(loc);
+      status.textContent = `✓ Загружено: ${Object.keys(sync).length} настроек` + (data.keys ? (nKeys ? `, ключей: ${nKeys}` : ' (ключи в файле есть — отметьте «с API-ключами» и загрузите снова)') : '') +
+        (loc.vocab ? `, слов: ${Object.keys(loc.vocab).length}` : '') + ` · файл от версии ${data.version || '?'}`;
+    };
+    const file = mk('input');
+    file.type = 'file';
+    file.accept = '.json,application/json';
+    file.addEventListener('change', async () => { if (file.files[0]) { await imp(await file.files[0].text()); file.value = ''; } });
+    const paste = mk('textarea', 'ytam-set-paste');
+    paste.rows = 4;
+    paste.placeholder = 'Или вставьте сюда содержимое файла настроек…';
+    paste.addEventListener('keydown', (e) => e.stopPropagation());
+    const pasteBtn = mk('button', 'ytam-set-reset', 'Загрузить из вставленного текста');
+    pasteBtn.addEventListener('click', () => imp(paste.value));
+    pane.append(cKeys.l, cVocab.l, cDev.l, exportBtn, mk('div', 'ytam-set-group', 'Загрузка'), mk('div', '', 'Файл настроек:'), file, paste, pasteBtn, status);
+    btn.addEventListener('click', () => select('backup'));
+    nav.append(btn);
+    body.append(pane);
+    panes.backup = { btn, pane };
+  }
+
   // Google Cloud usage / key test (Перевод tab)
   if (panes.subs && chrome.runtime && chrome.runtime.sendMessage) {
     const box = mk('div', 'ytam-cloud');

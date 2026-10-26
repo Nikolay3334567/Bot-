@@ -267,7 +267,7 @@
     else if (st !== 2) updateSaved((saved) => saved.filter((e) => e.k !== k));
   }
 
-  async function scheduleAnkiDelete(k, st) {
+  async function scheduleAnkiDelete(k, st, delaySec) {
     let ids = [];
     await updateSaved((saved) => {
       const e = saved.find((x) => x.k === k);
@@ -275,7 +275,7 @@
       return saved.filter((x) => x.k !== k);
     });
     const { ankiDel = [] } = await chrome.storage.local.get('ankiDel');
-    ankiDel.push({ k, st, ids, due: Date.now() + X.ankiDeleteSec * 1000 });
+    ankiDel.push({ k, st, ids, due: Date.now() + (delaySec != null ? delaySec : X.ankiDeleteSec) * 1000 });
     await chrome.storage.local.set({ ankiDel });
   }
 
@@ -296,7 +296,7 @@
     }
     await chrome.storage.local.set({ ankiDel: keep });
   }
-  setInterval(() => { processAnkiDeletes().catch(() => {}); }, 5000);
+  setInterval(() => { processAnkiDeletes().catch(() => {}); }, 2000);
 
   // ---------- Anki outbox (cards made while Anki was closed) ----------
 
@@ -824,8 +824,16 @@
         if (!best || score > best.score) best = { first, last, score };
       }
       if (!best) continue;
+      const dur0 = Math.max(0.3, c.end - c.start); // the model's own idea of how long the phrase lasts
       c.start = words[best.first].start;
-      c.end = Math.max(words[best.last].end, c.start + 0.3);
+      let end = Math.max(words[best.last].end, c.start + 0.3);
+      // The last words of a phrase are the ones the YouTube transcript most often hears differently ("I created" →
+      // "i create it"): they stay unmatched, and the phrase would end too early and get cut. Cover the transcript
+      // words that follow, as long as they fall inside the duration the model gave, and keep that duration.
+      const est = c.start + dur0;
+      for (let j = best.last + 1; j < words.length && words[j].start < est - 0.05 && words[j].start - end < 1.0; j++) end = Math.max(end, words[j].end);
+      end = Math.max(end, Math.min(est, end + 1.2));
+      c.end = end;
       c.aligned = true;
       prevLast = best.last;
       ok++;
@@ -1157,7 +1165,7 @@
       sel.anchor = w;
       sel.cue = cue;
       const v = getVideo();
-      if (v && !v.paused) { v.pause(); S.hoverPaused = true; } // freeze the picture while choosing
+      if (v && !v.paused) { softPause(v); S.hoverPaused = true; } // freeze the picture while choosing
       hideTip();
     } else if (w.parentElement !== sel.anchor.parentElement) return;
     sel.last = w;
@@ -1289,7 +1297,7 @@
       const row = e.target.closest('.ytam-row');
       if (!row) return;
       const i = +row.dataset.i;
-      if (e.target.closest('.ytam-star')) return queueCard(i, null);
+      if (e.target.closest('.ytam-star')) return togglePhrase(i);
       if (e.target.closest('.ytam-play')) return seekCue(i, true);
       const w = e.target.closest('.ytam-w');
       if (w) return shiftSave(e, w, i) || openWord(w, i);
@@ -1306,7 +1314,7 @@
     const ovText = h('div', { class: 'ytam-ov-text' });
     const ovTr = h('div', { class: 'ytam-ov-tr' });
     const ovPlay = h('button', { class: 'ytam-play', title: 'Повторить фразу (S)', onclick: () => seekCue(S.shown, true) });
-    const ovStar = h('button', { class: 'ytam-star', title: 'Фраза в Anki (R)', text: STAR, onclick: () => queueCard(S.shown, null) });
+    const ovStar = h('button', { class: 'ytam-star', title: 'Фраза в Anki (R)', text: STAR, onclick: () => togglePhrase(S.shown) });
     const ovBox = h('div', { class: 'ytam-ov-box' }, ovText);
     const ovLine = h('div', { class: 'ytam-ov-line' }, ovPlay, ovBox, ovStar);
     const overlay = h('div', { id: 'ytam-overlay', class: 'ytam-hidden' }, ovLine, ovTr);
@@ -1326,7 +1334,7 @@
       S.hoverIn = true;
       const v = getVideo();
       // 'now': stop at once. 'end': keep playing, tick() stops at the end of the phrase.
-      if (settings.pauseOnHover && settings.hoverPauseMode === 'now' && v && !v.paused && !S.posEdit) { v.pause(); S.hoverPaused = true; }
+      if (settings.pauseOnHover && settings.hoverPauseMode === 'now' && v && !v.paused && !S.posEdit) { softPause(v); S.hoverPaused = true; }
     });
     ovLine.addEventListener('mouseleave', () => { S.hoverIn = false; scheduleResume(); });
 
@@ -1368,7 +1376,7 @@
     if (hoverActive()) return;
     S.hoverPaused = false;
     const v = getVideo();
-    if (v) v.play();
+    if (v) softPlay(v);
   }
 
   function setStatus(text, extra) {
@@ -2200,7 +2208,7 @@
     const w = span.dataset.w;
     const cue = S.cues[i] || { text: word, start: 0, end: 0 };
     const v = getVideo();
-    if (v && !v.paused) { v.pause(); S.hoverPaused = true; }
+    if (v && !v.paused) { softPause(v); S.hoverPaused = true; }
     if (settings.speakOnClick) speak(word);
 
     // The popup opens at once at its final size; translation and dictionary fill in place.
@@ -2299,7 +2307,7 @@
         statusBtn(2, 'check', 'Знаю'),
         statusBtn(1, 'book', 'Изучаю — карточка в Anki'),
         statusBtn(3, 'ban', 'Не учить'),
-        h('button', { class: 'ytam-sb star', text: STAR, title: 'Только фраза в Anki', onclick: () => { queueCard(i, null); closePop(); } })),
+        h('button', { class: 'ytam-sb star', text: STAR, title: 'Только фраза в Anki', onclick: () => { togglePhrase(i); closePop(); } })),
     ];
     setTimeout(() => tabBtns[0].click(), 0);
     return {
@@ -2395,8 +2403,19 @@
 
   const Tap = { v: null, stream: null, ctx: null, proc: null, src: null, srcIds: '', blocks: [], pass: 0, lastEnd: null, quietMs: 0, reliable: false, ring: [], band: null, bandRate: 0, contrast: 0 };
 
+  function tapStop() {
+    try { if (Tap.ctx) Tap.ctx.close(); } catch (_) {}
+    try { if (Tap.stream) Tap.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    Tap.ctx = Tap.proc = Tap.src = Tap.stream = Tap.v = null;
+    Tap.srcIds = '';
+    Tap.blocks = [];
+    Tap.reliable = false;
+  }
+
   function tapEnsure(v) {
     if (!settings.includeAudio || !v) return;
+    // Test option "tapAlways" = 0: with the launcher supplying the audio, the video is not captured at all.
+    if (!+X.tapAlways && helperUsable(S.videoId)) { if (Tap.v) tapStop(); return; }
     if (Tap.v !== v) {
       try { Tap.stream = v.captureStream(); } catch (_) { Tap.stream = null; }
       Tap.v = v;
@@ -2448,6 +2467,7 @@
       s /= 2 * f;
       out[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
     }
+    if (+X.beatPause) detectBeats(out, sr / f, t0, t1);
     // Live pause detector (speech band, adaptive): stops playback at the real end of a phrase.
     const rate = sr / f;
     if (!Tap.band || Tap.bandRate !== rate) { Tap.band = makeBand(rate); Tap.bandRate = rate; Tap.ring = []; }
@@ -2463,6 +2483,29 @@
     Tap.blocks.push({ t0, t1, pass: Tap.pass, rate: sr / f, data: out });
     const maxBlocks = Math.ceil((X.tapMinutes * 60 * sr) / n);
     if (Tap.blocks.length > maxBlocks) Tap.blocks.splice(0, Tap.blocks.length - maxBlocks);
+  }
+
+  // Experimental: onsets (beats, note attacks) of the music, in video time — the pause at a phrase end can wait for one.
+  Tap.beats = [];
+  Tap.lastBeat = -9;
+  Tap.eh = [];
+  function detectBeats(out, rate, t0, t1) {
+    const sub = Math.max(32, Math.round(rate * 0.01));
+    for (let k = 0; k + sub <= out.length; k += sub) {
+      let e = 0;
+      for (let i = k; i < k + sub; i++) e += out[i] * out[i];
+      e /= sub;
+      const h = Tap.eh;
+      const avg = h.length ? h.reduce((a, b) => a + b, 0) / h.length : e;
+      const tb = t0 + (k / out.length) * (t1 - t0);
+      if (h.length >= 6 && e > avg * 1.8 && e > 25000 && tb - Tap.lastBeat > 0.12) {
+        Tap.lastBeat = tb;
+        Tap.beats.push(tb);
+        if (Tap.beats.length > 24) Tap.beats.shift();
+      }
+      h.push(e);
+      if (h.length > 8) h.shift();
+    }
   }
 
   // Audio for [start, end) of video time from the most recent complete pass.
@@ -2678,6 +2721,31 @@
 
   // Saving is instant for the user; the card goes to Anki once the
   // phrase's audio has been played (usually already the case).
+  // ☆ / R / E on a phrase: the first press saves it, the next one takes it back (pending → cancelled,
+  // being made → removed as soon as it is in Anki, saved → its card is deleted). No more duplicates.
+  const inFlight = new Set(), cancelled = new Set();
+  function togglePhrase(i) {
+    const cue = S.cues[i];
+    if (!cue) return;
+    const key = `p:${S.videoId}:${cue.start.toFixed(1)}`;
+    const un = () => { S.saved.delete(savedKey(cue)); markRow(cue, 'ytam-pending', false); markRow(cue, 'ytam-saved', false); };
+    const pend = S.pending.findIndex((p) => p.key === key);
+    if (pend >= 0) {
+      S.pending.splice(pend, 1);
+      un();
+      updateSaved((saved) => saved.filter((e) => e.k !== key));
+      return toast('Сохранение отменено');
+    }
+    if (inFlight.has(key)) { cancelled.add(key); un(); return toast('Отменяю — карточка уберётся сразу после создания'); }
+    if (S.saved.has(savedKey(cue))) {
+      un();
+      bg({ type: 'outboxRemove', key }).catch(() => {});
+      scheduleAnkiDelete(key, undefined, 1);
+      return toast('Фраза убрана из Anki');
+    }
+    queueCard(i, null);
+  }
+
   function queueCard(i, wordInfo, quiet) {
     const cue = S.cues[i];
     if (!cue) return;
@@ -2858,6 +2926,7 @@
 
   async function finalizeCard(item) {
     const { cue } = item;
+    inFlight.add(item.key);
     try {
       const card = await trimForCard(item);              // shorter excerpt for long phrases (or the whole phrase)
       const part = card.trimmed ? { ...item, cue: { start: card.start, end: card.end, text: card.text } } : item;
@@ -2889,6 +2958,15 @@
           meaning = [res.translation, ...terms.slice(0, 4)].filter(Boolean).join(', ');
         } catch (_) {}
       }
+      let examples = null;
+      if (+settings.cardExamples > 0 && item.word) {   // extra practice sentences from the AI (background, never blocks)
+        try {
+          examples = await Promise.race([
+            bg({ type: 'aiExamples', word: item.hl || item.word, sentence: card.text, n: +settings.cardExamples, tl: settings.targetLang, model: settings.aiFastModel }),
+            sleep(12000).then(() => null),
+          ]);
+        } catch (e) { toast('Примеры ИИ не получились: ' + e.message, 'warn', 3500); }
+      }
       const res = await bg({
         type: 'addCard',
         card: {
@@ -2903,9 +2981,18 @@
           wordMeaning: meaning,
           audio,
           audioAI,
+          examples,
           image: await canvasToB64(item.image),
         },
       });
+      if (cancelled.has(item.key)) {          // undone while it was being made
+        cancelled.delete(item.key);
+        if (res.queued) bg({ type: 'outboxRemove', key: item.key }).catch(() => {});
+        else if (res.noteId) bg({ type: 'deleteNotes', ids: [res.noteId] }).catch(() => {});
+        updateSaved((saved) => saved.filter((e) => e.k !== item.key));
+        if (item.videoId === S.videoId) { markRow(cue, 'ytam-pending', false); markRow(cue, 'ytam-saved', false); S.saved.delete(savedKey(cue)); }
+        return;
+      }
       if (res.queued) {
         toast(`⏳ Anki не отвечает — карточка сохранена в очереди (${res.count}). Откройте Anki или нажмите ⟳`, 'warn', 6000);
       } else {
@@ -2922,10 +3009,55 @@
     } catch (e) {
       if (item.videoId === S.videoId) markRow(cue, 'ytam-pending', false);
       toast('✗ Anki: ' + e.message, 'err', 7000);
+    } finally {
+      inFlight.delete(item.key);
     }
   }
 
   // ---------- playback control ----------
+
+  // ---------- click-free pause / play / seek ----------
+  // A cut at a non-zero sample level is the "click". Our own pauses and seeks fade the volume out and in over a
+  // few milliseconds (X.declickMs, 0 = off); YouTube is told to ignore those volume changes (see inject.js).
+  const nowAbs = () => performance.timeOrigin + performance.now();
+  function quietVol(v, x) {
+    document.documentElement.dataset.ytamQ = String(nowAbs() + 150);
+    v.volume = Math.max(0, Math.min(1, x));
+  }
+  function rampVol(v, to, ms) {
+    return new Promise((res) => {
+      const from = v.volume, steps = Math.max(1, Math.round(ms / 5));
+      let i = 0;
+      const t = setInterval(() => { i++; quietVol(v, from + (to - from) * Math.min(1, i / steps)); if (i >= steps) { clearInterval(t); res(); } }, 5);
+    });
+  }
+  const fading = new WeakMap();
+
+  // pause with a short fade-out; resolves when the video is really paused
+  async function softPause(v) {
+    const ms = +X.declickMs || 0;
+    if (!ms || v.paused || fading.has(v)) { if (!v.paused && !fading.has(v)) v.pause(); return; }
+    const st = { vol: v.volume, cancel: false };
+    fading.set(v, st);
+    await rampVol(v, 0, ms);
+    if (!st.cancel) v.pause();
+    quietVol(v, st.vol);
+    fading.delete(v);
+  }
+
+  // play with a short fade-in
+  function softPlay(v) {
+    const ms = +X.declickMs || 0;
+    const st = fading.get(v);
+    if (st) { st.cancel = true; return v.play(); }       // play pressed during a fade-out: just keep going
+    if (!ms || !v.paused) return v.play();
+    const vol0 = v.volume;
+    quietVol(v, 0);
+    const p = v.play();
+    const up = () => rampVol(v, vol0, ms);
+    if (p && p.then) p.then(up, () => quietVol(v, vol0)); else up();
+    return p;
+  }
 
   // Jump to a phrase (A / S / D, list click). The phrase is pinned on screen at once: the run-up to its start
   // belongs to the PREVIOUS phrase in the timeline, and without the pin that one would flash for a moment.
@@ -2936,14 +3068,28 @@
     S.lastAutoPause = -1;
     S.lastHoverPause = -1;
     S.lastSeekAt = Date.now();
-    S.ownSeek = Date.now();                 // our own seek: do not treat it as the user's rewind
-    S.pin = { i, at: Date.now() };
+    S.pin = { i, at: Date.now(), arrived: false };
     S.holdCue = -1;
     S.goneCue = -1;
     S.hoverPaused = false;
-    v.currentTime = Math.max(0, c.start + X.subShift - X.seekLead);
-    if (play) v.play();
-    try { tick(); } catch (_) { /* painted on the next tick anyway */ }
+    const target = Math.max(0, c.start + X.subShift - X.seekLead);
+    const jump = (volBefore) => {
+      S.ownSeek = Date.now();               // our own seek: do not treat it as the user's rewind
+      S.lastSeekAt = Date.now();
+      const vol0 = volBefore != null ? volBefore : v.volume;
+      v.currentTime = target;
+      if (play) {
+        if (+X.declickMs) { quietVol(v, 0); v.play(); rampVol(v, vol0, X.declickMs); } else v.play();
+      } else if (+X.declickMs && v.volume !== vol0) quietVol(v, vol0);
+      try { tick(); } catch (_) { /* painted on the next tick anyway */ }
+    };
+    // Playing now: a ~12 ms fade-out first, so the cut of the old sound is not a click. The phrase is on screen already.
+    if (+X.declickMs && !v.paused && !fading.has(v)) {
+      const vol0 = v.volume;
+      fading.set(v, { vol: vol0, cancel: true });
+      rampVol(v, 0, Math.min(14, +X.declickMs)).then(() => { fading.delete(v); jump(vol0); });
+    } else jump();
+    try { tick(); } catch (_) { /* the pin paints the phrase now */ }
   }
 
   // The phrase "owning" time t: the pinned one during the run-up to its start, otherwise by time.
@@ -2951,7 +3097,10 @@
     const p = S.pin;
     if (p) {
       const c = S.cues[p.i];
-      if (c && t < c.start + 0.03 && t > c.start - 2 && Date.now() - p.at < 3000) return p.i;
+      const near = c && t < c.start + 0.03 && t > c.start - 2;
+      if (near) p.arrived = true;
+      // not there yet (the jump is a few ms away) or in the run-up to the phrase: it is the phrase on screen
+      if (c && (near || (!p.arrived && Date.now() - p.at < 600))) return p.i;
       S.pin = null;
     }
     return cueIndexAt(t);
@@ -2966,7 +3115,7 @@
     const c = S.cues[a], next = S.cues[a + 1];
     const v = getVideo();
     const limit = next ? next.start - X.endLead * Math.max(1, (v && v.playbackRate) || 1) : Infinity; // faster playback → bigger margin
-    const endT = Math.min(Math.max(c.start + 0.3, Math.min(c.end, next ? next.start : Infinity) - X.autoPauseEarly), limit);
+    const endT = Math.min(Math.max(c.start + 0.3, Math.min(c.end + X.endExtra, next ? next.start : Infinity) - X.autoPauseEarly), limit);
     return { endT, hardT: Math.min(endT + X.endWaitMax, limit) };
   }
 
@@ -2981,12 +3130,18 @@
     // Reached the end, and the speech has actually stopped (or the wait budget is spent).
     const atEnd = t >= endT && (t >= hardT || !Tap.src || !Tap.reliable || Tap.quietMs >= X.endQuietMs);
     if (!atEnd) return false;
+    // Experimental: with music playing, hold the stop until the next beat (but not longer than beatWaitMax).
+    if (+X.beatPause && Tap.src && t < hardT && t - endT < X.beatWaitMax) {
+      const music = Tap.beats.filter((b) => b > t - 2.5 && b <= t + 0.1).length >= 3;
+      const sinceBeat = t - Tap.lastBeat;
+      if (music && !(sinceBeat >= -0.02 && sinceBeat < 0.1)) return false;
+    }
     let stop = false;
     if (wantAp) { S.lastAutoPause = a; stop = true; }
     if (wantHover && hoverActive()) { S.lastHoverPause = a; S.hoverPaused = true; stop = true; } // once per phrase
     if (!stop) return false;
     S.holdCue = a;
-    v.pause();
+    softPause(v);
     return true;
   }
 
@@ -3028,6 +3183,8 @@
     if (!S.videoId) return;
     const v = getVideo();
     if (!v) return;
+    const dc = String(+X.declickMs || 0);
+    if (document.documentElement.dataset.ytamDc !== dc) document.documentElement.dataset.ytamDc = dc;
     if (S.seekBound !== v) { S.seekBound = v; v.addEventListener('seeking', () => { S.lastSeekAt = Date.now(); if (S.ownSeek && Date.now() - S.ownSeek < 800) { S.ownSeek = 0; return; } S.lastHoverPause = -1; }); }
     tapEnsure(v);
     if (++pendingTick % 5 === 0) processPending(false);
@@ -3050,7 +3207,7 @@
     if (speaking) S.spokeAt = nowMs;
     // Speech has gaps between words: bridge them, otherwise the subtitle would blink off and on in its tail.
     const speakingEff = !v.paused && nowMs - (S.spokeAt || 0) < X.speakHoldMs;
-    if (!v.paused || S.holdCue !== a) S.holdCue = -1;
+    if ((!v.paused && !fading.has(v)) || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
     let shown = c && (t <= c.end + (+settings.tailSec >= 0 ? +settings.tailSec : 2.5) || (speakingEff && t <= hardT) || S.holdCue === a) ? a : -1;
     // A phrase that has left the screen never comes back until playback returns before its start (no blinking).
@@ -3063,7 +3220,7 @@
 
     // Resume once the pointer has really left (enter/leave events can be lost when the line re-renders).
     if (S.hoverPaused) {
-      if (!v.paused) S.hoverPaused = false;
+      if (!v.paused && !fading.has(v)) S.hoverPaused = false; // (a soft pause is still fading out: not "playing")
       else if (pop || selBox || sel.on || hoverActive() || S.posEdit) S.hoverGone = 0;
       else if (!S.hoverGone) S.hoverGone = Date.now();
       else if (Date.now() - S.hoverGone >= X.resumeMs) { S.hoverGone = 0; resumeAfterHover(); }
@@ -3087,6 +3244,34 @@
     window.addEventListener(type, (e) => { ptr.x = e.clientX; ptr.y = e.clientY; ptr.t = Date.now(); }, true);
   }
   document.addEventListener('mouseleave', () => { ptr.x = ptr.y = -1; });
+  // YouTube control bar: shown only while the pointer is in the bottom strip of the player (or is dragging on the bar).
+  let barDown = false, barRaf = 0;
+  function updateBar() {
+    barRaf = 0;
+    const root = document.documentElement;
+    if (!root.classList.contains('ytam-hidebar')) { root.classList.remove('ytam-bar-show'); return; }
+    const pl = document.getElementById('movie_player');
+    let show = false;
+    if (pl && ptr.x >= 0) {
+      const r = pl.getBoundingClientRect();
+      const inPlayer = ptr.x >= r.left && ptr.x <= r.right && ptr.y >= r.top && ptr.y <= r.bottom;
+      const zone = Math.max(24, +settings.barZone || 64);
+      show = inPlayer && ptr.y >= r.bottom - zone;
+      // Never because of the subtitles that sit above the bar.
+      if (show && ui && ui.overlay.offsetParent !== null) {
+        const o = ui.overlay.getBoundingClientRect();
+        if (ptr.x >= o.left && ptr.x <= o.right && ptr.y >= o.top && ptr.y <= o.bottom && ptr.y < r.bottom - 40) show = false;
+      }
+      if (barDown && inPlayer) show = true; // dragging the progress bar must not hide it
+    }
+    root.classList.toggle('ytam-bar-show', show);
+  }
+  const scheduleBar = () => { if (!barRaf) barRaf = requestAnimationFrame(updateBar); };
+  for (const type of ['pointermove', 'mousemove']) window.addEventListener(type, scheduleBar, true);
+  window.addEventListener('mousedown', () => { barDown = true; scheduleBar(); }, true);
+  window.addEventListener('mouseup', () => { barDown = false; scheduleBar(); }, true);
+  document.addEventListener('mouseleave', scheduleBar);
+
   const inRect = (r, pad = 0) => r && r.width > 0 && ptr.x >= r.left - pad && ptr.x <= r.right + pad && ptr.y >= r.top - pad && ptr.y <= r.bottom + pad;
   function hoverActive() {
     if (!ui) return false;
@@ -3102,10 +3287,10 @@
     const v = getVideo();
     if (!v || !v.currentTime) return;
     const key = S.videoId + ':' + Math.floor(v.currentTime / 5);
-    if (key === reportedKey || Date.now() - reportedAt < 9000) return;
+    if (key === reportedKey || Date.now() - reportedAt < 2900) return;
     reportedKey = key; reportedAt = Date.now();
     bg({ type: 'helperProgress', url: settings.helperUrl, v: S.videoId, t: v.currentTime, title: S.title || document.title.replace(/ - YouTube$/, '') }).catch(() => {});
-  }, 10000);
+  }, 3000);
 
   (function loop() { try { tick(); } catch (e) { console.warn('[ytam]', e); } setTimeout(loop, X.tickMs); })();
 
@@ -3156,7 +3341,7 @@
       KeyW: () => {
         const v = getVideo();
         if (!v) return;
-        if (v.paused) { S.hoverPaused = false; v.play(); } else { v.pause(); }
+        if (v.paused) { S.hoverPaused = false; softPlay(v); } else { softPause(v); }
       },
       KeyA: () => seekCue(Math.max(0, cur - 1), true),
       KeyD: () => seekCue(Math.min(S.cues.length - 1, cur + 1), true),
@@ -3165,8 +3350,8 @@
         chrome.storage.sync.set({ autoPause: !settings.autoPause });
         toast(!settings.autoPause ? 'Автопауза включена' : 'Автопауза выключена');
       },
-      KeyR: () => queueCard(S.shown >= 0 ? S.shown : cur, null),
-      KeyE: () => queueCard(S.shown >= 0 ? S.shown : cur, null),
+      KeyR: () => togglePhrase(S.shown >= 0 ? S.shown : cur),
+      KeyE: () => togglePhrase(S.shown >= 0 ? S.shown : cur),
     };
     if (settings.arrowKeys) {
       actions.ArrowLeft = actions.KeyA;

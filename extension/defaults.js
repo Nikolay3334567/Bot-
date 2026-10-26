@@ -40,6 +40,7 @@ self.YTAM_DEFAULTS = {
   cardTrim: 'off',
   cardMaxWords: 14,
   cardTrimRatio: 100,
+  cardExamples: 0,
   cardVoiceMode: 'off',
   cardVoiceRatio: 50,
   cardVoices: 'en-US-Neural2-F, en-US-Neural2-D, en-GB-Neural2-B',
@@ -63,7 +64,8 @@ self.YTAM_DEFAULTS = {
   twoLines: false,
   showSubControls: true,
   showSideControls: true,
-  hidePlaybar: false,
+  hidePlaybar: true,
+  barZone: 64,
   showPanel: true,
   panelFontSize: 16,
   tipFontSize: 16,
@@ -133,7 +135,8 @@ self.YTAM_SCHEMA = [
       { k: 'twoLines', label: 'Режим двух строк', type: 'toggle', hint: 'Длинная фраза переносится на две ровные строки' },
       { k: 'showSubControls', label: 'Кнопки у субтитров (▶ ☆)', type: 'toggle' },
       { k: 'showSideControls', label: 'Кнопки по бокам видео (‹ ↻ › AP)', type: 'toggle' },
-      { k: 'hidePlaybar', label: 'Прятать полосу YouTube (видна при наведении)', type: 'toggle' },
+      { k: 'hidePlaybar', label: 'Прятать полосу YouTube, пока курсор не у нижнего края', type: 'toggle', hint: 'Как в Language Reactor: сколько ни води мышью по видео, полоса не выскакивает; она появляется, только когда курсор внизу' },
+      { k: 'barZone', label: 'Высота нижней зоны, где появляется полоса', type: 'range', min: 24, max: 200, step: 4, unit: 'px' },
       { k: 'showPanel', label: 'Боковая панель со списком', type: 'toggle' },
       { k: 'panelFontSize', label: 'Текст в боковой панели', type: 'range', min: 11, max: 26, step: 1, unit: 'px' },
       { k: 'tipFontSize', label: 'Текст подсказки при наведении', type: 'range', min: 10, max: 26, step: 1, unit: 'px', preview: 'tip' },
@@ -199,6 +202,7 @@ self.YTAM_SCHEMA = [
       { k: 'segSoft', label: 'Знаки паузы внутри предложения', type: 'text', hint: 'Режут длинное предложение (см. долю выше). По умолчанию: , ; : — –' },
       { k: 'cardTrim', label: 'Обрезать длинные фразы в карточке', type: 'select', options: [['off', 'Нет — вся фраза'], ['rules', 'По правилам (запятые, концы предложений)'], ['ai', 'ИИ: осмысленный кусок со словом (в фоне)']], hint: 'Работает в фоне, пока вы смотрите дальше. Аудио режется по тому же куску; перевод переводится заново' },
       { k: 'cardMaxWords', label: 'Макс. слов во фразе карточки', type: 'range', min: 4, max: 40, step: 1 },
+      { k: 'cardExamples', label: 'ИИ добавляет примеры к карточке слова', type: 'range', min: 0, max: 6, step: 1, hint: 'Сколько новых предложений с этим словом (в том же значении, похожего стиля, с переводом) сгенерировать и положить на обратную сторону. 0 — не нужно. Нужен ключ ИИ; делается в фоне' },
       { k: 'cardTrimRatio', label: 'Доля длинных фраз, которые обрезаются', type: 'range', min: 0, max: 100, step: 5, unit: '%', hint: 'Градация «оригинал ↔ обработано»: 100% — все длинные фразы режутся, 50% — каждая вторая остаётся целиком как в видео, 0% — не режутся. Точное соотношение, не случайное' },
     ],
   },
@@ -252,6 +256,15 @@ self.YTAM_SCHEMA = [
 // Developer menu (🛠 in the side panel): every internal number, tunable live.
 // Stored in chrome.storage.local.dev
 self.YTAM_DEV_SCHEMA = [
+  {
+    title: '🧪 Тестовые функции (новое — проверяйте здесь)', fields: [
+      { k: 'declickMs', label: 'Плавное затухание звука при паузе / перемотке (против щелчка)', def: 25, min: 0, max: 80, step: 1, unit: 'мс', hint: '0 = выключено. Затихает и нарастает за это время; YouTube этих изменений громкости не видит и не запоминает' },
+      { k: 'beatPause', label: 'Пауза в конце фразы — на бит музыки (эксперимент)', def: 0, min: 0, max: 1, step: 1, hint: '1 = если играет музыка, остановка ждёт ближайший бит / атаку ноты после конца фразы' },
+      { k: 'beatWaitMax', label: 'Бит: ждать не дольше', def: 0.6, min: 0.1, max: 1.5, step: 0.05, unit: 'с' },
+      { k: 'tapAlways', label: 'Записывать звук из видео, даже если работает лончер', def: 1, min: 0, max: 1, step: 1, hint: '0 = не подключаться к звуку видео, когда аудио даёт лончер (проверьте, уходят ли щелчки; пауза тогда определяется по таймингам YouTube + добавке)' },
+      { k: 'endExtra', label: 'Добавка к концу фразы по YouTube', def: 0.12, min: 0, max: 0.6, step: 0.02, unit: 'с', hint: 'Не даёт обрезать последние слова, если тайминги YouTube чуть раньше речи' },
+    ],
+  },
   {
     title: 'Аудио: окно и обрезка', fields: [
       { k: 'clipLead', label: 'Окно до фразы (поиск начала)', def: 0.7, min: 0, max: 3, step: 0.05, unit: 'с' },

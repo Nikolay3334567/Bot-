@@ -114,8 +114,8 @@ async function refresh() {
   cfg = s.config;
   $('status').innerHTML =
     row('Лончер', true, 'работает', s.os + ' · кэш ' + s.cacheMB + ' МБ') +
-    row('yt-dlp', !!s.ytdlp, s.ytdlp ? s.ytdlpVersion : 'не найден', s.ytdlp || 'Нажмите «Скачать yt-dlp и ffmpeg» или положите yt-dlp.exe рядом с лончером') +
-    row('ffmpeg', !!s.ffmpeg, s.ffmpeg ? 'найден' : 'не найден', s.ffmpeg || '') +
+    row('yt-dlp', !!s.ytdlp, s.ytdlp ? 'работает · ' + s.ytdlpVersion : 'не найден', s.ytdlp || 'Нажмите «Скачать yt-dlp и ffmpeg» или положите yt-dlp.exe рядом с лончером') +
+    row('ffmpeg', !!s.ffmpeg, s.ffmpeg ? 'работает · ' + (String(s.ffmpegVersion || '').replace(/^ffmpeg version\s+/i, '').split(' ')[0] || 'найден') : 'не найден', s.ffmpeg || 'Нажмите «Проверить / скачать…» или укажите папку с ffmpeg ниже') +
     row('Anki + AnkiConnect', s.ankiConnect, s.ankiConnect ? 'на связи' : 'не отвечает', s.ankiConnect ? 'порт ' + (s.ankiLivePort || s.ankiPort) : (s.ankiPath ? 'Anki: ' + s.ankiPath + ' — нажмите «Запустить Anki»' : 'Установите дополнение AnkiConnect (код 2055492159) и запустите Anki')) +
     row('Автозапуск с Windows', s.autostart, s.autostart ? 'включён' : 'выключен', '') ;
   const c = s.config;
@@ -124,8 +124,22 @@ async function refresh() {
     `<label class="chk"><input type="checkbox" id="c_dl" ${c.autoDownload ? 'checked' : ''}> Скачивать yt-dlp и ffmpeg автоматически, если их нет</label>` +
     `<label class="chk"><input type="checkbox" id="c_open" ${c.openStatusPage ? 'checked' : ''}> Открывать это окно при запуске</label>` +
     `<label class="chk"><input type="checkbox" id="c_auto" ${s.autostart ? 'checked' : ''}> Запускать лончер при входе в Windows</label>` +
+    '<div class="row"><div>Где лежит yt-dlp<small>путь к файлу или к папке (можно вставить из проводника)</small></div><input id="c_yt" style="width:55%;padding:6px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)" placeholder="пусто = искать самому / скачать" value="' + (c.ytdlpPath || '').replace(/"/g, '&quot;') + '"></div>' +
+    '<div class="row"><div>Где лежит ffmpeg<small>путь к файлу или к папке</small></div><input id="c_ff" style="width:55%;padding:6px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)" placeholder="пусто = искать самому / скачать" value="' + (c.ffmpegPath || '').replace(/"/g, '&quot;') + '"></div>' +
+    '<div class="btns"><button id="savePaths" class="sec">Проверить пути и сохранить</button></div>' +
     '<small style="color:var(--mute)">Остальное — в config.json рядом с лончером (пути к yt-dlp/ffmpeg/Anki, аргументы yt-dlp, размер кэша).</small>';
   for (const id of ['c_anki', 'c_dl', 'c_open']) $(id).onchange = save;
+  $('savePaths').onclick = () => act($('savePaths'), 'Проверяю…', async () => {
+    cfg.ytdlpPath = $('c_yt').value.trim(); cfg.ffmpegPath = $('c_ff').value.trim();
+    await post('/api/config', cfg);
+    await new Promise((r) => setTimeout(r, 300));
+    const s2 = await (await fetch('/api/status')).json();
+    const parts = [];
+    parts.push(s2.ytdlp ? '✓ yt-dlp: ' + s2.ytdlp + ' (' + s2.ytdlpVersion + ')' : '✗ yt-dlp по этому пути не найден');
+    parts.push(s2.ffmpeg ? '✓ ffmpeg: ' + s2.ffmpeg : '✗ ffmpeg по этому пути не найден');
+    toast(parts.join('\n'), !s2.ytdlp || !s2.ffmpeg);
+    refresh();
+  });
   $('c_auto').onchange = async () => { const r = await post('/api/autostart?on=' + ($('c_auto').checked ? 1 : 0)); if (r.error) toast(r.error, true); else toast($('c_auto').checked ? '✓ Автозапуск включён' : '✓ Автозапуск выключен'); refresh(); };
   } else if ($('c_auto')) $('c_auto').checked = s.autostart;
   $('jobs').innerHTML = '<b>Загрузки аудио</b>' + (s.jobs && s.jobs.length ? s.jobs.map((j) =>

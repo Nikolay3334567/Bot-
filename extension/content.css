@@ -23,8 +23,9 @@
 }
 
 html.ytam-hide-native .ytp-caption-window-container { display: none !important; }
-html.ytam-hidebar #movie_player:not(:hover) .ytp-chrome-bottom,
-html.ytam-hidebar #movie_player:not(:hover) .ytp-gradient-bottom { opacity: 0 !important; }
+/* The YouTube control bar stays hidden until the pointer goes to the bottom edge of the player (class set by script). */
+html.ytam-hidebar:not(.ytam-bar-show) #movie_player .ytp-chrome-bottom,
+html.ytam-hidebar:not(.ytam-bar-show) #movie_player .ytp-gradient-bottom { opacity: 0 !important; pointer-events: none !important; transition: opacity .12s; }
 
 /* ---------- words ---------- */
 .ytam-w { border-radius: 4px; cursor: pointer; padding: 0 1px; box-decoration-break: clone; -webkit-box-decoration-break: clone; transition: background .1s; }

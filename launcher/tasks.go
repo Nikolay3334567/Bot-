@@ -1,9 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -164,4 +169,108 @@ func lastLine(s string) string {
 		return strings.TrimSpace(s[i+1:])
 	}
 	return s
+}
+
+// ---------- yt-dlp upkeep: YouTube changes every few weeks, an old yt-dlp simply stops working ----------
+
+var ytdlpDateRe = regexp.MustCompile(`(\d{4})\.(\d{1,2})\.(\d{1,2})`)
+
+func ytdlpDate(ver string) time.Time {
+	m := ytdlpDateRe.FindStringSubmatch(ver)
+	if m == nil {
+		return time.Time{}
+	}
+	y, _ := strconv.Atoi(m[1])
+	mo, _ := strconv.Atoi(m[2])
+	d, _ := strconv.Atoi(m[3])
+	return time.Date(y, time.Month(mo), d, 0, 0, 0, 0, time.UTC)
+}
+
+func ytdlpOutdated(path string) bool {
+	d := ytdlpDate(toolVersion(path, "--version"))
+	return !d.IsZero() && time.Since(d) > 45*24*time.Hour
+}
+
+var (
+	autoUpdMu   sync.Mutex
+	lastAutoUpd time.Time
+)
+
+// autoUpdateYtdlp replaces an old / broken yt-dlp by a fresh copy (at most every 20 minutes).
+// Returns true when something new was installed, so the failed download is worth retrying.
+func autoUpdateYtdlp(reason string) bool {
+	if cfg.YtdlpPath != "" || (!cfg.AutoDownload && !explicitDl) {
+		return false
+	}
+	autoUpdMu.Lock()
+	if time.Since(lastAutoUpd) < 20*time.Minute {
+		autoUpdMu.Unlock()
+		return false
+	}
+	lastAutoUpd = time.Now()
+	autoUpdMu.Unlock()
+	cur := workingYtdlp()
+	old := ""
+	if cur != "" {
+		old = toolVersionRun(cur, "--version")
+	}
+	logf("yt-dlp: %s — скачиваю свежую версию (была %s)", reason, old)
+	explicitDl = true
+	defer func() { explicitDl = false }()
+	if _, err := ensureYtdlpF(true); err != nil {
+		logf("✗ не удалось обновить yt-dlp: %v", err)
+		return false
+	}
+	verMu.Lock()
+	verCache = map[string]string{}
+	verMu.Unlock()
+	nv := toolVersionRun(workingYtdlp(), "--version")
+	logf("✓ yt-dlp: %s → %s", old, nv)
+	return nv != old
+}
+
+func denoPath() string {
+	for _, d := range []string{filepath.Join(appDir, "bin"), appDir} {
+		p := filepath.Join(d, exeName("deno"))
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("deno"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// ensureDeno downloads the Deno JavaScript runtime that yt-dlp needs to solve YouTube's challenges.
+func ensureDeno() (string, error) {
+	if p := denoPath(); p != "" {
+		return p, nil
+	}
+	if !cfg.AutoDownload && !explicitDl {
+		return "", errors.New("Deno не найден (нужен yt-dlp для YouTube); включите автоскачивание в настройках лончера")
+	}
+	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
+	var asset string
+	switch runtime.GOOS {
+	case "windows":
+		asset = "deno-" + arch + "-pc-windows-msvc.zip"
+	case "darwin":
+		asset = "deno-" + arch + "-apple-darwin.zip"
+	default:
+		asset = "deno-" + arch + "-unknown-linux-gnu.zip"
+	}
+	zipPath := filepath.Join(appDir, "bin", "deno.zip")
+	logf("скачиваю Deno (%s) …", asset)
+	if err := download("https://github.com/denoland/deno/releases/latest/download/"+asset, zipPath); err != nil {
+		return "", fmt.Errorf("не удалось скачать Deno: %v", err)
+	}
+	defer os.Remove(zipPath)
+	dest := filepath.Join(appDir, "bin", exeName("deno"))
+	if err := unzipFile(zipPath, exeName("deno"), dest); err != nil {
+		return "", err
+	}
+	os.Chmod(dest, 0o755)
+	logf("✓ Deno установлен: %s", dest)
+	return dest, nil
 }

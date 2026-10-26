@@ -222,7 +222,7 @@ func createShortcut() (string, error) {
 	q := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	script := fmt.Sprintf(`$d=[Environment]::GetFolderPath('Desktop');$p=Join-Path $d 'YouTube + Anki.lnk';`+
 		`$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);$s.TargetPath='%s';$s.Arguments='--open';`+
-		`$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='YouTube + Anki: лончер, Anki и Chrome';$s.Save();Write-Output $p`,
+		`$s.WorkingDirectory='%s';$s.WindowStyle=7;$s.IconLocation='%s,0';$s.Description='YouTube + Anki: лончер, Anki и Chrome';$s.Save();Write-Output $p`,
 		q(exe), q(filepath.Dir(exe)), q(icon))
 	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
 	hide(cmd)

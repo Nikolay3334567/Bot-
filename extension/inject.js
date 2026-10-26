@@ -38,6 +38,49 @@
     return p;
   };
 
+
+  // ---- click-free pause / play (the pop you hear when sound is cut at a non-zero level) ----
+  // Our fades change video.volume for a few ms; YouTube must neither notice nor save that. The content script
+  // marks such moments in <html data-ytam-q> and we swallow the volumechange events of that window.
+  const nowAbs = () => performance.timeOrigin + performance.now();
+  window.addEventListener('volumechange', (e) => {
+    const q = +document.documentElement.dataset.ytamQ;
+    if (q && nowAbs() < q && e.target && e.target.tagName === 'VIDEO') e.stopImmediatePropagation();
+  }, true);
+
+  const DCms = () => +document.documentElement.dataset.ytamDc || 0;    // 0 = off
+  const isMainVideo = (v) => v && v.tagName === 'VIDEO' && /html5-main-video/.test(v.className);
+  const quiet = (v, x) => { document.documentElement.dataset.ytamQ = String(nowAbs() + 150); v.volume = Math.max(0, Math.min(1, x)); };
+  const ramp = (v, to, ms) => new Promise((res) => {
+    const from = v.volume, steps = Math.max(1, Math.round(ms / 5));
+    let i = 0;
+    const t = setInterval(() => { i++; quiet(v, from + (to - from) * Math.min(1, i / steps)); if (i >= steps) { clearInterval(t); res(); } }, 5);
+  });
+  const nativePause = HTMLMediaElement.prototype.pause;
+  const nativePlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.pause = function () {
+    const v = this, ms = DCms();
+    if (!ms || !isMainVideo(v) || v.paused || v.__ytamFade) return nativePause.apply(v, arguments);
+    v.__ytamFade = { vol: v.volume, cancel: false };
+    ramp(v, 0, ms).then(() => {
+      const f = v.__ytamFade;
+      if (f && !f.cancel) nativePause.call(v);
+      quiet(v, f ? f.vol : v.volume);
+      v.__ytamFade = null;
+    });
+  };
+  HTMLMediaElement.prototype.play = function () {
+    const v = this, ms = DCms();
+    if (v.__ytamFade) { v.__ytamFade.cancel = true; return nativePlay.apply(v, arguments); } // play() during the fade-out: keep playing
+    if (!ms || !isMainVideo(v) || !v.paused) return nativePlay.apply(v, arguments);
+    const vol0 = v.volume;
+    quiet(v, 0);
+    const p = nativePlay.apply(v, arguments);
+    const up = () => ramp(v, vol0, ms);
+    if (p && p.then) p.then(up, () => quiet(v, vol0)); else up();
+    return p;
+  };
+
   window.addEventListener('message', (e) => {
     if (e.source !== window || !e.data || e.data.__ytamReq !== 'playerResponse') return;
     let pr = null;

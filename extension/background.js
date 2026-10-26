@@ -3,7 +3,7 @@ importScripts('defaults.js');
 try { importScripts('lib/lame.min.js'); } catch (_) {} // MP3 encoder (kept off the page's main thread)
 
 const MODEL = 'YT Anki Miner';
-const FIELDS = ['Sentence', 'Translation', 'Word', 'WordMeaning', 'Audio', 'Image', 'Source', 'AudioAI'];
+const FIELDS = ['Sentence', 'Translation', 'Word', 'WordMeaning', 'Audio', 'Image', 'Source', 'AudioAI', 'Examples'];
 
 const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTime = (s) => {
@@ -716,6 +716,11 @@ const CSS = `.card{font-family:Arial,sans-serif;font-size:22px;text-align:center
 .word{font-size:18px;color:#888}
 .tr{font-size:20px;color:#b06d00;margin:10px 0}
 .meaning{font-size:17px;margin:8px 0}
+.ex{margin:14px auto 0;max-width:34em;text-align:left;font-size:16px}
+.ex ul{margin:4px 0;padding-left:1.2em}
+.ex li{margin:6px 0}
+.ex .t{color:#b06d00;font-size:14px}
+.ex .h{color:#888;font-size:13px}
 .src{margin-top:22px;font-size:14px;color:#888}
 .src a{display:inline-block;padding:6px 14px;border-radius:16px;background:#ff0033;color:#fff;text-decoration:none;font-weight:bold}
 .src .title{margin-top:6px;font-size:12px}`;
@@ -729,6 +734,7 @@ const BACK = `{{FrontSide}}
 <hr id="answer">
 <div class="tr">{{Translation}}</div>
 {{#WordMeaning}}<div class="meaning"><b>{{Word}}</b> — {{WordMeaning}}</div>{{/WordMeaning}}
+{{#Examples}}<div class="ex">{{Examples}}</div>{{/Examples}}
 <div class="src">{{Source}}</div>`;
 
 let modelReady = false;
@@ -768,6 +774,23 @@ async function addCard(c) {  // writes one note to Anki (throws when Anki is unr
   }
 }
 
+const examplesHtml = (list) => (Array.isArray(list) && list.length
+  ? `<div class="h">Ещё примеры</div><ul>${list.map((e) => `<li>${esc(e.s)}${e.t ? `<br><span class="t">${esc(e.t)}</span>` : ''}</li>`).join('')}</ul>` : '');
+
+// More sentences with the word (same meaning, similar style) — one phrase from a video is not enough to learn a word.
+async function aiExamples({ word, sentence, n, tl, model }) {
+  const lang = LANGS[tl] || tl;
+  const prompt = `A learner of English is studying the word or phrase "${word}", met in this sentence from a video:
+"${sentence}"
+
+Write ${n} NEW example sentences that use "${word}" in the SAME meaning (and part of speech), in the same register and of similar difficulty.
+Rules: natural, everyday English; different situations; each at most 14 words; the target must appear exactly (a grammatical form is fine); do not copy the original sentence.
+Return a JSON array of {"s": sentence, "t": translation into ${lang}}.`;
+  const out = await llm({ model: model || (await aiConfig()).aiFastModel, prompt, json: true, temperature: 0.7,
+    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { s: { type: 'STRING' }, t: { type: 'STRING' } }, required: ['s', 't'] } } });
+  return asLines(parseJsonLoose(out)).filter((x) => x && x.s).slice(0, n).map((x) => ({ s: String(x.s), t: String(x.t || '') }));
+}
+
 const deckMade = new Set();
 async function addCardOnce(c) {
   await ensureModel();
@@ -786,6 +809,7 @@ async function addCardOnce(c) {
     WordMeaning: esc(c.wordMeaning),
     Audio: audio,
     AudioAI: audioAI,
+    Examples: examplesHtml(c.examples),
     Image: image,
     Source: `<a href="${link}">▶ Смотреть на YouTube · ${fmtTime(c.start)}</a><div class="title">${esc(c.title)}</div>`,
   };
@@ -1000,6 +1024,7 @@ async function handle(msg) {
       return { b64: await cloudTts(text, msg.voice || c.ttsVoice, c.ttsRate, true) };
     }
     case 'aiTrim': return aiTrim(msg);
+    case 'aiExamples': return aiExamples(msg);
     case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
     case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
     case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl, msg.phase);
@@ -1011,6 +1036,7 @@ async function handle(msg) {
     case 'addCard': return addCardOrQueue(msg.card);
     case 'syncNow': return flushOutbox();
     case 'outboxClear': return outboxSet([]);
+    case 'outboxRemove': { const box = await outboxGet(); const keep = box.filter((c) => c.key !== msg.key); if (keep.length !== box.length) await outboxSet(keep); return box.length - keep.length; }
     case 'helperPing': return (await helperFetch(msg.url, '/ping')).json();
     case 'helperPrepare': return (await helperFetch(msg.url, '/prepare?v=' + encodeURIComponent(msg.v))).json();
     case 'helperPcm': return helperPcm(msg);
