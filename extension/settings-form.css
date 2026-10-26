@@ -52,3 +52,6 @@
 .ytam-set-paste { box-sizing: border-box; width: 100%; margin-top: 8px; background: #1a1a1a; color: #ddd; border: 1px solid #555; border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
 
 .ytam-src-row { margin: 4px 0; font: 13px Roboto, Arial, sans-serif; } .ytam-src-row.ok b { color: #6fd08a; } .ytam-src-row.bad b { color: #ff8a80; } .ytam-src-row span { color: #ccc; }
+
+.ytam-off-bar { height: 8px; margin: 8px 0; border-radius: 4px; background: #333; overflow: hidden; } .ytam-off-bar i { display: block; height: 100%; width: 0; background: #2cc4a0; transition: width .4s; }
+.ytam-set-select { margin-right: 8px; padding: 5px 8px; background: #222; color: #ddd; border: 1px solid #555; border-radius: 4px; }

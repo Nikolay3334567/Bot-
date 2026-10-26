@@ -959,6 +959,7 @@
         setProgress(null);
         setCues(cues);
         setStatus('');
+        prefetchWords(token);
         return;
       } catch (e) {
         if (token !== S.token) return;
@@ -1042,18 +1043,29 @@
     }).catch(() => trAsked.delete(vid + ':' + i));
   }
 
-  // Translate every distinct word of the video up front so hover is instant.
+  // Translate every distinct word of the video up front (and warm up its dictionary variants), so hover is instant:
+  // the translation of all words in a few batches, the variants quietly, nearest words first.
   async function prefetchWords(token) {
     const tl = settings.targetLang;
     const re = /[\p{L}]+(?:['’-][\p{L}]+)*/gu;
-    const set = new Set();
-    for (const w of S.words) for (const m of w.text.matchAll(re)) set.add(norm(m[0]));
-    for (const c of S.cues) for (const e of cueExpr(c)) if (!e.t) set.add(e.key);
-    const list = [...set].filter((w) => !S.wordTr.has(w));
-    for (let i = 0; i < list.length; i += 300) {
+    const ordered = [];                 // by first appearance, starting from the current phrase
+    const seen = new Set();
+    const addTok = (t) => { const w = norm(t); if (w.length > 0 && !seen.has(w)) { seen.add(w); ordered.push(w); } };
+    const v = getVideo();
+    const from = Math.max(0, S.cues.length ? cueIndexAt(v ? v.currentTime : 0) : 0);
+    const cueOrder = S.cues.length ? S.cues.slice(from).concat(S.cues.slice(0, from)) : [];
+    for (const c of cueOrder) for (const m of c.text.matchAll(re)) addTok(m[0]);
+    for (const w of S.words) for (const m of w.text.matchAll(re)) addTok(m[0]);
+    for (const c of S.cues) for (const e of cueExpr(c)) if (!e.t && !seen.has(e.key)) { seen.add(e.key); ordered.push(e.key); }
+    const list = ordered.filter((w) => !S.wordTr.has(w));
+    // the nearest phrases first: a small batch, so the first words are ready within a moment
+    const batches = [];
+    for (let i = 0, step = 60; i < list.length; i += step, step = 300) batches.push(list.slice(i, i + step));
+    bg({ type: 'warmVariants', words: ordered.filter((w) => !w.includes(' ')), tl }).catch(() => {});
+    for (const part of batches) {
       if (token !== S.token || tl !== settings.targetLang) return;
       try {
-        const res = await bg({ type: 'translateWords', words: list.slice(i, i + 300), tl });
+        const res = await bg({ type: 'translateWords', words: part, tl });
         for (const [w, t] of Object.entries(res)) S.wordTr.set(w, t);
       } catch (_) {
         await sleep(2000);
@@ -2004,18 +2016,19 @@
     }
   }
 
-  const SRC_NAME = { cloud: 'Google Cloud', google: 'Google', edge: 'Microsoft Edge', azure: 'Microsoft Azure', ai: 'ИИ' };
-  // "Where does this translation come from" — a small line under the tooltip / popup (⚙ → Перевод).
+  const SRC_NAME = { cloud: 'Google Cloud', google: 'Google', edge: 'Edge', azure: 'Azure', ai: 'ИИ', wikt: 'Wiktionary', mymem: 'MyMemory' };
+  // "Where does this translation come from" — one short line under the tooltip / popup (⚙ → Перевод); the long
+  // explanation is in its tooltip title and in ⚙ → Перевод → «Проверить все источники».
   function srcLine(w) {
     if (!settings.showTrSource) return null;
     const d = dict.get(w);
     if (!d || d instanceof Promise || !d.src) return null;
-    const s = d.src;
-    let t = SRC_NAME[s.tr] || s.tr || '';
-    if (s.dict) { if (s.dict !== s.tr) t += ' · варианты: ' + (SRC_NAME[s.dict] || s.dict); }
-    else if (d.partial) t += ' · варианты загружаются…';
-    else t += ' · вариантов нет' + (s.why ? ` (${s.why})` : '');
-    return h('div', { class: 'ytam-tip-src', text: t });
+    const s = d.src, nm = (x) => String(x || '').split('+').map((k) => SRC_NAME[k] || k).join(' + ');
+    let t = nm(s.tr);
+    if (s.dict) { if (s.dict !== s.tr) t += ' · ' + nm(s.dict); }
+    else if (d.partial) t += ' · варианты…';
+    else t += ' · нет вариантов';
+    return h('div', { class: 'ytam-tip-src', text: t, title: s.why ? 'Почему нет вариантов: ' + s.why : 'Перевод: ' + nm(s.tr) + (s.dict ? '; варианты: ' + nm(s.dict) : '') });
   }
 
   function variants(w) {

@@ -1,6 +1,7 @@
 // Service worker: translation (Google Translate, no key), Gemini, AnkiConnect.
 importScripts('defaults.js');
-try { importScripts('lib/lame.min.js'); } catch (_) {} // MP3 encoder (kept off the page's main thread)
+try { importScripts('lib/lame.min.js'); } catch (_) {}
+try { importScripts('data/freq_en.js'); } catch (_) {} // word list (also used to build the offline dictionary) // MP3 encoder (kept off the page's main thread)
 
 const MODEL = 'YT Anki Miner';
 const FIELDS = ['Sentence', 'Translation', 'Word', 'WordMeaning', 'Audio', 'Image', 'Source', 'AudioAI', 'Examples'];
@@ -55,6 +56,8 @@ const SRC = {
   google: { name: 'Google (бесплатный)', ok: 0, fail: 0, last: '', at: 0 },
   azure: { name: 'Microsoft Azure', ok: 0, fail: 0, last: '', at: 0 },
   edge: { name: 'Microsoft Edge', ok: 0, fail: 0, last: '', at: 0 },
+  wikt: { name: 'Wiktionary', ok: 0, fail: 0, last: '', at: 0 },
+  mymem: { name: 'MyMemory', ok: 0, fail: 0, last: '', at: 0 },
   ai: { name: 'ИИ (Gemini)', ok: 0, fail: 0, last: '', at: 0 },
 };
 function mark(src, ok, info) {
@@ -319,27 +322,208 @@ async function getCache(name) {
   return caches[name];
 }
 
+// Writes are throttled, not debounced: busy caches (the offline dictionary grows for an hour) must still reach the
+// disk regularly, and a big cache is not rewritten every second.
 function persistCache(name) {
   dirtyCaches.add(name);
-  clearTimeout(saveTimer);
+  if (saveTimer) return;
+  const size = Object.keys(caches[name] || {}).length;
   saveTimer = setTimeout(() => {
-    for (const n of dirtyCaches) chrome.storage.local.set({ [n]: caches[n] });
+    saveTimer = 0;
+    for (const n of [...dirtyCaches]) chrome.storage.local.set({ [n]: caches[n] });
     dirtyCaches.clear();
-  }, 1500);
+  }, size > 3000 ? 15000 : 1500);
 }
 
 async function translateWords(words, tl, prio = 0, sl = 'auto') {
   const cache = await getCache('trc:' + tl);
+  const srcMap = await getCache('trs:' + tl);
   const missing = words.filter((w) => !(w in cache));
   for (let i = 0; i < missing.length; i += 100) {
     const chunk = missing.slice(i, i + 100);
+    const before = { cloud: SRC.cloud.ok, google: SRC.google.ok, azure: SRC.azure.ok, edge: SRC.edge.ok };
     const out = await translateLines(chunk, tl, prio, sl);
-    chunk.forEach((w, k) => { if (out[k]) cache[w] = out[k]; });
+    const who = SRC.cloud.ok > before.cloud ? 'cloud' : SRC.azure.ok > before.azure ? 'azure' : SRC.edge.ok > before.edge ? 'edge' : 'google';
+    chunk.forEach((w, k) => { if (out[k]) { cache[w] = out[k]; srcMap[w] = who; } });
     persistCache('trc:' + tl);
+    persistCache('trs:' + tl);
   }
   const res = {};
   for (const w of words) if (cache[w]) res[w] = cache[w];
   return res;
+}
+
+// ---- Wiktionary: free, official MediaWiki API; translations per sense and part of speech, no key, generous limits.
+// Variants for a word are read from the English entry's translation tables and cached for good.
+const WIKT_CODES = { 'zh-CN': ['cmn', 'zh'], 'zh-TW': ['cmn', 'zh'], iw: ['he'], he: ['he'] };
+const WIKT_POS = { Noun: 'noun', 'Proper noun': 'noun', Verb: 'verb', Adjective: 'adjective', Adverb: 'adverb', Preposition: 'preposition', Conjunction: 'conjunction',
+  Pronoun: 'pronoun', Interjection: 'interjection', Determiner: 'determiner', Article: 'determiner', Particle: 'particle', Numeral: 'numeral', Phrase: 'phrase', Prefix: 'prefix', Suffix: 'suffix' };
+const wikt = { active: 0, queue: [] };
+
+async function wiktApi(params) {
+  const url = 'https://en.wiktionary.org/w/api.php?' + new URLSearchParams({ format: 'json', formatversion: '2', origin: '*', redirects: '1', ...params });
+  const r = await fetchT(url, { headers: { 'Api-User-Agent': 'YT-Anki-Miner browser extension (language learning)' } }, 9000);
+  if (!r.ok) { mark('wikt', false, 'HTTP ' + r.status); throw new Error('Wiktionary HTTP ' + r.status); }
+  const j = await r.json();
+  if (j.error) throw new Error((j.error.code || 'error') + ': ' + (j.error.info || ''));   // e.g. missingtitle
+  return j;
+}
+
+// translation terms of one wikitext block, grouped by part of speech (first sense first)
+function parseWikt(text, codes) {
+  const groups = [];
+  let pos = '', lemma = null, lemmaPos = '';
+  const alt = codes.map((c) => c.replace(/[^\w-]/g, '')).join('|');
+  const reTerm = new RegExp('\\{\\{tt?\\+?\\|(?:' + alt + ')\\|([^|}]+)', 'g');
+  for (const ln of text.split('\n')) {
+    const h = /^={3,5}\s*([^=]+?)\s*={3,5}\s*$/.exec(ln);
+    if (h) { if (WIKT_POS[h[1].trim()]) pos = WIKT_POS[h[1].trim()]; continue; }
+    if (!lemma) {
+      const m = /\{\{((?:[\w -]+ of|inflection of))\|en\|([^|}=]+)/.exec(ln) || /\{\{(en-[\w -]+ of)\|([^|}=]+)/.exec(ln);
+      if (m) {
+        lemma = m[2].replace(/[\[\]]/g, '').trim();
+        const kind = m[1].toLowerCase();   // "past participle of", "plural of", ... say which part of speech the lemma is wanted as
+        lemmaPos = /past|participle|third-person|present|gerund|simple/.test(kind) ? 'verb' : /plural/.test(kind) ? 'noun' : /comparative|superlative/.test(kind) ? 'adjective' : '';
+      }
+    }
+    if (!/^\*+\s*[^:{]+:/.test(ln)) continue;
+    const terms = [];
+    for (const m of ln.matchAll(reTerm)) {
+      const t = m[1].replace(/\[\[|\]\]/g, '').replace(/\u0301/g, '').trim();
+      if (t && !terms.includes(t)) terms.push(t);
+    }
+    if (!terms.length) continue;
+    let g = groups.find((x) => x.pos === (pos || 'other'));
+    if (!g) groups.push((g = { pos: pos || 'other', terms: [] }));
+    for (const t of terms) if (!g.terms.includes(t) && g.terms.length < 8) g.terms.push(t);
+  }
+  return { dict: groups.filter((g) => g.terms.length), lemma, lemmaPos };
+}
+
+async function wiktFetchWord(word, tl, depth = 0) {
+  const codes = WIKT_CODES[tl] || [tl.split('-')[0]];
+  let sec;
+  try {
+    const s = await wiktApi({ action: 'parse', page: word, prop: 'sections' });
+    sec = ((s.parse || {}).sections || []).find((x) => x.line === 'English' && String(x.toclevel) === '1');
+  } catch (e) { if (/missingtitle|doesn.t exist/i.test(e.message)) return { dict: [], miss: true }; throw e; }
+  if (!sec) return { dict: [], miss: true };
+  const t = await wiktApi({ action: 'parse', page: word, prop: 'wikitext', section: sec.index });
+  let text = (t.parse || {}).wikitext || '';
+  // very long entries keep their translations on a subpage
+  if (/\{\{see translation subpage/i.test(text) || /\{\{trans-see\|/i.test(text)) {
+    try { const sub = await wiktApi({ action: 'parse', page: word + '/translations', prop: 'wikitext' }); text += '\n' + ((sub.parse || {}).wikitext || ''); } catch (_) { /* optional */ }
+  }
+  const out = parseWikt(text, codes);
+  if (!out.dict.length && out.lemma && out.lemma.toLowerCase() !== word && depth < 1) {
+    const base = await wiktFetchWord(out.lemma.toLowerCase(), tl, depth + 1);
+    // "figured" is a verb form: the verb meanings of "figure" go first, not its noun meanings
+    if (out.lemmaPos) base.dict.sort((x, y) => (y.pos === out.lemmaPos) - (x.pos === out.lemmaPos));
+    return { ...base, lemma: out.lemma };
+  }
+  return out;
+}
+
+// Cached for good (misses are retried after a week). Never more than 4 requests at once.
+async function wiktVariants(word, tl) {
+  const cache = await getCache('wkt:' + tl);
+  const hit = cache[word];
+  if (hit && (!hit.miss || Date.now() - hit.at < 7 * 86400000)) return hit;
+  while (wikt.active >= 4) await new Promise((r) => wikt.queue.push(r));
+  wikt.active++;
+  try {
+    const out = await wiktFetchWord(word, tl);
+    cache[word] = { dict: out.dict.map((g) => ({ pos: g.pos, terms: g.terms.slice(0, 6) })), lemma: out.lemma || '', miss: !out.dict.length, at: Date.now() };
+    persistCache('wkt:' + tl);
+    if (out.dict.length) mark('wikt', true);
+    return cache[word];
+  } finally {
+    wikt.active--;
+    const next = wikt.queue.shift();
+    if (next) next();
+  }
+}
+
+// Warm-up: all words of the video, in order of appearance, quietly in the background — hover is then instant.
+const warm = { running: false, todo: [], tl: '' };
+async function warmVariants(words, tl) {
+  const cache = await getCache('wkt:' + tl);
+  const seen = new Set(warm.todo);
+  for (const w of words) if (!seen.has(w) && !(cache[w] && !cache[w].miss) && /^[a-z][a-z'-]*$/.test(w)) warm.todo.push(w);
+  warm.tl = tl;
+  if (warm.running) return warm.todo.length;
+  warm.running = true;
+  (async () => {
+    try {
+      const pump = async () => { while (warm.todo.length) { const w = warm.todo.shift(); try { await wiktVariants(w, warm.tl); } catch (_) { await sleep(400); } } };
+      await Promise.all([pump(), pump(), pump()]);
+    } finally { warm.running = false; }
+  })();
+  return warm.todo.length;
+}
+
+
+// ---- Offline dictionary: the N most frequent English words with their Wiktionary translations, collected once in
+// the background (official API, a few requests at a time) and kept in storage. Afterwards those words need no network.
+const offline = { running: false, done: 0, total: 0, tl: '', stop: false };
+async function offlineBuild(n, tl) {
+  if (offline.running) return offline;
+  const list = String(self.YTAM_FREQ || '').split('\n').slice(0, Math.max(100, Math.min(60000, +n || 10000))).filter((w) => /^[a-z][a-z'-]*$/.test(w));
+  const cache = await getCache('wkt:' + tl);
+  const todo = list.filter((w) => !(cache[w] && (!cache[w].miss || Date.now() - cache[w].at < 7 * 86400000)));
+  Object.assign(offline, { running: true, stop: false, done: list.length - todo.length, total: list.length, tl });
+  await chrome.storage.local.set({ offlineJob: { n, tl } });
+  (async () => {
+    try {
+      const worker = async () => {
+        while (todo.length && !offline.stop) {
+          const w = todo.shift();
+          try { await wiktVariants(w, tl); offline.done++; } catch (_) { todo.push(w); await sleep(1500); }   // failed: try again later
+          await sleep(40);
+        }
+      };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+    } finally {
+      offline.running = false;
+      if (!offline.stop && !todo.length) { await chrome.storage.local.remove('offlineJob'); await chrome.storage.local.set({ offlineDone: { n, tl, at: Date.now() } }); }
+      persistCache('wkt:' + tl);
+    }
+  })();
+  return offline;
+}
+
+async function offlineStatus() {
+  const cache = await getCache('wkt:' + (offline.tl || (await cloudCfg()).targetLang));
+  const { offlineDone } = await chrome.storage.local.get('offlineDone');
+  return { ...offline, cached: Object.keys(cache).filter((w) => !cache[w].miss).length, finished: offlineDone || null };
+}
+
+// the service worker may be stopped by Chrome during a long job: an alarm brings the job back
+chrome.alarms.create('ytam-offline', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(async (a) => {
+  if (a.name !== 'ytam-offline' || offline.running) return;
+  const { offlineJob } = await chrome.storage.local.get('offlineJob');
+  if (offlineJob) offlineBuild(offlineJob.n, offlineJob.tl).catch(() => {});
+});
+
+// MyMemory: free translation-memory service; several candidate translations (quality varies, so only good ones).
+async function myMemoryVariants(word, tl) {
+  const r = await fetchT(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(word)}&langpair=en|${encodeURIComponent(tl.split('-')[0])}`, {}, 7000);
+  if (!r.ok) { mark('mymem', false, 'HTTP ' + r.status); throw new Error('MyMemory HTTP ' + r.status); }
+  const j = await r.json();
+  const seen = new Set();
+  const terms = [];
+  const cand = [{ translation: (j.responseData || {}).translatedText, quality: 100, match: 1 }, ...(j.matches || [])];
+  cand.sort((a, b) => (+b.match || 0) - (+a.match || 0));
+  for (const m of cand) {
+    const t = String(m.translation || '').trim().replace(/[.!?]+$/, '');
+    if (!t || t.length > 40 || t.split(/\s+/).length > 3 || t.toLowerCase() === word.toLowerCase() || +m.quality < 60) continue;
+    const k = t.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); terms.push(t); }
+    if (terms.length >= 4) break;
+  }
+  if (terms.length) mark('mymem', true);
+  return terms.length ? [{ pos: '', terms }] : [];
 }
 
 // Dictionary variants (several meanings by part of speech): Google's free dictionary, then Microsoft's (Azure with a
@@ -357,27 +541,45 @@ Return JSON: [{"pos": "noun|verb|adjective|adverb|preposition|conjunction|pronou
 async function fetchVariants(word, tl, prio, sentence) {
   const cfg = await cloudCfg();
   const why = [];
-  const viaGoogle = async () => {
-    const j = await gtx(word, tl, true, prio, 1); // one try: the next source answers if Google is slow
-    const dict = (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) }));
-    if (!dict.length) throw new Error('пусто');
-    return { dict, src: 'google', translation: joinTrans(j).trim() };
+  const sources = [];
+  const merged = [];           // [{pos, terms}] — first source first, the next ones only fill up
+  const add = (dict, src) => {
+    let used = false;
+    for (const g of dict) {
+      let tg = merged.find((x) => x.pos === g.pos) || (g.pos ? null : merged[0]);
+      if (!tg) merged.push((tg = { pos: g.pos, terms: [] }));
+      for (const t of g.terms) if (!merged.some((m) => m.terms.some((x) => x.toLowerCase() === t.toLowerCase())) && tg.terms.length < 6) { tg.terms.push(t); used = true; }
+    }
+    if (used && !sources.includes(src)) sources.push(src);
   };
-  const viaMs = async () => { const dict = await msDict(word, tl); if (!dict.length) throw new Error('пусто'); return { dict, src: dict.via }; };
+  const total = () => merged.reduce((n, g) => n + g.terms.length, 0);
+  const want = Math.max(3, +cfg.tipVariants || 3);
   const googleDown = gq.fails > 0 || Date.now() < gq.downUntil;
-  const chain = googleDown ? [['Microsoft', viaMs], ['Google', viaGoogle]] : [['Google', viaGoogle], ['Microsoft', viaMs]];
-  for (const [name, fn] of chain) {
-    try { return await fn(); } catch (e) { why.push(`${name}: ${e.message}`.slice(0, 80)); }
+  const steps = [
+    ['wikt', 'Wiktionary', async () => { const w = await wiktVariants(word, tl); if (!w.dict.length) throw new Error('нет'); return w.dict; }],
+    ['google', 'Google', async () => {
+      const j = await gtx(word, tl, true, prio, 1);
+      const dict = (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) }));
+      if (!dict.length) throw new Error('пусто');
+      return dict;
+    }],
+    ['ms', 'Microsoft', async () => { const d = await msDict(word, tl); if (!d.length) throw new Error('пусто'); merged.viaMs = d.via; return d; }],
+    ['mymem', 'MyMemory', async () => { if (cfg.variantsMyMemory === false || prio < 1) throw new Error('только при наведении'); const d = await myMemoryVariants(word, tl); if (!d.length) throw new Error('пусто'); return d; }],
+  ];
+  if (googleDown) steps.splice(1, 0, steps.splice(2, 1)[0]); // Google struggles: Microsoft goes first
+  for (const [id, name, fn] of steps) {
+    if (total() >= want) break;
+    try { add(await fn(), id === 'ms' ? (merged.viaMs || 'edge') : id); } catch (e) { why.push(`${name}: ${String(e.message).replace(/^Переводчик ответил /, '').slice(0, 40)}`); }
   }
   let aiPending = false;
-  if (cfg.variantsAI !== 'off' && prio < 1) aiPending = true; // background prefetch never spends AI calls; a hover will
-  if (cfg.variantsAI !== 'off' && prio >= 1) {
+  if (!total() && prio < 1 && (cfg.variantsAI !== 'off' || cfg.variantsMyMemory !== false)) aiPending = true; // background prefetch never spends MyMemory / AI quota; a hover will
+  if (!total() && cfg.variantsAI !== 'off' && prio >= 1) {
     try {
       const dict = await aiVariants(word, sentence, tl, await aiConfig());
-      if (dict.length) { mark('ai', true); return { dict, src: 'ai' }; }
-    } catch (e) { mark('ai', false, e.message); why.push('ИИ: ' + e.message.slice(0, 60)); }
+      if (dict.length) { mark('ai', true); add(dict, 'ai'); }
+    } catch (e) { mark('ai', false, e.message); why.push('ИИ: ' + e.message.slice(0, 40)); }
   }
-  return { dict: [], src: null, why: why.join(' · '), aiPending };
+  return { dict: merged, src: sources.join('+') || null, why: why.join(' · '), aiPending };
 }
 
 const variantJobs = new Map();
@@ -395,6 +597,11 @@ async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast', sentence 
 
   let res = hit || null;
   if (res && res.aiPending && prio >= 1) res.partial = true;
+  // Already translated in bulk when the video loaded? Then no request at all.
+  if (!res) {
+    const trc = await getCache('trc:' + tl);
+    if (trc[key]) res = { translation: trc[key], dict: [], dt: Date.now(), partial: !!c.cloudVariants, src: { tr: (await getCache('trs:' + tl))[key] || 'google', dict: null } };
+  }
   if (!res && await cloudOk('tr', word.length)) {
     try {
       const tr = await cloudTranslate([word], tl, sl);
@@ -411,6 +618,11 @@ async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast', sentence 
     } catch (e) {
       try { const o = await msTranslate([word], tl); res = { translation: o[0] || '', dict: [], dt: Date.now(), partial: true, src: { tr: ms.lastVia || 'edge', dict: null } }; } catch (_) { throw e; }
     }
+  }
+  // Variants already warmed up (Wiktionary cache)? Then the answer is complete right now.
+  if (res.partial) {
+    const wk = (await getCache('wkt:' + tl))[key];
+    if (wk && wk.dict && wk.dict.length) { res.dict = wk.dict; res.partial = false; res.dt = Date.now(); res.src = { ...(res.src || {}), dict: 'wikt', why: '' }; }
   }
   cache[key] = res;
   persistCache(name);
@@ -1147,7 +1359,7 @@ async function handle(msg) {
       for (const k of Object.keys(caches)) delete caches[k];
       dirtyCaches.clear(); ttsCache.clear(); ms.token = ''; gq.fails = 0; gq.downUntil = 0;
       const all = await chrome.storage.local.get(null);
-      await chrome.storage.local.remove(Object.keys(all).filter((k) => /^(trc|lkc):/.test(k)));
+      await chrome.storage.local.remove(Object.keys(all).filter((k) => /^(trc|trs|lkc|wkt):/.test(k)));
       return true;
     }
     case 'cardVoice': {
@@ -1158,6 +1370,10 @@ async function handle(msg) {
     }
     case 'aiTrim': return aiTrim(msg);
     case 'aiExamples': return aiExamples(msg);
+    case 'warmVariants': return warmVariants(msg.words || [], msg.tl);
+    case 'offlineStart': return offlineBuild(msg.n, msg.tl);
+    case 'offlineStop': { offline.stop = true; await chrome.storage.local.remove('offlineJob'); return true; }
+    case 'offlineStatus': return offlineStatus();
     case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
     case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
     case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl, msg.phase, msg.sentence);

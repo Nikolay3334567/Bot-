@@ -244,6 +244,37 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
     live();
   }
 
+
+  // Offline dictionary (Wiktionary): the most frequent words are collected once, then need no network.
+  if (panes.subs && chrome.runtime && chrome.runtime.sendMessage) {
+    const box = mk('div', 'ytam-srcbox');
+    box.append(mk('div', 'ytam-set-group', 'Офлайн-словарь (Wiktionary)'));
+    box.append(mk('div', 'ytam-set-note', 'Самые частые английские слова с переводами по значениям, собранные заранее (официальный API Wiktionary, несколько запросов за раз, в фоне, можно закрыть страницу). Потом эти слова переводятся мгновенно и без интернета. Остальные слова добавляются в этот же словарь сами, пока вы смотрите видео.'));
+    const size = mk('select', 'ytam-set-select');
+    for (const [n, l] of [[3000, '3 000 слов (≈ 15 мин)'], [10000, '10 000 слов (≈ 45 мин)'], [30000, '30 000 слов (≈ 2–3 часа)']]) size.append(new Option(l, n));
+    size.value = '10000';
+    const bar = mk('div', 'ytam-off-bar');
+    const fill = mk('i');
+    bar.append(fill);
+    const info = mk('div', 'ytam-set-note');
+    const go = mk('button', 'ytam-set-reset', 'Собрать словарь');
+    const stop = mk('button', 'ytam-set-reset', 'Остановить');
+    const draw = (s) => {
+      const pct = s.total ? Math.round((100 * s.done) / s.total) : 0;
+      fill.style.width = pct + '%';
+      info.textContent = s.running ? `Собираю: ${s.done} из ${s.total} слов (${pct}%). В словаре уже ${s.cached} слов.` : `В офлайн-словаре ${s.cached} слов` + (s.finished ? ` · последний сбор закончен ${new Date(s.finished.at).toLocaleDateString('ru-RU')}` : '');
+      go.disabled = s.running;
+      stop.style.display = s.running ? '' : 'none';
+    };
+    const poll = () => chrome.runtime.sendMessage({ type: 'offlineStatus' }, (r) => { if (r && r.result) draw(r.result); });
+    go.addEventListener('click', () => chrome.storage.sync.get({ targetLang: 'ru' }, (c) => chrome.runtime.sendMessage({ type: 'offlineStart', n: +size.value, tl: c.targetLang }, () => poll())));
+    stop.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'offlineStop' }, () => poll()));
+    box.append(size, go, stop, bar, info);
+    panes.subs.pane.append(box);
+    poll();
+    const iv = setInterval(() => { if (!box.isConnected) return clearInterval(iv); poll(); }, 2000);
+  }
+
   // Backup / transfer: all settings (optionally with API keys and the vocabulary) to a file and back.
   if (!opts.only || opts.only.includes('backup')) {
     const btn = mk('button', 'ytam-set-tab', 'Перенос');
