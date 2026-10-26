@@ -51,7 +51,7 @@ async function cloudOk(kind, chars) {
 
 async function cloudFetch(url, body, label) {
   let r;
-  try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+  try { r = await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 15000); }
   catch (_) { throw new Error(label + ': нет связи'); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
@@ -126,40 +126,48 @@ async function cloudTest() {
 // ---- Google Translate access: one shared queue (hover requests first), spacing and retries,
 // so a burst of prefetching can never lock us out and hover always gets an answer.
 
-const gq = { hi: [], lo: [], active: 0, last: 0, pauseUntil: 0, timer: 0 };
+const gq = { hi: [], mid: [], lo: [], active: 0, last: 0, pauseUntil: 0, timer: 0, fails: 0, downUntil: 0 };
 const GQ_CONC = 3, GQ_GAP = 110;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// fetch that cannot hang forever (a stuck request would hold a queue slot and delay every hover).
+async function fetchT(url, init = {}, ms = 8000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...init, signal: ctl.signal }); } finally { clearTimeout(timer); }
+}
+
 function gqRun(fn, prio) {
   return new Promise((resolve, reject) => {
-    (prio ? gq.hi : gq.lo).push({ fn, resolve, reject });
+    (prio >= 1 ? gq.hi : prio > 0 ? gq.mid : gq.lo).push({ fn, resolve, reject }); // hover > subtitle lines > prefetch
     gqPump();
   });
 }
 
 function gqPump() {
   clearTimeout(gq.timer);
-  while (gq.active < GQ_CONC && (gq.hi.length || gq.lo.length)) {
+  // Background (prefetch) jobs never take the last slot: a hover request always finds a free one.
+  while (gq.active < GQ_CONC && (gq.hi.length || ((gq.mid.length || gq.lo.length) && gq.active < GQ_CONC - 1))) {
     const now = Date.now();
     const wait = Math.max(gq.last + GQ_GAP - now, gq.hi.length ? 0 : gq.pauseUntil - now);
     if (wait > 0) { gq.timer = setTimeout(gqPump, wait); return; }
     gq.last = now;
-    const job = gq.hi.shift() || gq.lo.shift();
+    const job = gq.hi.shift() || gq.mid.shift() || gq.lo.shift();
     gq.active++;
     job.fn().then(job.resolve, job.reject).finally(() => { gq.active--; gqPump(); });
   }
 }
 
-async function gtxFetch(text, tl, dict) {
+async function gtxFetch(text, tl, dict, attempts = 4) {
   const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dj=1&dt=t' +
     (dict ? '&dt=bd' : '') + '&tl=' + encodeURIComponent(tl);
   let status = 0;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     let r = null;
     try {
       r = attempt % 2 === 1 && text.length < 1500
-        ? await fetch(url + '&q=' + encodeURIComponent(text))
-        : await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: 'q=' + encodeURIComponent(text) });
+        ? await fetchT(url + '&q=' + encodeURIComponent(text), {}, dict ? 5000 : 9000)
+        : await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: 'q=' + encodeURIComponent(text) }, dict ? 5000 : 9000);
     } catch (_) { r = null; }
     if (r && r.ok) return r.json();
     status = r ? r.status : 0;
@@ -170,27 +178,89 @@ async function gtxFetch(text, tl, dict) {
   throw new Error(status ? 'Переводчик ответил HTTP ' + status : 'Нет связи с переводчиком');
 }
 
-const gtx = (text, tl, dict = false, prio = 0) => gqRun(() => gtxFetch(text, tl, dict), prio);
+const gtx = (text, tl, dict = false, prio = 0, attempts = 4) => gqRun(() => gtxFetch(text, tl, dict, attempts), prio);
 
 const joinTrans = (j) => (j.sentences || []).map((s) => s.trans || '').join('');
 
-// Lines in, translated lines out. If Google merges/splits lines we bisect (a handful of
-// requests) instead of translating every line separately.
+// ---- Second free translator (the one built into Edge): used when Google's free endpoint is blocked or slow.
+const MS_LANG = { 'zh-CN': 'zh-Hans', 'zh-TW': 'zh-Hant', he: 'he', iw: 'he' };
+const msLang = (tl) => MS_LANG[tl] || tl;
+const ms = { token: '', at: 0 };
+
+async function msAuth() {
+  if (ms.token && Date.now() - ms.at < 8 * 60000) return ms.token;
+  const r = await fetchT('https://edge.microsoft.com/translate/auth', { cache: 'no-store' }, 6000);
+  if (!r.ok) throw new Error('MS auth HTTP ' + r.status);
+  ms.token = (await r.text()).trim();
+  ms.at = Date.now();
+  return ms.token;
+}
+
+async function msCall(path, body) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetchT('https://api-edge.cognitive.microsofttranslator.com' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (await msAuth()) }, body: JSON.stringify(body),
+    }, 9000);
+    if (r.status === 401 && attempt === 0) { ms.token = ''; continue; } // token expired
+    if (!r.ok) throw new Error('MS HTTP ' + r.status);
+    return r.json();
+  }
+  throw new Error('MS auth');
+}
+
+async function msTranslate(lines, tl) {
+  const out = [];
+  for (let i = 0; i < lines.length; i += 100) {
+    const chunk = lines.slice(i, i + 100);
+    const j = await msCall(`/translate?to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, chunk.map((Text) => ({ Text })));
+    if (!Array.isArray(j) || j.length !== chunk.length) throw new Error('MS: неожиданный ответ');
+    for (const it of j) out.push(String(((it.translations || [])[0] || {}).text || '').trim());
+  }
+  return out;
+}
+
+const MS_POS = { NOUN: 'noun', VERB: 'verb', ADJ: 'adjective', ADV: 'adverb', PRON: 'pronoun', PREP: 'preposition', CONJ: 'conjunction', DET: 'determiner', MODAL: 'modal', OTHER: 'other' };
+async function msDict(word, tl) {
+  const j = await msCall(`/dictionary/lookup?from=en&to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, [{ Text: word }]);
+  const by = new Map();
+  for (const t of (((j || [])[0] || {}).translations) || []) {
+    const pos = MS_POS[t.posTag] || String(t.posTag || '').toLowerCase();
+    if (!by.has(pos)) by.set(pos, []);
+    const terms = by.get(pos);
+    if (t.displayTarget && !terms.includes(t.displayTarget) && terms.length < 6) terms.push(t.displayTarget);
+  }
+  return [...by].map(([pos, terms]) => ({ pos, terms }));
+}
+
+// Lines in, translated lines out: Google Cloud (if allowed) → Google free → Edge. If Google merges/splits
+// lines we bisect (a handful of requests) instead of translating every line separately.
 async function translateLines(lines, tl, prio = 0, sl = 'auto') {
   if (!lines.length) return [];
   const chars = lines.reduce((n, l) => n + l.length, 0);
   if (await cloudOk('tr', chars)) {
-    try { return await cloudTranslate(lines, tl, sl); } catch (e) { /* key/quota problem: fall back to the free endpoint */ }
+    try { return await cloudTranslate(lines, tl, sl); } catch (e) { /* key/quota problem: fall back to the free endpoints */ }
   }
-  return translateLinesFree(lines, tl, prio);
+  // Google's free endpoint failed repeatedly just now: go straight to the second translator for a while.
+  const googleDown = Date.now() < gq.downUntil;
+  const viaMs = async () => { const o = await msTranslate(lines, tl); if (o.every(Boolean)) return o; throw new Error('MS: пустой перевод'); };
+  if (googleDown) { try { return await viaMs(); } catch (_) { /* try Google anyway */ } }
+  try {
+    // Google struggles → two tries at most, then the second translator answers instead of making the user wait.
+    const out = await translateLinesFree(lines, tl, prio, gq.fails > 0 ? 1 : 2);
+    gq.fails = 0;
+    return out;
+  } catch (e) {
+    if (++gq.fails >= 3) gq.downUntil = Date.now() + 60000;
+    try { return await viaMs(); } catch (_) { throw e; }
+  }
 }
 
-async function translateLinesFree(lines, tl, prio = 0) {
-  if (lines.length === 1) return [joinTrans(await gtx(lines[0], tl, false, prio)).trim()];
-  const parts = joinTrans(await gtx(lines.join('\n'), tl, false, prio)).split('\n').map((x) => x.trim());
+async function translateLinesFree(lines, tl, prio = 0, attempts = 4) {
+  if (lines.length === 1) return [joinTrans(await gtx(lines[0], tl, false, prio, attempts)).trim()];
+  const parts = joinTrans(await gtx(lines.join('\n'), tl, false, prio, attempts)).split('\n').map((x) => x.trim());
   if (parts.length === lines.length) return parts;
   const mid = lines.length >> 1;
-  return [...(await translateLinesFree(lines.slice(0, mid), tl, prio)), ...(await translateLinesFree(lines.slice(mid), tl, prio))];
+  return [...(await translateLinesFree(lines.slice(0, mid), tl, prio, attempts)), ...(await translateLinesFree(lines.slice(mid), tl, prio, attempts))];
 }
 
 // Persistent caches so hover translations are instant on every video.
@@ -226,36 +296,71 @@ async function translateWords(words, tl, prio = 0, sl = 'auto') {
   return res;
 }
 
-async function lookup(word, tl, prio = 0, sl = 'auto') {
+// Dictionary variants (several meanings by part of speech): Google's free dictionary, then Edge's.
+async function fetchVariants(word, tl, prio) {
+  if (gq.fails > 0 || Date.now() < gq.downUntil) {
+    try { const dict = await msDict(word, tl); if (dict.length) return { dict }; } catch (_) { /* Google below */ }
+  }
+  try {
+    const j = await gtx(word, tl, true, prio, 1); // one try: the Edge dictionary answers if Google is slow
+    const dict = (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) }));
+    if (dict.length) return { dict, translation: joinTrans(j).trim() };
+  } catch (_) { /* below */ }
+  try {
+    const dict = await msDict(word, tl);
+    if (dict.length) return { dict };
+  } catch (_) { /* no variants this time */ }
+  return null;
+}
+
+const variantJobs = new Map();
+
+// Fast path: the translation is returned at once (Google Cloud is ~150 ms); the variants are collected in the
+// background and picked up by a second call (phase 'dict'), so a slow free dictionary never delays the tooltip.
+async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast') {
   const name = 'lkc:' + tl;
   const cache = await getCache(name);
   const key = word.toLowerCase();
   const c = await cloudCfg();
   const hit = cache[key];
-  // A cached cloud result without dictionary variants is retried (the free dictionary may have been slow or blocked).
-  if (hit && (hit.dict && hit.dict.length || !c.cloudVariants || (hit.dt && Date.now() - hit.dt < 600000))) return hit;
-  let res;
-  if (await cloudOk('tr', word.length)) {
-    // Cloud gives one reliable translation at once; variants come from the free dictionary if it answers quickly.
-    const variants = c.cloudVariants
-      ? Promise.race([gtx(word, tl, true, prio).catch(() => null), sleep(prio ? 3500 : 6000).then(() => null)])
-      : Promise.resolve(null);
+  const complete = (h) => h && ((h.dict && h.dict.length) || !c.cloudVariants || (h.dt && Date.now() - h.dt < 600000 && !h.partial));
+  if (complete(hit)) return hit;
+
+  let res = hit || null;
+  if (!res && await cloudOk('tr', word.length)) {
     try {
-      const [tr, j] = await Promise.all([cloudTranslate([word], tl, sl), variants]);
-      res = {
-        translation: tr[0] || (j ? joinTrans(j).trim() : ''),
-        dict: j ? (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })) : [],
-        dt: Date.now(),
-      };
+      const tr = await cloudTranslate([word], tl, sl);
+      res = { translation: tr[0] || '', dict: [], dt: Date.now(), partial: !!c.cloudVariants };
     } catch (_) { res = null; }
   }
   if (!res) {
-    const j = await gtx(word, tl, true, prio);
-    res = { translation: joinTrans(j).trim(), dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })) };
+    // No cloud: one free call gives the translation and the variants together.
+    try {
+      const j = await gtx(word, tl, true, prio, gq.fails > 0 ? 1 : 2);
+      res = { translation: joinTrans(j).trim(), dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })), dt: Date.now() };
+    } catch (e) {
+      try { const o = await msTranslate([word], tl); res = { translation: o[0] || '', dict: [], dt: Date.now(), partial: true }; } catch (_) { throw e; }
+    }
   }
   cache[key] = res;
   persistCache(name);
-  return res;
+  if (!res.partial) return res;
+
+  let job = variantJobs.get(key + '|' + tl);
+  if (!job) {
+    job = fetchVariants(word, tl, prio).then((v) => {
+      const cur = cache[key] || res;
+      cur.dict = v ? v.dict : [];
+      cur.partial = false;
+      cur.dt = Date.now();
+      cache[key] = cur;
+      persistCache(name);
+      return cur;
+    }).catch(() => res).finally(() => variantJobs.delete(key + '|' + tl));
+    variantJobs.set(key + '|' + tl, job);
+  }
+  if (phase !== 'dict') return res;
+  return Promise.race([job, sleep(25000).then(() => res)]); // the tooltip is already on screen: no hurry
 }
 
 // ---------- Gemini ----------
@@ -881,6 +986,13 @@ function encodeMp3Bg({ pcm, rate, kbps }) {
 async function handle(msg) {
   switch (msg.type) {
     case 'encodeMp3': return encodeMp3Bg(msg);
+    case 'clearCaches': { // used by the settings page ("Сбросить кэш переводов") and by tests
+      for (const k of Object.keys(caches)) delete caches[k];
+      dirtyCaches.clear(); ttsCache.clear(); ms.token = ''; gq.fails = 0; gq.downUntil = 0;
+      const all = await chrome.storage.local.get(null);
+      await chrome.storage.local.remove(Object.keys(all).filter((k) => /^(trc|lkc):/.test(k)));
+      return true;
+    }
     case 'cardVoice': {
       const c = await cloudCfg();
       const text = String(msg.text || '').slice(0, 600);
@@ -890,7 +1002,7 @@ async function handle(msg) {
     case 'aiTrim': return aiTrim(msg);
     case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
     case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
-    case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl);
+    case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl, msg.phase);
     case 'speakCloud': return speakCloud(msg);
     case 'cloudTest': return cloudTest();
     case 'usage': return usageGet();

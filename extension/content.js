@@ -990,21 +990,48 @@
     const first = Math.max(0, chunks.findIndex((ch) => ch.includes(at)));
     const ordered = chunks.slice(first).concat(chunks.slice(0, first));
 
-    let doneCh = 0;
+    let doneCh = 0, failed = [];
+    const run = async (ch) => {
+      const out = await bg({ type: 'translateLines', lines: ch.map((i) => S.cues[i].text), tl, prio: 0.5 });
+      if (token !== S.token || tl !== settings.targetLang) return false;
+      ch.forEach((i, k) => { if (S.trans[i] == null || out[k]) S.trans[i] = out[k] || ''; updateRowTr(i); });
+      if (ch.includes(S.shown)) renderOverlay();
+      return true;
+    };
     for (const ch of ordered) {
       if (token !== S.token || tl !== settings.targetLang) return;
       if (ordered.length > 2) setProgress('Перевод фраз', doneCh++ / ordered.length);
-      try {
-        const out = await bg({ type: 'translateLines', lines: ch.map((i) => S.cues[i].text), tl });
+      try { if (!(await run(ch))) return; } catch (e) { failed.push(ch); S.trErr = e.message; }
+    }
+    // Chunks that failed are retried with growing pauses (a rate-limited endpoint recovers), not forgotten.
+    for (let round = 1; failed.length && round <= 6; round++) {
+      setProgress(null);
+      setStatus(`Перевод фраз не получился (${S.trErr}). Пробую снова… (${round}/6)`, h('button', { class: 'ytam-link', text: 'Сейчас', onclick: () => { S.trWake = true; } }));
+      for (let t = 0; t < 4000 * round && !S.trWake; t += 250) { await sleep(250); if (token !== S.token) return; }
+      S.trWake = false;
+      const again = failed;
+      failed = [];
+      for (const ch of again) {
         if (token !== S.token || tl !== settings.targetLang) return;
-        ch.forEach((i, k) => { S.trans[i] = out[k] || ''; updateRowTr(i); });
-        if (ch.includes(S.shown)) renderOverlay();
-      } catch (e) {
-        setStatus('Ошибка перевода: ' + e.message);
-        await sleep(1500);
+        try { if (!(await run(ch))) return; } catch (e) { failed.push(ch); S.trErr = e.message; }
       }
     }
-    if (token === S.token) setProgress(null);
+    if (token !== S.token) return;
+    setProgress(null);
+    if (failed.length) setStatus('Не удалось перевести часть фраз: ' + S.trErr + '. Проверьте интернет или ключ Google Cloud.', h('button', { class: 'ytam-link', text: 'Повторить', onclick: () => { S.trans = S.trans.map((t) => (t === '' ? null : t)); translateAll(token); } }));
+    else setStatus('');
+  }
+
+  // The phrase on screen must have its translation NOW, whatever the bulk translation is doing.
+  const trAsked = new Set();
+  function ensureCueTr(i) {
+    if (!settings.showTranslation || S.trans[i] != null || trAsked.has(S.videoId + ':' + i)) return;
+    trAsked.add(S.videoId + ':' + i);
+    const tl = settings.targetLang, vid = S.videoId;
+    bg({ type: 'translateLines', lines: [S.cues[i].text], tl, prio: 1 }).then((out) => {
+      if (vid !== S.videoId || tl !== settings.targetLang || !out[0]) return trAsked.delete(vid + ':' + i);
+      if (S.trans[i] == null) { S.trans[i] = out[0]; updateRowTr(i); if (i === S.shown) renderOverlay(); }
+    }).catch(() => trAsked.delete(vid + ':' + i));
   }
 
   // Translate every distinct word of the video up front so hover is instant.
@@ -1445,7 +1472,8 @@
       return;
     }
     ui.ovText.replaceChildren(...wordsNode(c.text, 'x', S.shown).childNodes);
-    ui.ovTr.textContent = S.trans[S.shown] || '';
+    ui.ovTr.textContent = S.trans[S.shown] || (settings.showTranslation && S.trans[S.shown] == null ? '…' : '');
+    if (S.trans[S.shown] == null) ensureCueTr(S.shown);
     renderOverlayStar();
   }
 
@@ -1894,10 +1922,32 @@
   const dictQueue = [];
   let dictBusy = 0;
 
+  // A lookup answers at once with the translation ("partial"); the variants (several meanings) follow in a
+  // second step. Tooltips / popups register here to be redrawn when the full entry arrives.
+  const fullWaiters = new Map();
+  const onDictFull = (w, fn) => {
+    const d = dict.get(w);
+    if (d && !(d instanceof Promise) && !d.partial) return;
+    if (!fullWaiters.has(w)) fullWaiters.set(w, new Set());
+    fullWaiters.get(w).add(fn);
+  };
+
+  function upgradeDict(w, r, prio) {
+    if (!r || !r.partial) return;
+    const tl = settings.targetLang;
+    bg({ type: 'lookup', word: w, tl, prio, phase: 'dict' }).then((full) => {
+      if (!full || tl !== settings.targetLang) return;
+      dict.set(w, full);
+      const fns = fullWaiters.get(w);
+      fullWaiters.delete(w);
+      if (fns) for (const fn of fns) { try { fn(); } catch (_) {} }
+    }).catch(() => {});
+  }
+
   function getDict(w) {
     if (dict.has(w)) return dict.get(w);
     const p = bg({ type: 'lookup', word: w, tl: settings.targetLang })
-      .then((r) => { dict.set(w, r); return r; })
+      .then((r) => { dict.set(w, r); upgradeDict(w, r, 0); return r; })
       .catch(() => { dict.delete(w); return null; });
     dict.set(w, p);
     return p;
@@ -1908,11 +1958,11 @@
   const hiPending = new Map();
   function getDictHi(w) {
     const d = dict.get(w);
-    if (d && !(d instanceof Promise)) return Promise.resolve(d);
+    if (d && !(d instanceof Promise)) { if (d.partial) upgradeDict(w, d, 1); return Promise.resolve(d); }
     if (hiPending.has(w)) return hiPending.get(w);
     const tl = settings.targetLang;
     const p = bg({ type: 'lookup', word: w, tl, prio: 1 })
-      .then((r) => { if (tl === settings.targetLang) dict.set(w, r); return r; })
+      .then((r) => { if (tl === settings.targetLang) { dict.set(w, r); upgradeDict(w, r, 1); } return r; })
       .catch(() => null)
       .then(async (r) => {
         if (r || S.wordTr.has(w)) return r;
@@ -2085,6 +2135,7 @@
       tipEl.classList.add('show');
     }
     getDictHi(w).then(fill);
+    onDictFull(w, fill);
     for (const e of exprs) {
       if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
     }
@@ -2255,6 +2306,7 @@
       nodes: out.filter(Boolean),
       load(alive) {
         getDictHi(w).then(() => { if (alive()) fillDict(); });
+        onDictFull(w, () => { if (alive()) fillDict(); });
         for (const { e, tr } of exprEls) {
           if (exprTr(e)) continue;
           bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 })
@@ -2974,9 +3026,17 @@
     // Stop at the real end of the speech: after YouTube's end, wait (a little) for actual silence.
     const hardT = c ? endTimes(a).hardT : 0;
     const speaking = !!Tap.src && Tap.reliable && Tap.quietMs < X.endQuietMs;
+    const nowMs = performance.now();
+    if (speaking) S.spokeAt = nowMs;
+    // Speech has gaps between words: bridge them, otherwise the subtitle would blink off and on in its tail.
+    const speakingEff = !v.paused && nowMs - (S.spokeAt || 0) < X.speakHoldMs;
     if (!v.paused || S.holdCue !== a) S.holdCue = -1;
     // The subtitle stays while the phrase is still being spoken, and while we hold playback at its end.
-    const shown = c && (t <= c.end + X.showTail || (!v.paused && speaking && t <= hardT) || S.holdCue === a) ? a : -1;
+    let shown = c && (t <= c.end + X.showTail || (speakingEff && t <= hardT) || S.holdCue === a) ? a : -1;
+    // A phrase that has left the screen never comes back until playback returns before its start (no blinking).
+    if (c && t < c.start) S.goneCue = -1;
+    if (shown === -1 && S.shown === a && a >= 0) S.goneCue = a;
+    else if (shown === a && S.goneCue === a && t > c.end && S.holdCue !== a) shown = -1;
     if (shown !== S.shown) { S.shown = shown; renderOverlay(); }
 
     if (c && !v.paused) endGuard(v, t, a);
