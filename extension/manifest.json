@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YT → Anki Miner",
-  "version": "7.4.0",
-  "version_name": "7.4 — W, мгновенные A/S/D, фраза держится 2,5 с, кнопки лончера с откликом",
+  "version": "7.5.0",
+  "version_name": "7.5 — без щелчков, нижняя полоса, прозрачный перевод, быстрый ИИ",
   "description": "Двойные субтитры на YouTube, перевод слов по клику и сохранение фрагментов видео (аудио + кадр) в Anki.",
   "permissions": [
     "storage",
@@ -18,7 +18,8 @@
     "https://translation.googleapis.com/*",
     "https://texttospeech.googleapis.com/*",
     "https://edge.microsoft.com/*",
-    "https://api-edge.cognitive.microsofttranslator.com/*"
+    "https://api-edge.cognitive.microsofttranslator.com/*",
+    "https://api.cognitive.microsofttranslator.com/*"
   ],
   "background": {
     "service_worker": "background.js"

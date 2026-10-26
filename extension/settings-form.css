@@ -50,3 +50,5 @@
 .ytam-set-chk.danger { color: #ff6b6b; font-weight: 600; }
 .ytam-set-chk.danger input { accent-color: #e53935; outline: 2px solid #e53935; outline-offset: 1px; }
 .ytam-set-paste { box-sizing: border-box; width: 100%; margin-top: 8px; background: #1a1a1a; color: #ddd; border: 1px solid #555; border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
+
+.ytam-src-row { margin: 4px 0; font: 13px Roboto, Arial, sans-serif; } .ytam-src-row.ok b { color: #6fd08a; } .ytam-src-row.bad b { color: #ff8a80; } .ytam-src-row span { color: #ccc; }

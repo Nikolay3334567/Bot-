@@ -49,15 +49,32 @@ async function cloudOk(kind, chars) {
   return true;
 }
 
+// What every translation source did last time — shown in the settings and under the tooltip ("transparent").
+const SRC = {
+  cloud: { name: 'Google Cloud', ok: 0, fail: 0, last: '', at: 0 },
+  google: { name: 'Google (бесплатный)', ok: 0, fail: 0, last: '', at: 0 },
+  azure: { name: 'Microsoft Azure', ok: 0, fail: 0, last: '', at: 0 },
+  edge: { name: 'Microsoft Edge', ok: 0, fail: 0, last: '', at: 0 },
+  ai: { name: 'ИИ (Gemini)', ok: 0, fail: 0, last: '', at: 0 },
+};
+function mark(src, ok, info) {
+  const s = SRC[src];
+  if (!s) return;
+  if (ok) { s.ok++; s.last = 'ok'; } else { s.fail++; s.last = String(info || 'ошибка').slice(0, 120); }
+  s.at = Date.now();
+}
+
 async function cloudFetch(url, body, label) {
   let r;
   try { r = await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 15000); }
-  catch (_) { throw new Error(label + ': нет связи'); }
+  catch (_) { mark('cloud', false, 'нет связи'); throw new Error(label + ': нет связи'); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const m = (j.error && j.error.message) || 'HTTP ' + r.status;
+    mark('cloud', false, m);
     throw new Error(label + ': ' + String(m).slice(0, 240));
   }
+  mark('cloud', true);
   return j;
 }
 
@@ -169,8 +186,9 @@ async function gtxFetch(text, tl, dict, attempts = 4) {
         ? await fetchT(url + '&q=' + encodeURIComponent(text), {}, dict ? 5000 : 9000)
         : await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: 'q=' + encodeURIComponent(text) }, dict ? 5000 : 9000);
     } catch (_) { r = null; }
-    if (r && r.ok) return r.json();
+    if (r && r.ok) { mark('google', true); return r.json(); }
     status = r ? r.status : 0;
+    mark('google', false, status ? 'HTTP ' + status + (status === 429 ? ' (слишком много запросов)' : '') : 'нет связи');
     if (r && status !== 429 && status < 500) break; // not worth retrying
     gq.pauseUntil = Date.now() + 800 * (attempt + 1); // back off the background traffic too
     await sleep(350 * 2 ** attempt);
@@ -182,7 +200,8 @@ const gtx = (text, tl, dict = false, prio = 0, attempts = 4) => gqRun(() => gtxF
 
 const joinTrans = (j) => (j.sentences || []).map((s) => s.trans || '').join('');
 
-// ---- Second free translator (the one built into Edge): used when Google's free endpoint is blocked or slow.
+// ---- Second translator, Microsoft's: the official Azure Translator when a key is given (free: 2M characters a month),
+// otherwise the one built into Edge (unofficial, needs no key). Both offer translation and a dictionary with variants.
 const MS_LANG = { 'zh-CN': 'zh-Hans', 'zh-TW': 'zh-Hant', he: 'he', iw: 'he' };
 const msLang = (tl) => MS_LANG[tl] || tl;
 const ms = { token: '', at: 0 };
@@ -190,29 +209,54 @@ const ms = { token: '', at: 0 };
 async function msAuth() {
   if (ms.token && Date.now() - ms.at < 8 * 60000) return ms.token;
   const r = await fetchT('https://edge.microsoft.com/translate/auth', { cache: 'no-store' }, 6000);
-  if (!r.ok) throw new Error('MS auth HTTP ' + r.status);
+  if (!r.ok) throw new Error('Edge auth HTTP ' + r.status);
   ms.token = (await r.text()).trim();
   ms.at = Date.now();
   return ms.token;
 }
 
-async function msCall(path, body) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await fetchT('https://api-edge.cognitive.microsofttranslator.com' + path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (await msAuth()) }, body: JSON.stringify(body),
-    }, 9000);
-    if (r.status === 401 && attempt === 0) { ms.token = ''; continue; } // token expired
-    if (!r.ok) throw new Error('MS HTTP ' + r.status);
-    return r.json();
+async function azureKey() {
+  const l = await chrome.storage.local.get({ azureKey: '', azureRegion: '' });
+  return { key: (l.azureKey || '').trim(), region: (l.azureRegion || '').trim() };
+}
+
+// Returns { j, via } — via is 'azure' or 'edge'.
+async function msCall(path, body, only) {
+  const az = await azureKey();
+  if (only === 'azure' && !az.key) throw new Error('ключ Azure не задан');
+  if (az.key && only !== 'edge') {
+    try {
+      const r = await fetchT('https://api.cognitive.microsofttranslator.com' + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Ocp-Apim-Subscription-Key': az.key, ...(az.region ? { 'Ocp-Apim-Subscription-Region': az.region } : {}) },
+        body: JSON.stringify(body),
+      }, 9000);
+      if (!r.ok) throw new Error('Azure HTTP ' + r.status + (r.status === 401 ? ' (ключ или регион не подходят)' : r.status === 429 ? ' (лимит)' : ''));
+      mark('azure', true);
+      ms.lastVia = 'azure';
+      return { j: await r.json(), via: 'azure' };
+    } catch (e) { mark('azure', false, e.message); if (only === 'azure') throw e; /* the free Edge translator still can answer */ }
   }
-  throw new Error('MS auth');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetchT('https://api-edge.cognitive.microsofttranslator.com' + path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (await msAuth()) }, body: JSON.stringify(body),
+      }, 9000);
+      if (r.status === 401 && attempt === 0) { ms.token = ''; continue; } // token expired
+      if (!r.ok) throw new Error('Edge HTTP ' + r.status);
+      mark('edge', true);
+      ms.lastVia = 'edge';
+      return { j: await r.json(), via: 'edge' };
+    } catch (e) { if (attempt === 1 || !/401/.test(e.message)) { mark('edge', false, e.message); throw e; } }
+  }
+  throw new Error('Edge: нет ответа');
 }
 
 async function msTranslate(lines, tl) {
   const out = [];
   for (let i = 0; i < lines.length; i += 100) {
     const chunk = lines.slice(i, i + 100);
-    const j = await msCall(`/translate?to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, chunk.map((Text) => ({ Text })));
+    const { j } = await msCall(`/translate?to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, chunk.map((Text) => ({ Text })));
     if (!Array.isArray(j) || j.length !== chunk.length) throw new Error('MS: неожиданный ответ');
     for (const it of j) out.push(String(((it.translations || [])[0] || {}).text || '').trim());
   }
@@ -221,7 +265,7 @@ async function msTranslate(lines, tl) {
 
 const MS_POS = { NOUN: 'noun', VERB: 'verb', ADJ: 'adjective', ADV: 'adverb', PRON: 'pronoun', PREP: 'preposition', CONJ: 'conjunction', DET: 'determiner', MODAL: 'modal', OTHER: 'other' };
 async function msDict(word, tl) {
-  const j = await msCall(`/dictionary/lookup?from=en&to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, [{ Text: word }]);
+  const { j, via } = await msCall(`/dictionary/lookup?from=en&to=${encodeURIComponent(msLang(tl))}&api-version=3.0`, [{ Text: word }]);
   const by = new Map();
   for (const t of (((j || [])[0] || {}).translations) || []) {
     const pos = MS_POS[t.posTag] || String(t.posTag || '').toLowerCase();
@@ -229,7 +273,9 @@ async function msDict(word, tl) {
     const terms = by.get(pos);
     if (t.displayTarget && !terms.includes(t.displayTarget) && terms.length < 6) terms.push(t.displayTarget);
   }
-  return [...by].map(([pos, terms]) => ({ pos, terms }));
+  const dict = [...by].map(([pos, terms]) => ({ pos, terms }));
+  dict.via = via;
+  return dict;
 }
 
 // Lines in, translated lines out: Google Cloud (if allowed) → Google free → Edge. If Google merges/splits
@@ -296,50 +342,74 @@ async function translateWords(words, tl, prio = 0, sl = 'auto') {
   return res;
 }
 
-// Dictionary variants (several meanings by part of speech): Google's free dictionary, then Edge's.
-async function fetchVariants(word, tl, prio) {
-  if (gq.fails > 0 || Date.now() < gq.downUntil) {
-    try { const dict = await msDict(word, tl); if (dict.length) return { dict }; } catch (_) { /* Google below */ }
-  }
-  try {
-    const j = await gtx(word, tl, true, prio, 1); // one try: the Edge dictionary answers if Google is slow
+// Dictionary variants (several meanings by part of speech): Google's free dictionary, then Microsoft's (Azure with a
+// key, else Edge), then — if allowed — the AI. Returns the variants and who gave them (or why nobody did).
+async function aiVariants(word, sentence, tl, cfg) {
+  const lang = LANGS[tl] || tl;
+  const prompt = `Translate the English word or phrase "${word}" into ${lang}.${sentence ? ` It was met in: "${sentence}".` : ''}
+Give the 2-3 most common meanings grouped by part of speech, the most likely for this context first.
+Return JSON: [{"pos": "noun|verb|adjective|adverb|preposition|conjunction|pronoun|other", "terms": ["...", "..."]}]. At most 3 terms per part of speech; single words or short phrases in ${lang}.`;
+  const out = await llm({ model: cfg.aiFastModel, prompt, json: true, temperature: 0.2,
+    schema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { pos: { type: 'STRING' }, terms: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['pos', 'terms'] } } });
+  return asLines(parseJsonLoose(out)).filter((x) => x && Array.isArray(x.terms) && x.terms.length).slice(0, 4).map((x) => ({ pos: String(x.pos || ''), terms: x.terms.slice(0, 4).map(String) }));
+}
+
+async function fetchVariants(word, tl, prio, sentence) {
+  const cfg = await cloudCfg();
+  const why = [];
+  const viaGoogle = async () => {
+    const j = await gtx(word, tl, true, prio, 1); // one try: the next source answers if Google is slow
     const dict = (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) }));
-    if (dict.length) return { dict, translation: joinTrans(j).trim() };
-  } catch (_) { /* below */ }
-  try {
-    const dict = await msDict(word, tl);
-    if (dict.length) return { dict };
-  } catch (_) { /* no variants this time */ }
-  return null;
+    if (!dict.length) throw new Error('пусто');
+    return { dict, src: 'google', translation: joinTrans(j).trim() };
+  };
+  const viaMs = async () => { const dict = await msDict(word, tl); if (!dict.length) throw new Error('пусто'); return { dict, src: dict.via }; };
+  const googleDown = gq.fails > 0 || Date.now() < gq.downUntil;
+  const chain = googleDown ? [['Microsoft', viaMs], ['Google', viaGoogle]] : [['Google', viaGoogle], ['Microsoft', viaMs]];
+  for (const [name, fn] of chain) {
+    try { return await fn(); } catch (e) { why.push(`${name}: ${e.message}`.slice(0, 80)); }
+  }
+  let aiPending = false;
+  if (cfg.variantsAI !== 'off' && prio < 1) aiPending = true; // background prefetch never spends AI calls; a hover will
+  if (cfg.variantsAI !== 'off' && prio >= 1) {
+    try {
+      const dict = await aiVariants(word, sentence, tl, await aiConfig());
+      if (dict.length) { mark('ai', true); return { dict, src: 'ai' }; }
+    } catch (e) { mark('ai', false, e.message); why.push('ИИ: ' + e.message.slice(0, 60)); }
+  }
+  return { dict: [], src: null, why: why.join(' · '), aiPending };
 }
 
 const variantJobs = new Map();
 
 // Fast path: the translation is returned at once (Google Cloud is ~150 ms); the variants are collected in the
-// background and picked up by a second call (phase 'dict'), so a slow free dictionary never delays the tooltip.
-async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast') {
+// background and picked up by a second call (phase 'dict'), so a slow dictionary never delays the tooltip.
+async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast', sentence = '') {
   const name = 'lkc:' + tl;
   const cache = await getCache(name);
   const key = word.toLowerCase();
   const c = await cloudCfg();
   const hit = cache[key];
-  const complete = (h) => h && ((h.dict && h.dict.length) || !c.cloudVariants || (h.dt && Date.now() - h.dt < 600000 && !h.partial));
+  const complete = (h) => h && ((h.dict && h.dict.length) || !c.cloudVariants || (h.dt && Date.now() - h.dt < 600000 && !h.partial && !(h.aiPending && prio >= 1)));
   if (complete(hit)) return hit;
 
   let res = hit || null;
+  if (res && res.aiPending && prio >= 1) res.partial = true;
   if (!res && await cloudOk('tr', word.length)) {
     try {
       const tr = await cloudTranslate([word], tl, sl);
-      res = { translation: tr[0] || '', dict: [], dt: Date.now(), partial: !!c.cloudVariants };
+      res = { translation: tr[0] || '', dict: [], dt: Date.now(), partial: !!c.cloudVariants, src: { tr: 'cloud', dict: null } };
     } catch (_) { res = null; }
   }
   if (!res) {
     // No cloud: one free call gives the translation and the variants together.
     try {
       const j = await gtx(word, tl, true, prio, gq.fails > 0 ? 1 : 2);
-      res = { translation: joinTrans(j).trim(), dict: (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) })), dt: Date.now() };
+      const dict = (j.dict || []).map((d) => ({ pos: d.pos, terms: (d.terms || []).slice(0, 6) }));
+      res = { translation: joinTrans(j).trim(), dict, dt: Date.now(), src: { tr: 'google', dict: dict.length ? 'google' : null } };
+      if (!dict.length && c.cloudVariants) res.partial = true;
     } catch (e) {
-      try { const o = await msTranslate([word], tl); res = { translation: o[0] || '', dict: [], dt: Date.now(), partial: true }; } catch (_) { throw e; }
+      try { const o = await msTranslate([word], tl); res = { translation: o[0] || '', dict: [], dt: Date.now(), partial: true, src: { tr: ms.lastVia || 'edge', dict: null } }; } catch (_) { throw e; }
     }
   }
   cache[key] = res;
@@ -348,11 +418,14 @@ async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast') {
 
   let job = variantJobs.get(key + '|' + tl);
   if (!job) {
-    job = fetchVariants(word, tl, prio).then((v) => {
+    job = fetchVariants(word, tl, prio, sentence).then((v) => {
       const cur = cache[key] || res;
-      cur.dict = v ? v.dict : [];
+      cur.dict = v.dict;
       cur.partial = false;
       cur.dt = Date.now();
+      cur.src = { ...(cur.src || {}), dict: v.src, why: v.why || '' };
+      cur.aiPending = !!v.aiPending;
+      if (!cur.translation && v.translation) cur.translation = v.translation;
       cache[key] = cur;
       persistCache(name);
       return cur;
@@ -360,7 +433,40 @@ async function lookup(word, tl, prio = 0, sl = 'auto', phase = 'fast') {
     variantJobs.set(key + '|' + tl, job);
   }
   if (phase !== 'dict') return res;
-  return Promise.race([job, sleep(25000).then(() => res)]); // the tooltip is already on screen: no hurry
+  return Promise.race([job, sleep(25000).then(() => res)]);
+}
+
+// Every source tried on one word, separately: the settings page shows who works and who does not.
+async function translatorTest(word = 'but') {
+  const c = await cloudCfg();
+  const tl = c.targetLang;
+  const rows = [];
+  const run = async (id, fn) => {
+    const t0 = performance.now();
+    try { const text = await fn(); rows.push({ id, name: SRC[id].name, ok: true, ms: Math.round(performance.now() - t0), text }); mark(id, true); }
+    catch (e) { rows.push({ id, name: SRC[id].name, ok: false, ms: Math.round(performance.now() - t0), text: e.message }); }
+  };
+  if (!c.key) rows.push({ id: 'cloud', name: SRC.cloud.name, ok: false, text: 'ключ не задан (вкладка «Перевод»)', ms: 0 });
+  else await run('cloud', async () => (await cloudTranslate([word], tl, 'en'))[0] + ' — один вариант (так устроен официальный API)');
+  await run('google', async () => {
+    const j = await gtxFetch(word, tl, true, 1);
+    const d = (j.dict || []).flatMap((x) => x.terms || []).slice(0, 5);
+    if (!d.length) return joinTrans(j).trim() + ' (вариантов нет)';
+    return joinTrans(j).trim() + ' · ' + d.join(', ');
+  });
+  const az = await azureKey();
+  if (az.key) await run('azure', async () => { const { j } = await msCall(`/dictionary/lookup?from=en&to=${msLang(tl)}&api-version=3.0`, [{ Text: word }], 'azure'); return (((j[0] || {}).translations) || []).slice(0, 5).map((t) => t.displayTarget).join(', ') || 'пусто'; });
+  else rows.push({ id: 'azure', name: SRC.azure.name, ok: false, text: 'ключ не задан — необязательно', ms: 0 });
+  await run('edge', async () => { const { j } = await msCall(`/dictionary/lookup?from=en&to=${msLang(tl)}&api-version=3.0`, [{ Text: word }], 'edge'); return (((j[0] || {}).translations) || []).slice(0, 5).map((t) => t.displayTarget).join(', ') || 'пусто'; });
+  const ai = await aiConfig();
+  if (ai.geminiKey || ai.aiKey) await run('ai', async () => (await aiVariants(word, '', tl, ai)).map((x) => x.terms.join(', ')).join(' | ') || 'пусто');
+  else rows.push({ id: 'ai', name: SRC.ai.name, ok: false, text: 'ключ ИИ не задан — необязательно', ms: 0 });
+  return { word, tl, rows };
+}
+
+function translatorStatus() {
+  const g = SRC.google;
+  return { sources: SRC, googleDownUntil: gq.downUntil, googleFails: gq.fails, order: 'Cloud (перевод) → Google (варианты) → Azure/Edge → ИИ', now: Date.now(), g };
 }
 
 // ---------- Gemini ----------
@@ -407,6 +513,34 @@ async function httpError(r, label) {
   throw new Error(label + ': ' + (typeof msg === 'string' ? msg : JSON.stringify(msg)).slice(0, 300));
 }
 
+// Gemini 2.5 / 3.x models may "think" before answering — seconds of silence before the first word. For quick
+// answers (word explanations, translations, short JSON) we switch that off. Models disagree about the parameter,
+// so the first rejected one is replaced by the next, and the working variant is remembered per model.
+const THINK_LADDER = [{ thinkingBudget: 0 }, { thinkingLevel: 'minimal' }, { thinkingLevel: 'low' }, null];
+const thinkStep = {}; // model → index in THINK_LADDER that works
+
+async function geminiFetch(url, body, cfg, model, { think = true } = {}) {
+  const useThink = think && cfg.aiThinking !== 'model' && !/gemini-1\./.test(model);
+  for (let guard = 0; guard < THINK_LADDER.length + 1; guard++) {
+    const step = thinkStep[model] || 0;
+    const tc = useThink ? THINK_LADDER[step] : null;
+    const gc = { ...body.generationConfig };
+    delete gc.thinkingConfig;
+    if (tc) gc.thinkingConfig = tc;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
+      body: JSON.stringify({ ...body, generationConfig: gc }),
+    });
+    if (r.status === 400 && tc) {
+      const txt = await r.clone().text().catch(() => '');
+      if (/think/i.test(txt)) { thinkStep[model] = Math.min(THINK_LADDER.length - 1, step + 1); continue; }
+    }
+    return r;
+  }
+  throw new Error('Gemini: не удалось подобрать параметры запроса');
+}
+
 // Returns the text of the model's answer.
 async function llm({ model, prompt, json, schema, temperature = 0.2, media }) {
   const cfg = await aiConfig();
@@ -430,12 +564,8 @@ async function llm({ model, prompt, json, schema, temperature = 0.2, media }) {
   if (media) body.generationConfig.mediaResolution = 'MEDIA_RESOLUTION_LOW';
   let r;
   try {
-    r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
-      body: JSON.stringify(body),
-    });
-  } catch (e) { throw new Error('Нет доступа к ' + base + ' — разрешите адрес в настройках расширения'); }
+    r = await geminiFetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`, body, cfg, model, { think: !media });
+  } catch (e) { if (/подобрать/.test(e.message)) throw e; throw new Error('Нет доступа к ' + base + ' — разрешите адрес в настройках расширения'); }
   if (!r.ok) await httpError(r, 'Gemini');
   const j = await r.json();
   const out = (((j.candidates || [])[0] || {}).content || {}).parts || [];
@@ -573,15 +703,12 @@ async function streamLlm(model, prompt, onDelta) {
   const base = String(cfg.aiBaseUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
   const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 600, ...parseObj(cfg.aiExtraBody, 'Доп. параметры') } };
   if (cfg.aiSystem) body.systemInstruction = { parts: [{ text: cfg.aiSystem }] };
-  const r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.geminiKey, ...parseObj(cfg.aiHeaders, 'Свои заголовки') },
-    body: JSON.stringify(body),
-  });
+  const r = await geminiFetch(`${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, body, cfg, model);
   if (!r.ok) await httpError(r, 'Gemini');
   await readSse(r, (j) => {
     const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-    const text = parts.map((p) => p.text || '').join('');
+    // thought summaries (if any) are not part of the answer
+    const text = parts.filter((p) => !p.thought).map((p) => p.text || '').join('');
     if (text) onDelta(text);
   });
 }
@@ -591,8 +718,10 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(async (msg) => {
     try {
       const cfg = await chrome.storage.sync.get(YTAM_DEFAULTS);
-      await streamLlm(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => port.postMessage({ delta }));
-      port.postMessage({ done: true });
+      const t0 = performance.now();
+      let first = 0;
+      await streamLlm(cfg.aiFastModel, explainPrompt(msg, cfg), (delta) => { if (!first) first = performance.now() - t0; port.postMessage({ delta }); });
+      port.postMessage({ done: true, meta: { model: cfg.aiFastModel, first: Math.round(first), total: Math.round(performance.now() - t0), think: cfg.aiThinking === 'model' ? 'модель решает сама' : 'без размышлений' } });
     } catch (e) {
       try { port.postMessage({ error: e.message || String(e) }); } catch (_) {}
     }
@@ -1027,7 +1156,9 @@ async function handle(msg) {
     case 'aiExamples': return aiExamples(msg);
     case 'translateLines': return translateLines(msg.lines, msg.tl, msg.prio, msg.sl);
     case 'translateWords': return translateWords(msg.words, msg.tl, msg.prio, msg.sl);
-    case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl, msg.phase);
+    case 'lookup': return lookup(msg.word, msg.tl, msg.prio, msg.sl, msg.phase, msg.sentence);
+    case 'translatorTest': return translatorTest(msg.word);
+    case 'translatorStatus': return translatorStatus();
     case 'speakCloud': return speakCloud(msg);
     case 'cloudTest': return cloudTest();
     case 'usage': return usageGet();

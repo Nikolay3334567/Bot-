@@ -203,6 +203,47 @@ self.YTAM_buildSettings = function buildSettings(opts = {}) {
   }
 
 
+
+  // Translation sources: who works right now, and a test on one word ("transparent").
+  if (panes.subs && chrome.runtime && chrome.runtime.sendMessage) {
+    const box = mk('div', 'ytam-srcbox');
+    box.append(mk('div', 'ytam-set-group', 'Откуда берётся перевод'));
+    box.append(mk('div', 'ytam-set-note', 'Порядок: перевод — Google Cloud (если есть ключ и не исчерпан лимит), иначе бесплатный Google, иначе Microsoft. Варианты слова («но / однако / зато»): словарь Google → Microsoft (Azure с ключом, иначе Edge) → ИИ. Официальный Google Cloud отдаёт ОДИН перевод — вариантов в нём нет, поэтому варианты берутся из словарей.'));
+    const list = mk('div', 'ytam-src-list');
+    const status = mk('div', 'ytam-set-note');
+    const testWord = mk('input');
+    testWord.type = 'text';
+    testWord.value = 'but';
+    testWord.className = 'ytam-set-num';
+    testWord.style.width = '90px';
+    testWord.addEventListener('keydown', (e) => e.stopPropagation());
+    const btn = mk('button', 'ytam-set-reset', 'Проверить все источники на слове');
+    const draw = (rows) => {
+      list.replaceChildren(...rows.map((r) => {
+        const row = mk('div', 'ytam-src-row ' + (r.ok ? 'ok' : 'bad'));
+        row.append(mk('b', '', (r.ok ? '✓ ' : '✗ ') + r.name), mk('span', '', ` ${r.ms ? r.ms + ' мс · ' : ''}${r.text}`));
+        return row;
+      }));
+    };
+    btn.addEventListener('click', () => {
+      status.textContent = 'Проверяю…';
+      chrome.runtime.sendMessage({ type: 'translatorTest', word: testWord.value.trim() || 'but' }, (r) => {
+        const res = r && r.result;
+        if (!res) { status.textContent = (r && r.error) || 'Нет ответа от расширения'; return; }
+        status.textContent = `Слово «${res.word}» → ${res.tl}. «Один перевод» у Cloud — норма; варианты ищите у Google / Microsoft / ИИ.`;
+        draw(res.rows);
+      });
+    });
+    const live = () => chrome.runtime.sendMessage({ type: 'translatorStatus' }, (r) => {
+      const res = r && r.result;
+      if (!res || list.childNodes.length) return;
+      draw(Object.values(res.sources).map((s) => ({ ok: s.last === 'ok', name: s.name, ms: 0, text: s.last ? (s.last === 'ok' ? `работал (${s.ok} запросов)` : `последний сбой: ${s.last}`) : 'ещё не использовался' })));
+    });
+    box.append(list, testWord, btn, status);
+    panes.subs.pane.append(box);
+    live();
+  }
+
   // Backup / transfer: all settings (optionally with API keys and the vocabulary) to a file and back.
   if (!opts.only || opts.only.includes('backup')) {
     const btn = mk('button', 'ytam-set-tab', 'Перенос');

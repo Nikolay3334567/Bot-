@@ -1940,10 +1940,10 @@
     fullWaiters.get(w).add(fn);
   };
 
-  function upgradeDict(w, r, prio) {
+  function upgradeDict(w, r, prio, sentence) {
     if (!r || !r.partial) return;
     const tl = settings.targetLang;
-    bg({ type: 'lookup', word: w, tl, prio, phase: 'dict' }).then((full) => {
+    bg({ type: 'lookup', word: w, tl, prio, phase: 'dict', sentence }).then((full) => {
       if (!full || tl !== settings.targetLang) return;
       dict.set(w, full);
       const fns = fullWaiters.get(w);
@@ -1964,13 +1964,13 @@
   // Hover/click lookups: jump the queue; fall back to the plain word translation; failures are
   // never cached, so the next hover simply tries again.
   const hiPending = new Map();
-  function getDictHi(w) {
+  function getDictHi(w, sentence) {
     const d = dict.get(w);
-    if (d && !(d instanceof Promise)) { if (d.partial) upgradeDict(w, d, 1); return Promise.resolve(d); }
+    if (d && !(d instanceof Promise)) { if (d.partial) upgradeDict(w, d, 1, sentence); return Promise.resolve(d); }
     if (hiPending.has(w)) return hiPending.get(w);
     const tl = settings.targetLang;
-    const p = bg({ type: 'lookup', word: w, tl, prio: 1 })
-      .then((r) => { if (tl === settings.targetLang) { dict.set(w, r); upgradeDict(w, r, 1); } return r; })
+    const p = bg({ type: 'lookup', word: w, tl, prio: 1, sentence })
+      .then((r) => { if (tl === settings.targetLang) { dict.set(w, r); upgradeDict(w, r, 1, sentence); } return r; })
       .catch(() => null)
       .then(async (r) => {
         if (r || S.wordTr.has(w)) return r;
@@ -2002,6 +2002,20 @@
       dictBusy++;
       Promise.resolve(getDict(w)).finally(() => { dictBusy--; setTimeout(pumpDict, X.dictDelayMs); });
     }
+  }
+
+  const SRC_NAME = { cloud: 'Google Cloud', google: 'Google', edge: 'Microsoft Edge', azure: 'Microsoft Azure', ai: 'ИИ' };
+  // "Where does this translation come from" — a small line under the tooltip / popup (⚙ → Перевод).
+  function srcLine(w) {
+    if (!settings.showTrSource) return null;
+    const d = dict.get(w);
+    if (!d || d instanceof Promise || !d.src) return null;
+    const s = d.src;
+    let t = SRC_NAME[s.tr] || s.tr || '';
+    if (s.dict) { if (s.dict !== s.tr) t += ' · варианты: ' + (SRC_NAME[s.dict] || s.dict); }
+    else if (d.partial) t += ' · варианты загружаются…';
+    else t += ' · вариантов нет' + (s.why ? ` (${s.why})` : '');
+    return h('div', { class: 'ytam-tip-src', text: t });
   }
 
   function variants(w) {
@@ -2108,6 +2122,7 @@
       }
       if (exprs.length) kids.push(h('div', { class: 'ytam-tip-head' }, h('span', { text: span.textContent })));
       kids.push(varsEl(vars));
+      { const sl = srcLine(w); if (sl) kids.push(sl); }
       if (settings.showStageButtons) {
         const learning = S.vocab[w] === 1;
         kids.push(h('div', { class: 'ytam-tip-btns' },
@@ -2142,7 +2157,7 @@
       }
       tipEl.classList.add('show');
     }
-    getDictHi(w).then(fill);
+    getDictHi(w, (S.cues[i] || {}).text).then(fill);
     onDictFull(w, fill);
     for (const e of exprs) {
       if (!exprTr(e)) bg({ type: 'translateWords', words: [e.key], tl: settings.targetLang, prio: 1 }).then((r) => { if (r[e.key]) { S.wordTr.set(e.key, r[e.key]); fill(); } }).catch(() => {});
@@ -2185,7 +2200,15 @@
     try { port = chrome.runtime.connect({ name: 'ytam-ai' }); } catch (_) { out.textContent = 'Перезагрузите страницу'; return; }
     port.onMessage.addListener((m) => {
       if (m.delta) { text += m.delta; out.innerHTML = mdLite(text); }
-      if (m.done) { aiCache.set(key, text); port.disconnect(); }
+      if (m.done) {
+        aiCache.set(key, text);
+        if (settings.aiShowTiming && m.meta) {
+          const mt = m.meta, slow = mt.first > 5000;
+          out.append(h('div', { class: 'ytam-ai-meta' + (slow ? ' slow' : ''), text: `${mt.model} · первое слово через ${(mt.first / 1000).toFixed(1)} с · всего ${(mt.total / 1000).toFixed(1)} с · ${mt.think}` +
+            (slow ? ' — долго: попробуйте модель gemini-2.5-flash-lite или lite-версию без размышлений' : '') }));
+        }
+        port.disconnect();
+      }
       if (m.error) { out.textContent = m.error; port.disconnect(); }
     });
     port.postMessage(params);
@@ -2254,7 +2277,7 @@
       trEl.textContent = variants(w).slice(0, 3).join(', ') || '…';
       if (d && !(d instanceof Promise)) {
         dictBox.replaceChildren(h('div', { class: 'ytam-dict-word', text: word }),
-          ...(d.dict.length ? d.dict.map((e) => h('div', {}, h('i', { text: `(${e.pos}) ` }), e.terms.join(', '))) : [h('div', { text: d.translation })]));
+          ...(d.dict.length ? d.dict.map((e) => h('div', {}, h('i', { text: `(${e.pos}) ` }), e.terms.join(', '))) : [h('div', { text: d.translation })]), ...[srcLine(w)].filter(Boolean));
       } else {
         dictBox.replaceChildren(h('div', { class: 'ytam-dim', text: S.wordTr.get(w) ? S.wordTr.get(w) : '…' }));
       }
@@ -2313,7 +2336,7 @@
     return {
       nodes: out.filter(Boolean),
       load(alive) {
-        getDictHi(w).then(() => { if (alive()) fillDict(); });
+        getDictHi(w, cue.text).then(() => { if (alive()) fillDict(); });
         onDictFull(w, () => { if (alive()) fillDict(); });
         for (const { e, tr } of exprEls) {
           if (exprTr(e)) continue;
